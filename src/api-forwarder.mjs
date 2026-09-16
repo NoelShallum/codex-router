@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { usesNativeChatReasoning } from "./chat-reasoning.mjs";
 import {
   deepSeekResponsesEffort,
@@ -904,27 +905,22 @@ function normalizeBody(buffer, contentType, route) {
   if (["fireworks", "opencode-go"].includes(provider.id)) {
     delete payload.web_search_options;
   }
-  // Meta refuses `search_content_types` on anything but a `web_search_preview`
+  // Meta and OpenCode Console Go Responses refuse `search_content_types` on anything but a `web_search_preview`
   // tool, and Codex only ever sends the current spelling: its hosted search
   // tool is `type: "web_search"`, carrying search_content_types beside
   // external_web_access, indexed_web_access, filters, user_location, and
   // search_context_size (read out of the shipped 0.147 binary, which contains
   // no occurrence of `web_search_preview` at all). The tool is declared on the
   // turn whenever web search is enabled, not only when the model searches, so
-  // the reporter's "running anything" is literal: every turn 400s and the
-  // provider is unusable rather than degraded (#286).
+  // one rejected field can make every turn 400 rather than degrading search.
   //
-  // Deliberately scoped to Meta and not applied everywhere. OpenAI documents
-  // `search_content_types` on `web_search` and *not* on `web_search_preview`,
-  // which is the reverse of what this endpoint enforces, so Meta is running an
-  // older fork of the schema rather than being the strict reader of it.
-  // Stripping the field for every provider would take a documented parameter
-  // away from responses-native providers that do follow the current spec, such
-  // as GitHub Copilot. Console Go Responses has its separately measured strict
-  // tool boundary applied in the router before this hop. A caller that does send
-  // Meta a real `web_search_preview` tool keeps the field, because that is the
-  // one tool this endpoint accepts it on.
-  if (provider.id === "meta" && Array.isArray(payload.tools)) {
+  // Deliberately scoped to Meta and OpenCode Console Go Responses, whose
+  // deployed schema rejects this field on `web_search` while accepting it on
+  // `web_search_preview`. Other responses-native providers keep it unchanged.
+  if (
+    ["meta", "opencode-go-responses"].includes(provider.id) &&
+    Array.isArray(payload.tools)
+  ) {
     payload.tools = stripSearchContentTypes(payload.tools);
   }
   // Strip empty tools array and dangling tool_choice for all routes.
@@ -1265,6 +1261,12 @@ function normalizeBody(buffer, contentType, route) {
   };
 }
 
+// Stable per-credential stand-in for x-opencode-session (see upstreamHeaders).
+function stableCredentialSessionId(apiKey) {
+  const digest = createHash("sha256").update(String(apiKey || "anonymous")).digest("hex");
+  return `codex-router-${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
 function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = {}, endpoint = provider) {
   const headers = {};
   const providerIdentityHeaders = new Set([
@@ -1309,7 +1311,9 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   applyOpenCodeSessionHeaders(headers, {
     provider,
     requestHeaders,
-    body,
+    // Keep a stable affinity id for adapted requests that have no native
+    // thread header. The helper preserves explicit caller values.
+    fallback: stableCredentialSessionId(apiKey),
   });
   // Content-Length is fetch's to compute. An explicit copy is at best
   // redundant, and the HTTP/1.1 dispatcher rejects the request outright

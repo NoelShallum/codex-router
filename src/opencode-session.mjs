@@ -25,6 +25,14 @@ export function isOpenCodeProvider(provider) {
 }
 
 export function resolveOpenCodeSessionId({ headers = {}, body, fallback } = {}) {
+  const explicit = Object.entries(headers || {}).find(
+    ([name, value]) =>
+      name.toLowerCase() === OPENCODE_SESSION_HEADER &&
+      typeof value === "string" &&
+      value.trim().length > 0,
+  )?.[1];
+  if (explicit) return explicit.trim();
+
   const fromThread = threadIdFromHeaders(headers);
   if (fromThread) return fromThread;
 

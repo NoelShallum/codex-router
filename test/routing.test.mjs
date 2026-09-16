@@ -6537,6 +6537,10 @@ test("API forwarder routes opencode Go chat, Messages, and Responses surfaces", 
       upstreamRequests[0].headers.authorization,
       "Bearer TEST_OPENCODE_GO_API_KEY",
     );
+    assert.match(
+      upstreamRequests[0].headers["x-opencode-session"],
+      /^codex-router-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
 
     const messages = await fetch(
       `http://127.0.0.1:${forwarderPort}/v1/messages`,
@@ -6562,6 +6566,10 @@ test("API forwarder routes opencode Go chat, Messages, and Responses surfaces", 
       "TEST_OPENCODE_GO_API_KEY",
     );
     assert.equal(upstreamRequests[1].headers.authorization, undefined);
+    assert.equal(
+      upstreamRequests[1].headers["x-opencode-session"],
+      upstreamRequests[0].headers["x-opencode-session"],
+    );
 
     const responses = await fetch(
       `http://127.0.0.1:${forwarderPort}/v1/responses`,
@@ -6585,6 +6593,51 @@ test("API forwarder routes opencode Go chat, Messages, and Responses surfaces", 
       upstreamRequests[2].headers.authorization,
       "Bearer TEST_OPENCODE_GO_API_KEY",
     );
+    assert.equal(
+      upstreamRequests[2].headers["x-opencode-session"],
+      upstreamRequests[0].headers["x-opencode-session"],
+    );
+
+    const museResponses = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/responses`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "opencode-go-responses-muse-spark-1-3-contributor",
+          input: "test",
+          stream: false,
+        }),
+      },
+    );
+    assert.equal(museResponses.status, 200);
+    assert.equal(upstreamRequests[3].url, "/v1/responses");
+    assert.equal(upstreamRequests[3].body.model, "muse-spark-1.3-contributor");
+    assert.equal(
+      upstreamRequests[3].headers["x-opencode-session"],
+      upstreamRequests[0].headers["x-opencode-session"],
+    );
+
+    const explicitSession = await fetch(
+      `http://127.0.0.1:${forwarderPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "X-OpenCode-Session": "caller-session",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "opencode-go-mimo-v2-5",
+          messages: [{ role: "user", content: "test" }],
+        }),
+      },
+    );
+    assert.equal(explicitSession.status, 200);
+    assert.equal(upstreamRequests[4].headers["x-opencode-session"], "caller-session");
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -6946,6 +6999,51 @@ test("router strips empty text parts and drops the messages left with nothing", 
   }
 });
 
+test("router preserves the legacy Muse Spark 1.3 slug and routes it to Responses", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(request.url);
+    json(response, 400, {
+      detail: "native fallback should not receive the legacy routed model",
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "opencode-go/muse-spark-1.3-contributor",
+        input: "legacy alias probe",
+        stream: false,
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeRequests.length, 0);
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(
+      gatewayRequests[0].model,
+      "opencode-go-responses-muse-spark-1-3-contributor",
+    );
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    await closeServer(native.server);
+  }
+});
+
 test("router preserves orphan Codex app outputs as readable history", async () => {
   const gatewayRequests = [];
   const gateway = await mockServer(async (request, response) => {
@@ -6985,7 +7083,6 @@ test("router preserves orphan Codex app outputs as readable history", async () =
     { type: "function_call", call_id: "call-valid", name: "lookup", arguments: "{}" },
     { type: "function_call_output", call_id: "call-valid", output: "kept byte-for-byte" },
   ];
-
   try {
     await waitFor(`${routerBase(routerPort)}/models`, router);
     for (const endpoint of ["/responses", "/responses/compact"]) {
@@ -6995,15 +7092,10 @@ test("router preserves orphan Codex app outputs as readable history", async () =
           Authorization: "Bearer CHATGPT_SESSION_TOKEN",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: "kimi-oauth/k3",
-          stream: false,
-          input,
-        }),
+        body: JSON.stringify({ model: "kimi-oauth/k3", stream: false, input }),
       });
       assert.equal(response.status, 200, await response.text());
     }
-
     assert.equal(gatewayRequests.length, 2);
     const recovered = gatewayRequests[0].input[0];
     assert.equal(recovered.type, "message");
@@ -7015,19 +7107,13 @@ test("router preserves orphan Codex app outputs as readable history", async () =
       },
     ]);
     assert.deepEqual(gatewayRequests[0].input.slice(-2), input.slice(-2));
-
     for (const request of gatewayRequests) {
       assert.equal(
-        request.input.some(
-          (item) => item?.type === "function_call_output" && !item.call_id,
-        ),
+        request.input.some((item) => item?.type === "function_call_output" && !item.call_id),
         false,
       );
     }
-    assert.match(
-      JSON.stringify(gatewayRequests[1].input),
-      /Codex app tool result: codex_app\.send_message_to_thread/u,
-    );
+    assert.match(JSON.stringify(gatewayRequests[1].input), /Codex app tool result: codex_app\.send_message_to_thread/u);
     assert.match(JSON.stringify(gatewayRequests[1].input), /child finished/u);
     const catalog = gatewayRequests[1].input.at(-2).content[0].text;
     assert.match(catalog, /"kind":"tool_result"/u);
@@ -7574,7 +7660,7 @@ const CODEX_WEB_SEARCH_TOOL = Object.freeze({
   user_location: { type: "approximate", country: "US" },
 });
 
-test("API forwarder drops the search_content_types Meta refuses, and only for Meta", async () => {
+test("API forwarder drops the search_content_types strict Responses providers refuse", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
     upstreamRequests.push({ url: request.url, body: await bodyJson(request) });
@@ -7643,14 +7729,39 @@ test("API forwarder drops the search_content_types Meta refuses, and only for Me
       { type: "web_search_preview", search_content_types: ["text", "image"] },
     ]);
 
-    // Provider-scoped at this direct forwarder boundary: OpenAI documents
-    // search_content_types on `web_search`, so non-Meta traffic keeps it here.
-    // The outer router owns Console Go's separately measured compatibility.
+    // OpenCode Console Go's Responses surface applies the same legacy schema
+    // restriction as Meta.
+    const opencodeMuseTools = await send(
+      "responses/opencode-go-responses-muse-spark-1-2-contributor",
+      [CODEX_WEB_SEARCH_TOOL],
+    );
+    assert.deepEqual(opencodeMuseTools, [
+      {
+        type: "web_search",
+        external_web_access: true,
+        indexed_web_access: true,
+        filters: { allowed_domains: ["example.com"] },
+        search_context_size: "medium",
+        user_location: { type: "approximate", country: "US" },
+      },
+    ]);
+
+    // The OpenCode Responses provider uses the same legacy schema for its
+    // other Responses models as well.
     const opencodeTools = await send(
       "responses/opencode-go-responses-gpt-5-6-luna",
       [CODEX_WEB_SEARCH_TOOL],
     );
-    assert.deepEqual(opencodeTools, [CODEX_WEB_SEARCH_TOOL]);
+    assert.deepEqual(opencodeTools, [
+      {
+        type: "web_search",
+        external_web_access: true,
+        indexed_web_access: true,
+        filters: { allowed_domains: ["example.com"] },
+        search_context_size: "medium",
+        user_location: { type: "approximate", country: "US" },
+      },
+    ]);
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);

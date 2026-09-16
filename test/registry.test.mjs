@@ -984,6 +984,8 @@ test("deprecated DeepSeek aliases remain routable but stay out of the picker", (
   for (const slug of [
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
+    "opencode-go/muse-spark-1.2-contributor",
+    "opencode-go/muse-spark-1.3-contributor",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.ok(model);

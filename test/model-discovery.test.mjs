@@ -286,6 +286,7 @@ test("the checked-in OpenCode Go set matches the official current-model table", 
   const registered = MODELS
     .filter(({ provider }) => ["opencode-go", "opencode-go-messages", "opencode-go-responses"].includes(provider))
     .map(({ upstreamModel }) => upstreamModel)
+    .filter((model, index, all) => all.indexOf(model) === index)
     .sort();
   assert.deepEqual(registered, documented);
   for (const model of MODELS.filter(({ upstreamModel }) => documented.includes(upstreamModel))) {
