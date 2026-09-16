@@ -1,24 +1,19 @@
-// The companion, served by the router that is already running, so looking at
-// it costs nothing to install. The tray and the Electron shell each need a
-// binary to be built, published, downloaded and kept current; this needs a
-// browser and the router you already started.
-//
-// It is the same apps/desktop/ui those shells render, reached through the same
-// command table, so it is a third window onto one application rather than a
-// third application.
+// A read-only companion served by the router that is already running, so
+// looking at it costs nothing to install. apps/panel is deliberately separate
+// from the one packaged Control Center: it exposes status in a browser but its
+// server-side command allowlist refuses every mutation.
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { COMMANDS, runDesktopCommand, sourceRoot } from "./desktop-commands.mjs";
 
-const UI_DIR = path.resolve(
+const APP_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
-  "apps",
-  "desktop",
-  "ui",
 );
+const UI_DIR = path.join(APP_ROOT, "apps", "panel");
+const PANEL_ICON = path.join(APP_ROOT, "apps", "control-center", "assets", "32x32.png");
 
 // Only what the UI is built from. A directory served wholesale would follow
 // whatever else ever lands in it, and this route sits behind a capability that
@@ -37,9 +32,9 @@ const ASSETS = new Map([
 ]);
 
 // app.js reaches its backend through window.__TAURI__.core.invoke and nothing
-// else, so presenting that one function is the whole port. Injected rather
-// than shipped as a file in apps/desktop/ui, because that directory belongs to
-// the shells that load it from disk.
+// else, so presenting that one compatibility function is the whole port. Keep
+// it server-injected so the capability transport is not mistaken for a static
+// asset that can be opened without the router's caller boundary.
 const BRIDGE = `<script>
 window.__TAURI__ = {
   core: {
@@ -70,8 +65,8 @@ export function isPanelRoute(route) {
 // Commands the panel may run. The mutating half of the table is deliberately
 // absent: a browser tab is reachable by any page that learns the capability,
 // and "save this API key" is not something to expose on that assumption. The
-// tray and the Electron shell keep the full table because reaching them means
-// already running code on the machine.
+// packaged Control Center keeps the full table because reaching its main
+// process means already running code on the machine.
 const READ_ONLY = new Set([
   "control_snapshot",
   "account_usage",
@@ -85,7 +80,7 @@ export function panelCommandAllowed(command, { readOnly = true } = {}) {
   return readOnly ? READ_ONLY.has(command) : true;
 }
 
-// Commands the shells answer from their own process rather than the CLI. A
+// Commands the browser panel answers from the router process rather than the CLI. A
 // browser tab has no window to show, hide or quit and cannot float an overlay
 // above other applications, so those resolve to the honest answer instead of
 // failing: the UI asks for them on load and would otherwise paint an error
@@ -100,8 +95,8 @@ const LOCAL = {
     // and only one of them is the gate. Both lists are the real ones -- a
     // command in neither is precisely what /panel/invoke answers 403 for -- so
     // a control the UI leaves live cannot disagree with what the panel permits.
-    // The tray and the Electron shell advertise nothing here and keep the full
-    // table, which is why this field is additive rather than a mode switch.
+    // The packaged Control Center does not use this browser bridge and keeps
+    // the full table, which is why this field is additive rather than a mode switch.
     capabilities: {
       readOnly: true,
       allowedCommands: [...READ_ONLY],
@@ -133,7 +128,12 @@ async function readBody(request, limit = 64 * 1024) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export async function handlePanelRequest(request, response, route, { writeJson }) {
+export async function handlePanelRequest(
+  request,
+  response,
+  route,
+  { writeJson, runCommand = runDesktopCommand, root },
+) {
   // index.html loads styles.css and app.js relatively. Served at "/panel" the
   // browser resolves those one level too high and the page renders empty, so
   // the directory form is the canonical one and the bare name redirects to it.
@@ -150,9 +150,8 @@ export async function handlePanelRequest(request, response, route, { writeJson }
   // Browsers ask for this unprompted; answering keeps a console clean enough
   // that a real error still stands out in it.
   if (route === "/panel/favicon.ico") {
-    const icon = path.resolve(UI_DIR, "..", "src-tauri", "icons", "32x32.png");
     try {
-      const body = await readFile(icon);
+      const body = await readFile(PANEL_ICON);
       response.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" });
       response.end(body);
     } catch {
@@ -217,7 +216,7 @@ export async function handlePanelRequest(request, response, route, { writeJson }
   }
 
   try {
-    const value = await runDesktopCommand(command, args ?? {}, { root: sourceRoot() });
+    const value = await runCommand(command, args ?? {}, { root: root ?? sourceRoot() });
     writeJson(response, 200, { value });
   } catch (error) {
     writeJson(response, 502, {

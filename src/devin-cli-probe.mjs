@@ -549,7 +549,7 @@ export async function runProbe(argv = [], { provider: injected, fetchImpl = fetc
   if (provider.missing) {
     report.fail("devin provider sources", `${provider.missing} is not present in this checkout`, {
       observed: truncateForReport(provider.reason, 160),
-      fix: "The provider lands with PR #271: `git fetch origin feat/devin-cli-provider && git checkout feat/devin-cli-provider`, then merge this branch on top. See docs/DEVIN-CLI-PROBE.md.",
+      fix: "The provider sources ship on main. Update or reclone the repository, run `npm install`, and retry. See docs/DEVIN-CLI-PROBE.md.",
     });
   } else if (!report.failed) {
     const context = await runFreeStage(report, provider, args, fetchImpl);

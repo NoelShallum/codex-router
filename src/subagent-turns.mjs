@@ -30,10 +30,10 @@ import { acceptedInputTokens } from "./context-window-drift.mjs";
 // reaches it honestly. It is *compacting again* that names the runaway, so the
 // ceiling is two budgets of new input with the child still going.
 //
-// That multiple is also what makes a false demotion structurally impossible
-// rather than merely unlikely, which matters because a false demotion silently
-// drops a working model from the picker and only a hand-run
-// `control subagents verify` restores it. A spawn that has never been
+// That multiple is also what makes false negative evidence structurally
+// impossible rather than merely unlikely. Historical proof records are only
+// diagnostic now, but invented failure evidence would still mislead a registry
+// review. A spawn that has never been
 // compacted cannot have produced more new input than its own largest prompt,
 // so the ceiling is taken against whichever is bigger, the model's declared
 // budget or the largest prompt this spawn has actually had accepted. An
@@ -103,7 +103,7 @@ function spawnKey(spawnId) {
 //
 // Returns undefined when the turn cannot be attributed to a spawn -- no
 // thread id means no way to tell one child from the next, and guessing would
-// demote a model for someone else's traffic.
+// manufacture negative evidence from someone else's traffic.
 export function observeChildTurn({
   spawnId,
   slug,
@@ -156,14 +156,14 @@ export function observeChildTurn({
     newInputTokens: state.newInputTokens,
     budget,
     // A model with no declared compaction budget has no derived ceiling, so it
-    // is counted and never demoted on this signal. Inventing one for it is the
+    // is counted and never rejected on this signal. Inventing one for it is the
     // thing this module exists not to do.
     exceeded: budget !== undefined && state.newInputTokens > budget,
   };
 }
 
-// Drop a spawn the router has already settled a verdict on, so a child that
-// keeps answering after its slug was demoted does not keep re-firing.
+// Drop a legacy-observed spawn after its diagnostic verdict, so a child that
+// keeps answering does not keep re-firing the same record update.
 export function forgetChildSpawn(spawnId) {
   const id = spawnKey(spawnId);
   if (id) spawns.delete(id);

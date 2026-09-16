@@ -155,9 +155,9 @@ button {
   padding: 6px 8px 2px 13px;
 }
 
-/* Electron's macOS hidden-inset titlebar leaves the native traffic lights in
-   the content surface. Reserve that same leading space for the sidebar
-   controls so the renderer and OS chrome share one toolbar row, like Codex. */
+/* Hidden titlebar chrome leaves native window buttons in the content
+   surface. Reserve that same leading/trailing space so the renderer and OS
+   chrome share one toolbar row, like Codex. */
 .native-titlebar .sidebar-window-row,
 .native-titlebar .titlebar {
   min-height: 44px;
@@ -169,7 +169,6 @@ button {
 .native-titlebar .sidebar-window-row {
   padding-top: 9px;
   padding-bottom: 7px;
-  padding-left: 88px;
   border-bottom: 0;
   background: var(--surface-1);
 }
@@ -179,9 +178,50 @@ button {
   background: var(--surface-0);
 }
 
-.native-titlebar.sidebar-collapsed .titlebar {
+/* macOS hiddenInset traffic lights sit over the sidebar, or the titlebar
+   when the sidebar is collapsed. */
+.native-titlebar-darwin .sidebar-window-row {
   padding-left: 88px;
 }
+
+.native-titlebar-darwin.sidebar-collapsed .titlebar {
+  padding-left: 88px;
+}
+
+/* Windows/Linux draw macOS-style traffic lights on the left. */
+.native-titlebar-win32 .sidebar-window-row,
+.native-titlebar-linux .sidebar-window-row {
+  padding-left: 16px;
+}
+
+.native-titlebar-win32.sidebar-collapsed .titlebar,
+.native-titlebar-linux.sidebar-collapsed .titlebar {
+  padding-left: 16px;
+}
+
+.traffic-lights {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 10px;
+  -webkit-app-region: no-drag;
+}
+
+.traffic-light {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: #d0d0d0;
+}
+
+.traffic-light-close { background: #ff5f57; }
+.traffic-light-minimize { background: #febc2e; }
+.traffic-light-maximize { background: #28c840; }
+
+.traffic-light:hover { filter: brightness(0.92); }
+.traffic-light:active { filter: brightness(0.82); }
 
 .sidebar-collapsed .titlebar-toggle {
   position: relative;
@@ -240,15 +280,7 @@ button {
   display: flex;
   min-height: 40px;
   align-items: center;
-  gap: 8px;
   padding: 4px 10px;
-}
-
-.router-logo {
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  border-radius: 5px;
 }
 
 .router-wordmark strong {
@@ -256,18 +288,12 @@ button {
   flex: 1;
   overflow: hidden;
   color: var(--ink-strong);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14.5px;
-  font-weight: 700;
-  letter-spacing: -0.04em;
-  line-height: 1;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.router-wordmark strong i {
-  color: var(--ink-faint);
-  font-style: normal;
 }
 
 .sidebar-search-toggle {
@@ -361,6 +387,13 @@ button {
   color: inherit;
   font-size: 12px;
   font-weight: 520;
+}
+
+.primary-nav .badge {
+  min-height: 16px;
+  padding: 1px 5px;
+  font-size: 7px;
+  letter-spacing: 0.035em;
 }
 
 .nav-group-label {
@@ -476,6 +509,13 @@ button {
 .title-tabs span {
   color: var(--ink-subtle);
   font-size: 10.5px;
+}
+
+.title-tabs .badge {
+  min-height: 17px;
+  padding: 1px 5px;
+  color: var(--warning);
+  font-size: 7.5px;
 }
 
 .titlebar-spacer {
@@ -787,17 +827,36 @@ textarea::placeholder {
   overflow: hidden;
 }
 
-.service-health-accordion > summary {
+.service-health-accordion-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 16px 20px;
-  cursor: pointer;
-  list-style: none;
+  min-height: 62px;
+  padding: 10px 12px 10px 20px;
 }
 
-.service-health-accordion > summary::-webkit-details-marker { display: none; }
+.service-health-toggle {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.service-health-toggle > svg {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  transition: transform 160ms ease;
+}
+
+.service-health-toggle > svg.is-open { transform: rotate(180deg); }
 
 .service-health-summary-copy {
   display: grid;
@@ -819,31 +878,21 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
-.service-health-summary-status {
+.service-health-header-actions {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
-  color: var(--ink-faint);
 }
 
-.service-health-accordion[open] > summary {
-  border-bottom: 1px solid var(--line);
+.service-health-details {
+  padding: 0 20px 5px;
+  border-top: 1px solid var(--line);
 }
 
-.service-health-accordion[open] > summary svg { transform: rotate(180deg); }
-
-.service-health-summary-status svg { transition: transform 160ms ease; }
-
-.service-health-details { padding: 0 20px 8px; }
-
-.service-health-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding-top: 10px;
-}
+/* The collapsed region stays mounted so the toggle's aria-controls resolves;
+   this keeps `hidden` authoritative if the rule above ever gains a display. */
+.service-health-details[hidden] { display: none; }
 
 .service-health-list {
   display: grid;
@@ -855,9 +904,12 @@ textarea::placeholder {
   gap: 9px;
   min-width: 0;
   align-items: center;
-  padding: 12px 0;
-  border-top: 1px solid var(--line);
+  min-height: 54px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
 }
+
+.service-health-row:last-child { border-bottom: 0; }
 
 .service-health-row > svg {
   color: var(--ink-faint);
@@ -876,7 +928,7 @@ textarea::placeholder {
 .service-health-row strong {
   overflow: hidden;
   color: var(--ink-strong);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -885,7 +937,7 @@ textarea::placeholder {
 .service-health-row small {
   overflow: hidden;
   color: var(--ink-faint);
-  font-size: 9.5px;
+  font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1819,6 +1871,23 @@ progress::-webkit-progress-value { border-radius: 999px; background: var(--accen
 .settings-actions,
 .maintenance-actions {
   margin-top: 13px;
+}
+
+.subscription-account-create {
+  margin-bottom: 15px;
+}
+
+.subscription-account-row {
+  min-height: 60px;
+  padding-block: 16px;
+}
+
+.subscription-account-row > .settings-actions {
+  flex-shrink: 0;
+  align-self: center;
+  gap: 10px;
+  margin-top: 0;
+  padding-block: 4px;
 }
 
 .surface-summary {

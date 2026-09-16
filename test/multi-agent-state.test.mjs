@@ -48,7 +48,7 @@ test("per-model subagent toggles promote selected mode and remember exclusions",
   assert.deepEqual(all.disabled, ["qwen-plan/qwen3.8-max"]);
 });
 
-test("all mode never promotes models without registry proof", () => {
+test("all mode advertises every model the operator has not switched off", () => {
   const models = [
     { slug: "opencode-go/deepseek-v4-flash" },
     { slug: "qwen-plan/qwen3.8-max", multiAgentVersion: "v1" },
@@ -62,8 +62,10 @@ test("all mode never promotes models without registry proof", () => {
   });
   assert.deepEqual(
     promoted.map((model) => [model.slug, model.multiAgentVersion]),
+    // `all` is documented as "every non-hidden model, regardless of whether
+    // it works". An explicit `off` still beats it.
     [
-      ["opencode-go/deepseek-v4-flash", undefined],
+      ["opencode-go/deepseek-v4-flash", "v2"],
       ["qwen-plan/qwen3.8-max", "v1"],
       ["kimi-oauth/k3", "v2"],
     ],
@@ -90,7 +92,7 @@ test("provider-sized subagent changes preserve other providers", () => {
   assert.deepEqual(subagentSettingsSnapshot().disabled, ["kimi-oauth/k3"]);
 });
 
-test("picker visibility can withhold but never promote models", () => {
+test("picker visibility withholds a model the mode would otherwise advertise", () => {
   const models = [
     { slug: "opencode-go/deepseek-v4-flash" },
     { slug: "qwen-plan/qwen3.8-max" },
@@ -102,14 +104,15 @@ test("picker visibility can withhold but never promote models", () => {
   );
   assert.deepEqual(
     promoted.map((model) => [model.slug, model.multiAgentVersion]),
+    // Hidden always demotes; the mode promotes only what is left.
     [
       ["opencode-go/deepseek-v4-flash", "v1"],
-      ["qwen-plan/qwen3.8-max", undefined],
+      ["qwen-plan/qwen3.8-max", "v2"],
     ],
   );
 });
 
-test("selected mode retains only registry-proven v2 claims", () => {
+test("selected mode advertises registry-proven routes plus the chosen ones", () => {
   const models = [
     { slug: "opencode-go/deepseek-v4-flash" },
     { slug: "qwen-plan/qwen3.8-max" },
@@ -123,15 +126,17 @@ test("selected mode retains only registry-proven v2 claims", () => {
   });
   assert.deepEqual(
     selected.map((model) => [model.slug, model.multiAgentVersion]),
+    // "Proven models plus ones you explicitly turn on"; a route nobody chose
+    // is left exactly as the registry shipped it.
     [
-      ["opencode-go/deepseek-v4-flash", undefined],
+      ["opencode-go/deepseek-v4-flash", "v2"],
       ["qwen-plan/qwen3.8-max", undefined],
       ["kimi-oauth/k3", "v2"],
     ],
   );
 });
 
-test("effective capabilities include machine-local proofs and respect exclusions", () => {
+test("a machine-local proof still promotes nothing on its own", () => {
   const models = [
     { slug: "opencode-go/deepseek-v4-pro" },
     { slug: "opencode-go/deepseek-v4-flash" },
@@ -154,6 +159,9 @@ test("effective capabilities include machine-local proofs and respect exclusions
   );
   assert.deepEqual(
     resolved.map((model) => [model.slug, model.multiAgentVersion]),
+    // deepseek-v4-pro is v2 because the operator selected it, not because a
+    // "proven" proof record exists; deepseek-v4-flash carries the same record
+    // and stays v1 because they switched it off.
     [
       ["opencode-go/deepseek-v4-pro", "v2"],
       ["opencode-go/deepseek-v4-flash", "v1"],

@@ -8,6 +8,8 @@ const routerControl = Object.freeze({
   toggleMaximizeWindow: () => call("toggleMaximizeWindow"),
   closeWindow: () => call("closeWindow"),
   getSnapshot: () => call("getSnapshot"),
+  getChatGptSession: () => call("getChatGptSession"),
+  getChatGptAccountPool: () => call("getChatGptAccountPool"),
   getHealth: () => call("getHealth"),
   getProviders: () => call("getProviders"),
   discoverProviderModels: (providerId, options) =>
@@ -21,6 +23,7 @@ const routerControl = Object.freeze({
   repairInstall: () => call("repairInstall"),
   getPresence: () => call("getPresence"),
   getHarnesses: () => call("getHarnesses"),
+  getAgentBridges: () => call("getAgentBridges"),
   getContextSessions: () => call("getContextSessions"),
   refreshAll: () => call("refreshAll"),
   setProviderEnabled: (providerId, enabled) => call("setProviderEnabled", { providerId, enabled }),
@@ -31,6 +34,7 @@ const routerControl = Object.freeze({
   setSubagentMode: (mode) => call("setSubagentMode", { mode }),
   setSubagentModel: (slug, enabled) => call("setSubagentModel", { slug, enabled }),
   setSubagentEffort: (slug, effort) => call("setSubagentEffort", { slug, effort }),
+  certifySubagentModels: (slugs) => call("certifySubagentModels", { slugs }),
   setSubagentSelection: (selectAll) => call("setSubagentSelection", { selectAll }),
   setPickerModel: (slug, visible) => call("setPickerModel", { slug, visible }),
   setPickerModels: (showAll) => call("setPickerModels", { showAll }),
@@ -54,13 +58,32 @@ const routerControl = Object.freeze({
   setRouterDefault: (slug) => call("setRouterDefault", { slug }),
   clearRouterDefault: () => call("clearRouterDefault"),
   setSignedRouting: (enabled) => call("setSignedRouting", { enabled }),
+  setChatGptSessionSharing: (enabled) => call("setChatGptSessionSharing", { enabled }),
+  addChatGptSubscriptionAccount: (label) => call("addChatGptSubscriptionAccount", { label }),
+  loginChatGptSubscriptionAccount: (accountId) => call("loginChatGptSubscriptionAccount", { accountId }),
+  removeChatGptSubscriptionAccount: (accountId) => call("removeChatGptSubscriptionAccount", { accountId }),
+  setChatGptAccountSelection: (selection) => call("setChatGptAccountSelection", { selection }),
   setPresence: (mode) => call("setPresence", { mode }),
   controlService: (action) => call("controlService", { action }),
   controlTray: (action) => call("controlTray", { action }),
   launchHarness: (harnessId, surface) => call("launchHarness", { harnessId, surface }),
-  installHarness: (harnessId) => call("installHarness", { harnessId }),
+  probeAgentBridge: (bridgeId) => call("probeAgentBridge", { bridgeId }),
+  loginAgentBridge: (bridgeId) => call("loginAgentBridge", { bridgeId }),
+  setupHarness: (harnessId, hostname) => call("setupHarness", { harnessId, hostname }),
+  updateHarness: (harnessId) => call("updateHarness", { harnessId }),
+  prepareCursorTunnel: () => call("prepareCursorTunnel"),
+  connectCursor: (hostname) => call("connectCursor", { hostname }),
+  disconnectCursor: () => call("disconnectCursor"),
+  disconnectHarness: (harnessId) => call("disconnectHarness", { harnessId }),
   openHarnessSession: (harnessId, sessionId, surface, model) => call("openHarnessSession", { harnessId, sessionId, surface, model }),
   openExternal: (url) => call("openExternal", { url }),
+  onNavigation(listener) {
+    if (typeof listener !== "function") throw new TypeError("Navigation listener must be a function.");
+    const wrapped = (_event, destination) => listener(destination);
+    ipcRenderer.on("router-control:navigate", wrapped);
+    ipcRenderer.send("router-control:navigation-ready");
+    return () => ipcRenderer.removeListener("router-control:navigate", wrapped);
+  },
   onOperation(listener) {
     if (typeof listener !== "function") throw new TypeError("Operation listener must be a function.");
     const wrapped = (_event, payload) => listener(payload);

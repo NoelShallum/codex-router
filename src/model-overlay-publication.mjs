@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -12,10 +11,109 @@ import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import {
+  ROUTER_SERVICE_RESTART_MINIMUM_MS,
+  ROUTER_SERVICE_RESTART_OPERATION_MS,
+} from "./router-restart.mjs";
+import {
+  contractOperationDeadline,
+  operationDeadlineFromEnvironment,
+  remainingOperationMs,
+  runDuringOwnerSignalCleanup,
+  runOperationProcessTree,
+  runProcessTree,
+  withOwnerSignalExitBarrier,
+} from "./process-tree.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
 const CHILD_ARGUMENT = "--publish-in-fresh-process";
+const OVERLAY_PUBLISH_OPERATION_MS = 5 * 60_000;
+// Publishing and restarting are sequential. Reserve the restart's complete
+// status/owner/platform/readiness envelope plus handoff margin instead of
+// handing both phases the same nominal five-minute parent deadline.
+const OVERLAY_SERVICE_RESTART_RESERVE_MS =
+  ROUTER_SERVICE_RESTART_OPERATION_MS + 9_000;
+const OVERLAY_RESTARTING_PUBLICATION_MS =
+  OVERLAY_PUBLISH_OPERATION_MS + OVERLAY_SERVICE_RESTART_RESERVE_MS;
+const OVERLAY_RESTARTING_PUBLICATION_MINIMUM_MS =
+  OVERLAY_PUBLISH_OPERATION_MS + ROUTER_SERVICE_RESTART_MINIMUM_MS;
+const DEFAULT_OVERLAY_TRANSACTION_MS = 2 * OVERLAY_RESTARTING_PUBLICATION_MS;
+const MAX_OVERLAY_TRANSACTION_MS = DEFAULT_OVERLAY_TRANSACTION_MS;
+
+function overlayPublicationDeadline(
+  deadline,
+  environment = process.env,
+  { restart = false } = {},
+) {
+  const boundedEnvironment = Number.isSafeInteger(deadline)
+    ? { ...environment, CODEX_ROUTER_OPERATION_DEADLINE_MS: String(deadline) }
+    : environment;
+  const maximumMs = restart
+    ? OVERLAY_RESTARTING_PUBLICATION_MS
+    : OVERLAY_PUBLISH_OPERATION_MS;
+  return operationDeadlineFromEnvironment(boundedEnvironment, {
+    timeoutMs: maximumMs,
+    maximumMs,
+  });
+}
+
+function overlayTransactionDeadline(deadline, environment = process.env) {
+  const boundedEnvironment = Number.isSafeInteger(deadline)
+    ? { ...environment, CODEX_ROUTER_OPERATION_DEADLINE_MS: String(deadline) }
+    : environment;
+  return operationDeadlineFromEnvironment(boundedEnvironment, {
+    timeoutMs: DEFAULT_OVERLAY_TRANSACTION_MS,
+    maximumMs: MAX_OVERLAY_TRANSACTION_MS,
+  });
+}
+
+function overlayRollbackDeadline(restart) {
+  // This epoch deliberately ignores both caller cancellation and the caller's
+  // absolute deadline. Forward work was contracted before mutation to leave
+  // room for it, but an uncooperative mutation or a late thrown error must not
+  // turn an already-expired caller epoch into an immediate rollback failure.
+  return operationDeadlineFromEnvironment({}, {
+    timeoutMs: restart
+      ? OVERLAY_RESTARTING_PUBLICATION_MS
+      : OVERLAY_PUBLISH_OPERATION_MS,
+    maximumMs: restart
+      ? OVERLAY_RESTARTING_PUBLICATION_MS
+      : OVERLAY_PUBLISH_OPERATION_MS,
+  });
+}
+
+function assertRestartingPublicationAllowance(deadline, signal) {
+  const remaining = remainingOperationMs(deadline, signal, {
+    message: "The model-overlay deadline cannot preserve publication and router readiness.",
+  });
+  if (
+    remaining !== undefined
+    && remaining < OVERLAY_RESTARTING_PUBLICATION_MINIMUM_MS
+  ) {
+    const error = new Error(
+      "The model-overlay deadline cannot preserve publication and the full router readiness allowance.",
+    );
+    error.code = "router_operation_timeout";
+    throw error;
+  }
+}
+
+function assertServiceRestartAllowance(deadline, signal) {
+  const remaining = remainingOperationMs(deadline, signal, {
+    message: "The model-overlay deadline cannot preserve router readiness.",
+  });
+  if (
+    remaining !== undefined
+    && remaining < ROUTER_SERVICE_RESTART_MINIMUM_MS
+  ) {
+    const error = new Error(
+      "The model-overlay deadline cannot preserve the full router readiness allowance.",
+    );
+    error.code = "router_operation_timeout";
+    throw error;
+  }
+}
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -87,14 +185,19 @@ export function restoreModelOverlayFiles(
 export async function rebuildModelOverlayPublication({
   writeGateway,
   refreshTargets,
+  signal,
+  deadline,
 } = {}) {
   const write = writeGateway ||
     (await import("./litellm-config.mjs")).writeLiteLlmConfig;
   const refresh = refreshTargets ||
     (await import("./target-integration.mjs")).refreshTargetPickerIfInstalled;
 
+  const operationDeadline = overlayPublicationDeadline(deadline);
+  remainingOperationMs(operationDeadline, signal);
   const gatewayPath = write();
-  const targetsRefreshed = refresh();
+  remainingOperationMs(operationDeadline, signal);
+  const targetsRefreshed = await refresh({ signal, deadline: operationDeadline });
   return { gatewayPath, targetsRefreshed };
 }
 
@@ -103,20 +206,27 @@ export async function rebuildModelOverlayPublication({
  * just committed to disk. The child also provides one fail-closed ordering
  * point: the gateway is written before any Codex, DSH, or Gemini publication.
  */
-export function publishModelOverlayFresh({
-  spawn = spawnSync,
+export async function publishModelOverlayFresh({
+  run = runProcessTree,
   executable = process.execPath,
   sourceRoot = REPO_ROOT,
   environment = process.env,
+  signal,
+  deadline,
 } = {}) {
-  const result = spawn(executable, [SELF, CHILD_ARGUMENT], {
+  const operationDeadline = overlayPublicationDeadline(deadline, environment);
+  const result = await runOperationProcessTree(executable, [SELF, CHILD_ARGUMENT], {
     cwd: sourceRoot,
-    env: { ...environment, MODEL_ROUTER_TARGET: "codex" },
+    env: environment,
+    childEnvironment: {
+      MODEL_ROUTER_TARGET: "codex",
+    },
+    signal,
+    deadline: operationDeadline,
+    run,
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-  if (result?.error) throw result.error;
   if (result?.status !== 0) {
     const detail = String(result?.stderr || "").trim();
     throw new Error(detail || "The shared model routes could not be published.");
@@ -138,10 +248,21 @@ export async function applyModelOverlayPublication({
   restart = false,
   publish = publishModelOverlayFresh,
   restartService,
+  signal,
+  deadline,
 } = {}) {
+  const operationDeadline = overlayPublicationDeadline(deadline, process.env, { restart });
   const warnings = {};
   try {
-    await publish();
+    let publishDeadline = operationDeadline;
+    if (restart) {
+      assertRestartingPublicationAllowance(operationDeadline, signal);
+      publishDeadline = contractOperationDeadline(operationDeadline, {
+        reserveMs: OVERLAY_SERVICE_RESTART_RESERVE_MS,
+        message: "The model-overlay publication has no remaining service-restart epoch.",
+      });
+    } else remainingOperationMs(operationDeadline, signal);
+    await publish({ signal, deadline: publishDeadline });
   } catch (error) {
     if (!warningOnly) throw error;
     warnings.catalogError = errorMessage(error);
@@ -154,11 +275,12 @@ export async function applyModelOverlayPublication({
 
   if (restart) {
     try {
-      const reload = restartService || (async () => {
+      const reload = restartService || (async (operation) => {
         const { restartRouterServiceIfInstalled } = await import("./router-restart.mjs");
-        return restartRouterServiceIfInstalled();
+        return restartRouterServiceIfInstalled(operation);
       });
-      await reload();
+      assertServiceRestartAllowance(operationDeadline, signal);
+      await reload({ signal, deadline: operationDeadline });
     } catch (error) {
       if (!warningOnly) throw error;
       warnings.restartError = errorMessage(error);
@@ -173,9 +295,23 @@ export async function restorePublishedModelOverlay({
   warningOnly = false,
   applyPublication = applyModelOverlayPublication,
   restartService,
+  signal,
+  deadline,
 } = {}) {
+  const operationDeadline = overlayPublicationDeadline(deadline, process.env, { restart });
+  // The durable overlay snapshot is the transaction's source of truth. Always
+  // restore it first, even when forward publication consumed the remaining
+  // budget; the best-effort client/gateway republish below may then report an
+  // aggregated deadline failure without leaving the failed mutation on disk.
   await restore();
-  await applyPublication({ restart, restartService, warningOnly });
+  remainingOperationMs(operationDeadline, signal);
+  await applyPublication({
+    restart,
+    restartService,
+    warningOnly,
+    signal,
+    deadline: operationDeadline,
+  });
 }
 
 export function aggregateRollbackError(operationError, rollbackError) {
@@ -202,7 +338,10 @@ export async function transactModelOverlayMutation({
   applyPublication = applyModelOverlayPublication,
   restartService,
   lock = true,
+  signal,
+  deadline,
 } = {}) {
+  const operationDeadline = overlayTransactionDeadline(deadline);
   const transaction = async () => {
     // Capture only after the cross-process lock is held. Capturing before the
     // lock lets a queued operation retain a stale snapshot and roll back a
@@ -219,28 +358,63 @@ export async function transactModelOverlayMutation({
         : restoreModelOverlayFiles(nextSnapshots);
 
     const restartRequested = typeof restart === "function" ? await restart() : restart;
-    try {
-      await mutate();
-      return await applyPublication({
-        restart: restartRequested,
-        restartService,
-        warningOnly,
-      });
-    } catch (operationError) {
-      try {
-        if (!restoreState) throw new Error("A model-overlay transaction has no rollback state.");
-        await restorePublishedModelOverlay({
-          restore: restoreState,
-          restart: restartRequested,
-          warningOnly,
-          applyPublication,
-          restartService,
-        });
-      } catch (rollbackError) {
-        throw aggregateRollbackError(operationError, rollbackError);
-      }
-      throw operationError;
+    const rollbackReserveMs = restartRequested
+      ? OVERLAY_RESTARTING_PUBLICATION_MS
+      : OVERLAY_PUBLISH_OPERATION_MS;
+    // Restart-bearing forward and rollback phases each own a complete
+    // five-minute publication budget followed by a complete service-restart
+    // budget. Contract the caller before mutation, never after it has changed
+    // durable state.
+    const forwardDeadline = contractOperationDeadline(operationDeadline, {
+      reserveMs: rollbackReserveMs,
+      message: "The model-overlay operation has no remaining semantic rollback epoch.",
+    });
+    if (restartRequested) {
+      assertRestartingPublicationAllowance(forwardDeadline, signal);
     }
+    return withOwnerSignalExitBarrier(async (ownerSignal) => {
+      const forwardSignal = signal
+        ? AbortSignal.any([signal, ownerSignal])
+        : ownerSignal;
+      try {
+        remainingOperationMs(forwardDeadline, forwardSignal);
+        await mutate();
+        remainingOperationMs(forwardDeadline, forwardSignal);
+        return await applyPublication({
+          restart: restartRequested,
+          restartService,
+          warningOnly,
+          signal: forwardSignal,
+          deadline: forwardDeadline,
+        });
+      } catch (operationError) {
+        try {
+          if (!restoreState) throw new Error("A model-overlay transaction has no rollback state.");
+          const rollbackDeadline = overlayRollbackDeadline(restartRequested);
+          await runDuringOwnerSignalCleanup(() => restorePublishedModelOverlay({
+            restore: restoreState,
+            restart: restartRequested,
+            // Forward warning-only publication is appropriate only after an
+            // irreversible physical operation. Rollback is the consistency
+            // boundary and must never turn a failed republish/restart into a
+            // warning that lets divergent durable and running state pass.
+            warningOnly: false,
+            applyPublication,
+            restartService,
+            signal: undefined,
+            deadline: rollbackDeadline,
+          }));
+        } catch (rollbackError) {
+          throw aggregateRollbackError(operationError, rollbackError);
+        }
+        throw operationError;
+      }
+    }, {
+      // A received owner signal may interrupt forward publication immediately.
+      // Keep the process alive long enough for the independent rollback epoch
+      // plus its child-tree cleanup margin, without extending normal callers.
+      timeoutMs: rollbackReserveMs + 10_000,
+    });
   };
   return lock ? withModelOverlayLock(transaction) : transaction();
 }

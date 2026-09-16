@@ -97,6 +97,7 @@ for (const event of events) {
       savedTokens,
       cumulativeSavedTokens,
       resultsAged: event.toolResultsAged ?? 0,
+      resultsShaped: event.toolResultsShaped ?? 0,
     });
   }
 
@@ -104,10 +105,14 @@ for (const event of events) {
     // Fresh vs stable classification: a turn whose (count, bytes) aging
     // signature repeats the previous turn for that model resends receipts
     // byte-identically; a new signature means a fresh compaction this turn.
-    const signature = `${event.toolResultsAged ?? 0}:${event.toolResultBytesSaved ?? 0}`;
+    const resultsCompacted =
+      (event.toolResultsAged ?? 0) + (event.toolResultsShaped ?? 0);
+    const signature =
+      `${event.toolResultsAged ?? 0}:${event.toolResultsShaped ?? 0}:` +
+      `${event.toolResultBytesSaved ?? 0}`;
     const previous = receiptSeen.get(event.model);
     receiptSeen.set(event.model, signature);
-    const kind = !event.toolResultsAged
+    const kind = !resultsCompacted
       ? "unaged"
       : previous === signature
         ? "stable"

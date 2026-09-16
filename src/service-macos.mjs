@@ -20,8 +20,25 @@ import {
   STATE_DIR,
   TARGET,
 } from "./paths.mjs";
+import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
-import { assertServiceWriteIsolated } from "./service-write-guard.mjs";
+import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
+import {
+  skipServiceManagerCall,
+  assertServiceWriteIsolated,
+} from "./service-write-guard.mjs";
+
+// Only this platform's own module can reach this machine's service manager.
+// Run anywhere else -- the cross-platform render tests drive all three modules
+// on one host -- launchctl is absent or a test's own stub.
+const HOST_MANAGED = process.platform === "darwin";
+
+// Reads stay live. Skipping `print` as well made `loaded()` answer "nothing is
+// there" for every caller, which changed what the doctor reports about the
+// service and, through it, what else the doctor goes on to do -- CI caught
+// that as two unrelated Windows tests failing on their own cleanup. Only the
+// verbs that change launchd's registration are skipped.
+const MUTATING_VERBS = new Set(["bootout", "bootstrap", "disable", "enable", "kickstart"]);
 
 const command = process.argv[2] || "status";
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
@@ -57,6 +74,9 @@ function environmentEntries() {
     MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
     MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(PORTS.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(PORTS.devinCli),
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(PORTS.antigravityOauth),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     KIMI_CODEX_STATE_DIR: STATE_DIR,
@@ -67,6 +87,8 @@ function environmentEntries() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...serviceProxyEnvironment(),
+    ...serviceGrokPatchHookEnvironment(),
+    ...providerApiKeyServiceEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
       : {}),
@@ -85,6 +107,11 @@ function environmentEntries() {
 
 function plist() {
   const start = path.join(SOURCE_ROOT, "src", "start.mjs");
+  // Background starved LiteLLM to ~4% CPU (fb40f8c). Adaptive was meant to
+  // boost under load, but it only does so on XPC transactions; this job is
+  // localhost HTTP, so Adaptive stays at Background. Node forwarders then miss
+  // the 30s OAuth health budget, KeepAlive crash-loops, and tray Update /
+  // doctor --fix wait 300s on /health. Standard is a normal user-agent class.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -107,7 +134,7 @@ ${environmentEntries()}
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Adaptive</string>
+  <string>Standard</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
@@ -119,7 +146,11 @@ ${environmentEntries()}
 `;
 }
 
+
 function run(args, options = {}) {
+  if (MUTATING_VERBS.has(args[0]) && skipServiceManagerCall({ hostManaged: HOST_MANAGED })) {
+    return "";
+  }
   return execFileSync(launchctl, args, {
     encoding: "utf8",
     timeout: 15_000,
@@ -139,6 +170,9 @@ function loaded(targetService = service) {
 }
 
 function bootout(targetService = service) {
+  // Before `loaded`, not after: the loop below polls until the job is gone,
+  // and the job it would see is this machine's own.
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
   const description = loaded(targetService);
   if (!description) return;
   try {
@@ -177,6 +211,7 @@ function writePlist() {
 }
 
 function bootstrap() {
+  if (skipServiceManagerCall({ hostManaged: HOST_MANAGED })) return;
   if (!existsSync(LAUNCH_AGENT_PATH)) {
     throw new Error(`LaunchAgent is not installed at ${LAUNCH_AGENT_PATH}.`);
   }
@@ -216,6 +251,11 @@ if (command === "render") {
     })}\n`,
   );
 } else if (command === "install") {
+  // Before anything, including the bootout below: an install that is going to
+  // be refused for writing outside its fixture must not first unload the
+  // machine's running service. writePlist re-checks; the guard is a pure
+  // predicate.
+  guardPlistWrite();
   bootout();
   // Only safe here. launchd opens StandardOutPath before it execs the service,
   // so a rotation performed by the started process renames a file the process

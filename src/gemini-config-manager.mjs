@@ -26,10 +26,13 @@ import {
   GEMINI_ENV_PATH,
   GEMINI_CATALOG_PATH,
   PORTS,
+  LEGACY_PORTS,
 } from "./paths.mjs";
 import { writePrivateFile, writePrivateJson } from "./file-security.mjs";
+import { refreshGeminiCallerCapabilityDocuments } from "./caller-key-client-refresh.mjs";
 import {
   GEMINI_MANAGED_KEYS,
+  geminiManagedBlockPresent,
   conflictingAssignments,
   removeGeminiEnvBlock,
   spliceGeminiEnvBlock,
@@ -92,6 +95,19 @@ function assertNoConflicts(document) {
  * `model.name` and is out-ranked by `--model`, which is stated in the docs and
  * is why it can be turned off.
  */
+export function refreshCallerCapability() {
+  assertStateOwnership("refresh the Gemini CLI caller capability");
+  if (!existsSync(GEMINI_CATALOG_PATH)) throw new Error("Gemini caller capability catalog is missing; refusing partial refresh.");
+  const document = readDocument(GEMINI_ENV_PATH);
+  assertNoConflicts(document);
+  let published;
+  try { published = JSON.parse(readFileSync(GEMINI_CATALOG_PATH, "utf8")); } catch { throw new Error("Gemini caller capability catalog is invalid; refusing partial refresh."); }
+  const refreshed = refreshGeminiCallerCapabilityDocuments({ document, published, baseUrl: callerBase(), secret: callerSecret(), port: PORTS.router, legacyPort: LEGACY_PORTS.router });
+  writePrivateFile(GEMINI_ENV_PATH, refreshed.document);
+  writePrivateJson(GEMINI_CATALOG_PATH, refreshed.published, { directoryMode: 0o700 });
+  return { refreshed: true, env: GEMINI_ENV_PATH, catalog: GEMINI_CATALOG_PATH };
+}
+
 export function publishGeminiIntegration({
   setDefaultModel = true,
   routedModels = geminiRoutedModels,
@@ -153,9 +169,11 @@ export function geminiIntegrationStatus() {
   // are reported together: `documentReadable: false` is the finding, and an
   // empty `conflicts` beside it does not mean there are none.
   let documentReadable = true;
+  let managedBlockPresent = false;
   let conflicts = [];
   try {
     conflicts = conflictingAssignments(document);
+    managedBlockPresent = geminiManagedBlockPresent(document);
   } catch {
     documentReadable = false;
   }
@@ -164,13 +182,15 @@ export function geminiIntegrationStatus() {
     envExists: existsSync(GEMINI_ENV_PATH),
     installed: existsSync(GEMINI_CATALOG_PATH),
     documentReadable,
+    managedBlockPresent,
     conflicts,
     managedKeys: [...GEMINI_MANAGED_KEYS],
     // Never the complete URL: it carries the caller capability, and status
     // output reaches doctor, the tray, and support bundles.
     baseUrl: published?.baseUrl ? redactCallerUrl(published.baseUrl) : null,
     baseUrlManaged: published?.baseUrl
-      ? isManagedGeminiBaseUrl(published.baseUrl, PORTS.router)
+      ? (isManagedGeminiBaseUrl(published.baseUrl, PORTS.router) ||
+          isManagedGeminiBaseUrl(published.baseUrl, LEGACY_PORTS.router))
       : false,
     defaultModel: published?.defaultModel ?? null,
     publishedModels: Array.isArray(published?.models) ? published.models : [],
@@ -199,6 +219,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const command = process.argv[2] || "status";
   const handlers = {
     status: () => geminiIntegrationStatus(),
+    "caller-capability-refresh": () => refreshCallerCapability(),
     // `--no-default-model` rather than `--set-default-model`: Gemini CLI's own
     // default is a Gemini model this router does not route, so an install that
     // left it alone would 404 on the user's first turn.

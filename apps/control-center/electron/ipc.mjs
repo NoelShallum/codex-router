@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   accessSync,
   closeSync,
@@ -17,13 +17,31 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import {
   assertMutationCompatibility,
   discoverSourceRoot,
   runControl,
+  runControlDetached,
   runControlJson,
   runRouterScript,
+  terminateProcessTree,
 } from "./command-runner.mjs";
+
+const spawnableCommandUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/spawnable-command.mjs", import.meta.url)
+  : new URL("../../../src/spawnable-command.mjs", import.meta.url);
+const { spawnableCommand } = await import(spawnableCommandUrl);
+const loginLeaseUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/chatgpt-login-lease.mjs", import.meta.url)
+  : new URL("../../../src/chatgpt-login-lease.mjs", import.meta.url);
+const {
+  attachChatGPTLoginLease,
+  chatGPTLoginAuthChanged,
+  clearChatGPTLoginLease,
+  createChatGPTLoginLease,
+} = await import(loginLeaseUrl);
 
 // Codex is the one client-specific adapter this panel still exposes (native
 // GPT details and the current task default). Routed model identity and picker
@@ -41,11 +59,108 @@ const RETENTION_MIN_TTL_DAYS = 1;
 const RETENTION_MAX_TTL_DAYS = 3_650;
 const MODEL_SLUG = /^[A-Za-z0-9][A-Za-z0-9._/:+-]{0,200}$/;
 const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,80}$/;
+const CHATGPT_ACCOUNT_ID = /^acct_[A-Za-z0-9_-]{8,80}$/;
+const CHATGPT_LOGIN_URL = /https:\/\/auth\.openai\.com\/oauth\/authorize\?[^\s"'<>]+/;
+const CHATGPT_LOGIN_COMPLETION_TIMEOUT_MS = 10 * 60_000;
 const LOCAL_TAG = /^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
 const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CURSOR_SESSION_ID = /^(?:(?:draft|bc)-)?[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SESSION_UUID_IN_FILENAME = /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
-const HARNESS_IDS = ["codex", "deepcode"];
+const DSH_SESSION_ID = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// The five document-configured harnesses this router publishes into. The
+// authority is `src/routed-harness-catalog.mjs`; this table is the renderer's
+// copy of the parts a detection-only pass needs, kept here for the same reason
+// `HARNESS_SITES` and the docs URLs below are — the app must be able to draw
+// the Harness tab before it can load a module out of the installed router.
+const ROUTED_HARNESS_ROWS = Object.freeze([
+  Object.freeze({
+    id: "opencode",
+    binEnv: "OPENCODE_BIN",
+    displayName: "opencode",
+    ownership: "opencode",
+    description: "The opencode terminal agent, using every model selected in this router.",
+    executables: Object.freeze(["opencode"]),
+    marker: "opencode-models.json",
+    site: "https://opencode.ai/",
+    docs: "https://opencode.ai/docs/config/",
+    installable: true,
+    updater: "opencode upgrade",
+    installHint: "Setup installs opencode-ai when it is missing and publishes every routed model.",
+    publishHint: "Publishes every routed model into opencode's router-owned provider. Other opencode settings remain untouched.",
+  }),
+  Object.freeze({
+    id: "pi",
+    binEnv: "PI_BIN",
+    displayName: "pi",
+    ownership: "pi",
+    description: "Mario Zechner's pi coding agent, using every model selected in this router.",
+    executables: Object.freeze(["pi"]),
+    marker: "pi-models.json",
+    site: "https://pi.dev/",
+    docs: "https://pi.dev/docs/latest/models",
+    installable: true,
+    updater: "pi update --self",
+    installHint: "Setup installs @earendil-works/pi-coding-agent when it is missing and publishes every routed model.",
+    publishHint: "Publishes every routed model into pi's models.json. Every other provider in that file is preserved.",
+  }),
+  Object.freeze({
+    id: "omp",
+    binEnv: "OMP_BIN",
+    displayName: "omp",
+    ownership: "omp",
+    description: "The omp (oh-my-pi) terminal agent, using every model selected in this router.",
+    executables: Object.freeze(["omp"]),
+    marker: "omp-models.json",
+    site: "https://omp.sh/",
+    docs: "https://github.com/can1357/oh-my-pi/blob/main/docs/models.md",
+    // omp runs on Bun and installs from its own script, Homebrew, or Bun, none
+    // of which this router runs on somebody's behalf. The row links to them.
+    installable: false,
+    updater: null,
+    installHint: "Install omp from omp.sh first; setup then publishes every routed model into ~/.omp/agent/models.yml.",
+    publishHint: "Publishes every routed model into omp's models.yml. Comments and every other provider are preserved.",
+  }),
+  Object.freeze({
+    id: "commandcode",
+    binEnv: "COMMANDCODE_BIN",
+    displayName: "Command Code",
+    ownership: "commandcode",
+    description: "Command Code's CLI as a BYOK client of this router's Anthropic surface.",
+    executables: Object.freeze(process.platform === "win32" ? ["command-code", "cmdc"] : ["command-code", "cmd"]),
+    marker: "commandcode-models.json",
+    site: "https://commandcode.ai/",
+    docs: "https://commandcode.ai/docs/byok",
+    installable: true,
+    // `command-code`, not the `cmd` alias the docs use: `cmd` is the Windows
+    // command shell, so Command Code ships as `cmdc` there. The full name is
+    // the one that resolves on every platform, and the one this router runs.
+    updater: "command-code update",
+    installHint: "Setup installs command-code 1.30.0 or later (the first release that reads providers.json) and publishes every routed model as a BYOK provider.",
+    publishHint: "Publishes every routed model into ~/.commandcode/providers.json. Your Command Code plan and its own models are untouched.",
+  }),
+  Object.freeze({
+    id: "hermes",
+    binEnv: "HERMES_BIN",
+    displayName: "Hermes Agent",
+    ownership: "nousresearch",
+    description: "Nous Research's Hermes Agent as a named custom provider on this router.",
+    executables: Object.freeze(["hermes"]),
+    marker: "hermes-models.json",
+    site: "https://hermes-agent.nousresearch.com/",
+    docs: "https://hermes-agent.nousresearch.com/docs/integrations/providers",
+    // Hermes installs from its own shell script rather than a package
+    // registry, and this router does not run remote installers on somebody's
+    // behalf. The row links to the official instructions instead.
+    installable: false,
+    updater: "hermes update --yes",
+    installHint: "Install the official Hermes Agent first; setup then publishes every routed model into its config.yaml.",
+    publishHint: "Publishes every routed model as the codex-router provider in Hermes's config.yaml. Every other setting is preserved.",
+  }),
+]);
+const ROUTED_HARNESS_IDS = ROUTED_HARNESS_ROWS.map((row) => row.id);
+const HARNESS_IDS = ["codex", "dsh", "gemini", "cursor", "claude", "openclaw", ...ROUTED_HARNESS_IDS];
 const HARNESS_SURFACES = ["app", "terminal"];
+const AGENT_BRIDGE_IDS = ["anthropic", "cursor", "gemini"];
 const SESSION_INDEX_LIMIT = 16 * 1024 * 1024;
 const SESSION_EDGE_BYTES = 256 * 1024;
 const SESSION_LIST_LIMIT = 500;
@@ -53,15 +168,52 @@ const SESSION_LIST_LIMIT = 500;
 // and committing all coupled model files. Leave room for both the bounded
 // lock wait and the build itself; killing the lock holder at the old 30/120s
 // limits would strand a stale lock and force a rollback to race recovery.
-const CATALOG_MUTATION_TIMEOUT_MS = 330_000;
+// A restart-bearing model-overlay mutation owns two complete 640-second
+// epochs: each has five minutes for publication followed by the service's
+// status/platform/readiness envelope. The runner and control owner retain
+// their process-tree cleanup margins outside the 1,280-second transaction.
+const CATALOG_MUTATION_TIMEOUT_MS = 1_320_000;
+// Provider usage combines the local retained ledger with optional account
+// quota reads. OAuth refreshes alone may take 30 seconds, and a rejected token
+// can require a second refresh before the provider answers. Keep this aligned
+// with the control command's 120-second default: timing it out at 20 seconds
+// discards the already-computed ledger and makes the dashboard fall back to
+// its latest 1,000 event details.
+const PROVIDER_USAGE_TIMEOUT_MS = 120_000;
+// Five live checks, two of them a full Codex parent-and-child turn. The
+// catalog ceiling is not enough headroom for a slow provider, and a timeout
+// here reads to the operator as "your model failed" when it did not.
+const SUBAGENT_CERTIFY_TIMEOUT_MS = 600_000;
+const ROUTER_BROWSER_OAUTH_TIMEOUT_MS = 11 * 60_000;
+// The live compatibility request and the managed service readiness gate share
+// one ten-minute budget. The command runner gets one extra minute solely to
+// terminate the complete child tree and return a truthful failure to the UI.
+const ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS = 10 * 60_000;
+const ANTIGRAVITY_PROBE_RUNNER_TIMEOUT_MS =
+  ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS + 60_000;
 // Repair reruns the installer with --force-deps, which rebuilds node_modules
 // and the Python environment from scratch. That is the slowest thing this app
 // can start, so it gets the runner's whole ceiling rather than a catalog-sized
 // budget; timing it out early would leave a half-rebuilt tree behind.
 const REPAIR_TIMEOUT_MS = 11 * 60_000;
-const DEEPCODE_PACKAGE = "@vegamo/deepcode-cli";
-const DEEPCODE_DOCS = "https://api-docs.deepseek.com/quick_start/agent_integrations/deepcode";
+const CURSOR_CONNECTOR_TIMEOUT_MS = 10 * 60_000;
+const CURSOR_QUIT_TIMEOUT_MS = 5 * 60_000;
+const DSH_DOCS = "https://github.com/deepseek-ai/deepseek-harness";
+const CURSOR_DOCS = "https://docs.cursor.com/en/cli/overview";
+const CLOUDFLARED_INSTALL_DOCS = "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/";
 const CODEX_DOCS = "https://developers.openai.com/codex/cli/";
+const CLAUDE_CODE_DOCS = "https://code.claude.com/docs/en/overview";
+const GEMINI_CLI_DOCS = "https://github.com/google-gemini/gemini-cli";
+const OPENCLAW_DOCS = "https://docs.openclaw.ai/";
+const HARNESS_SITES = Object.freeze({
+  openclaw: "https://openclaw.ai/",
+  codex: "https://openai.com/codex/",
+  dsh: DSH_DOCS,
+  cursor: "https://cursor.com/",
+  claude: "https://claude.com/product/claude-code",
+  gemini: "https://google-gemini.github.io/gemini-cli/",
+  ...Object.fromEntries(ROUTED_HARNESS_ROWS.map((row) => [row.id, row.site])),
+});
 const OAUTH_LOGIN_COMMANDS = Object.freeze({
   "kimi-oauth": { executable: "kimi", args: ["login"] },
   "grok-oauth": { executable: "grok", args: ["login", "--oauth"] },
@@ -101,6 +253,7 @@ function executablePath(name) {
       ? [
           process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "nodejs") : undefined,
           process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Programs", "nodejs") : undefined,
+          process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links") : undefined,
           process.env.APPDATA ? path.join(process.env.APPDATA, "npm") : undefined,
         ]
       : []),
@@ -147,23 +300,145 @@ function codexDesktopPath() {
   ].find((candidate) => existsSync(candidate));
 }
 
+function cursorDesktopPath() {
+  return [
+    "/Applications/Cursor.app",
+    path.join(os.homedir(), "Applications", "Cursor.app"),
+    ...(process.platform === "win32" && process.env.LOCALAPPDATA
+      ? [path.join(process.env.LOCALAPPDATA, "Programs", "cursor", "Cursor.exe")]
+      : []),
+  ].find((candidate) => existsSync(candidate));
+}
+
+function openclawDesktopPath() {
+  const localAppData = process.env.LOCALAPPDATA;
+  const programFiles = process.env.PROGRAMFILES;
+  return [
+    "/Applications/OpenClaw.app",
+    path.join(os.homedir(), "Applications", "OpenClaw.app"),
+    ...(process.platform === "linux"
+      ? [
+          executablePath("openclaw-desktop"),
+          "/usr/bin/openclaw-desktop",
+          "/usr/local/bin/openclaw-desktop",
+          path.join(os.homedir(), ".local", "bin", "openclaw-desktop"),
+        ]
+      : []),
+    ...(process.platform === "win32"
+      ? [
+          localAppData && path.join(localAppData, "Programs", "OpenClaw Companion", "OpenClaw Companion.exe"),
+          localAppData && path.join(localAppData, "Programs", "OpenClawCompanion", "OpenClawCompanion.exe"),
+          localAppData && path.join(localAppData, "Programs", "OpenClaw", "OpenClaw.exe"),
+          programFiles && path.join(programFiles, "OpenClaw Companion", "OpenClaw Companion.exe"),
+        ]
+      : []),
+  ].filter(Boolean).find((candidate) => existsSync(candidate));
+}
+
+function cursorConnectorInstallSpec() {
+  if (process.platform === "darwin") {
+    const brew = executablePath("brew");
+    return brew ? {
+      executable: brew,
+      args: ["install", "cloudflared"],
+      environment: { HOMEBREW_NO_AUTO_UPDATE: "1", HOMEBREW_NO_ENV_HINTS: "1" },
+    } : undefined;
+  }
+  if (process.platform === "win32") {
+    const winget = executablePath("winget");
+    return winget ? {
+      executable: winget,
+      args: [
+        "install", "--id", "Cloudflare.cloudflared", "--exact", "--silent",
+        "--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity",
+      ],
+      environment: {},
+    } : undefined;
+  }
+  return undefined;
+}
+
+function routerStateDirectory() {
+  return process.env.MODEL_ROUTER_STATE_DIR || process.env.CODEX_ROUTER_STATE_DIR ||
+    process.env.KIMI_CODEX_STATE_DIR ||
+    path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "codex-router");
+}
+
+function cursorHome() {
+  return process.env.CURSOR_HOME || (
+    process.platform === "darwin"
+      ? path.join(os.homedir(), "Library", "Application Support", "Cursor")
+      : process.platform === "win32"
+        ? path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Cursor")
+        : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "Cursor")
+  );
+}
+
+function readJsonObject(filePath, limit = SESSION_INDEX_LIMIT) {
+  const text = readBounded(filePath, limit);
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function terminalAvailable() {
   return process.platform === "darwin" && existsSync("/usr/bin/open");
 }
 
 export function getHarnessSnapshot() {
   const codex = executablePath("codex");
-  const deepcode = executablePath("deepcode");
-  const npm = executablePath("npm");
-  const nodeVersion = executableVersion(executablePath("node"));
-  const nodeMajor = Number.parseInt(String(nodeVersion || "").replace(/^v/, "").split(".", 1)[0], 10);
+  const dsh = executablePath("dsh");
+  const cursorAgent = executablePath("cursor-agent");
+  const cursorLauncher = executablePath("cursor-router-agent");
+  const claude = executablePath("claude");
+  const claudeLauncher = executablePath("claude-router");
+  const gemini = executablePath("gemini");
+  const openclaw = executablePath("openclaw");
   const codexVersion = executableVersion(codex);
-  const deepcodeVersion = executableVersion(deepcode);
-  const deepcodeSettings = path.join(os.homedir(), ".deepcode", "settings.json");
+  const dshVersion = executableVersion(dsh);
+  const cursorVersion = executableVersion(cursorAgent);
+  const claudeVersion = executableVersion(claude);
+  const geminiVersion = executableVersion(gemini);
+  const openclawVersion = executableVersion(openclaw);
+  const openclawApp = openclawDesktopPath();
+  const stateDirectory = routerStateDirectory();
+  const codexConfig = readBounded(path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "config.toml"), 2 * 1024 * 1024);
+  const cursorState = readJsonObject(path.join(stateDirectory, "cursor-models.json"), 2 * 1024 * 1024);
+  const claudeState = readJsonObject(path.join(stateDirectory, "claude-models.json"), 2 * 1024 * 1024);
+  const geminiState = readJsonObject(path.join(stateDirectory, "gemini-models.json"), 2 * 1024 * 1024);
+  const openclawState = readJsonObject(path.join(stateDirectory, "openclaw-models.json"), 2 * 1024 * 1024);
+  const cursorTunnel = readJsonObject(path.join(stateDirectory, "cursor-tunnel.json"), 512 * 1024);
+  const cloudflared = executablePath("cloudflared");
+  const cloudflareLoggedIn = existsSync(
+    process.env.TUNNEL_ORIGIN_CERT || path.join(
+      process.env.MODEL_ROUTER_CLOUDFLARED_HOME || path.join(os.homedir(), ".cloudflared"),
+      "cert.pem",
+    ),
+  );
+  const cursorApp = cursorDesktopPath();
   return {
     platform: process.platform,
     terminalAvailable: terminalAvailable(),
     harnesses: [
+      {
+        id: "openclaw",
+        displayName: "OpenClaw",
+        ownership: "openclaw",
+        description: "OpenClaw's current agent runtime using every model selected in this router.",
+        cliInstalled: Boolean(openclaw),
+        ...(openclawVersion ? { cliVersion: openclawVersion } : {}),
+        appInstalled: Boolean(openclawApp),
+        configured: Boolean(openclawState?.models?.length),
+        canInstall: true,
+        installRequirement: openclaw
+          ? "Publishes every routed model into OpenClaw's router-owned provider. Other OpenClaw settings remain untouched."
+          : "Setup installs openclaw@latest and publishes every routed model in one action.",
+        docsUrl: OPENCLAW_DOCS,
+      },
       {
         id: "codex",
         displayName: "Codex",
@@ -172,31 +447,116 @@ export function getHarnessSnapshot() {
         cliInstalled: Boolean(codex),
         ...(codexVersion ? { cliVersion: codexVersion } : {}),
         appInstalled: Boolean(codexDesktopPath()),
-        configured: Boolean(codex),
-        canInstall: false,
-        installRequirement: codex ? undefined : "Install Codex from the official OpenAI download.",
+        configured: /# BEGIN (?:kimi-)?codex-(?:router|proxy)-/m.test(codexConfig || ""),
+        canInstall: Boolean(codex || codexDesktopPath()),
+        installRequirement: codex || codexDesktopPath()
+          ? "Publishes the shared router catalog into Codex."
+          : "Install Codex from the official OpenAI download.",
         docsUrl: CODEX_DOCS,
       },
       {
-        id: "deepcode",
-        displayName: "Deep Code",
-        ownership: "third-party",
-        description: "A third-party terminal harness optimized for DeepSeek models.",
-        cliInstalled: Boolean(deepcode),
-        ...(deepcodeVersion ? { cliVersion: deepcodeVersion } : {}),
-        appInstalled: false,
-        // Presence only. The control center never opens this file because it can contain an API key.
-        configured: existsSync(deepcodeSettings),
-        canInstall: Boolean(npm) && Number.isInteger(nodeMajor) && nodeMajor >= 22 && terminalAvailable(),
-        installRequirement: !npm
-          ? "npm is required."
-          : !Number.isInteger(nodeMajor) || nodeMajor < 22
-            ? "Node.js 22 or newer is required."
-            : !terminalAvailable()
-              ? "Open an interactive terminal and install the package manually."
-              : undefined,
-        docsUrl: DEEPCODE_DOCS,
+        id: "dsh",
+        displayName: "DeepSeek Harness",
+        ownership: "deepseek",
+        description: "DeepSeek's coding harness, sharing this router's model catalog and credentials.",
+        cliInstalled: Boolean(dsh),
+        ...(dshVersion ? { cliVersion: dshVersion } : {}),
+        appInstalled: Boolean(dsh),
+        configured: existsSync(path.join(stateDirectory, "dsh-models.json")),
+        canInstall: true,
+        installRequirement: "Setup installs @deepseek-ai/dsh when it is missing and publishes the shared route.",
+        docsUrl: DSH_DOCS,
       },
+      {
+        id: "claude",
+        displayName: "Claude Code",
+        ownership: "anthropic",
+        description: "Anthropic's coding agent using every model selected in this router.",
+        cliInstalled: Boolean(claude),
+        ...(claudeVersion ? { cliVersion: claudeVersion } : {}),
+        appInstalled: false,
+        configured: Boolean(claudeLauncher && claudeState?.models?.length),
+        canInstall: Boolean(claude),
+        installRequirement: claude
+          ? "Creates a private claude-router launcher and publishes the shared routed catalog. Claude settings remain untouched."
+          : "Install the official Claude Code CLI first.",
+        docsUrl: CLAUDE_CODE_DOCS,
+      },
+      {
+        id: "gemini",
+        displayName: "Gemini CLI",
+        ownership: "google",
+        description: "Google's terminal coding agent using the shared routed model catalog.",
+        cliInstalled: Boolean(gemini),
+        ...(geminiVersion ? { cliVersion: geminiVersion } : {}),
+        appInstalled: false,
+        configured: Boolean(geminiState?.models?.length),
+        canInstall: Boolean(gemini),
+        installRequirement: gemini
+          ? "Publishes the shared router catalog into Gemini CLI. Its settings file remains untouched."
+          : "Install the official Gemini CLI first.",
+        docsUrl: GEMINI_CLI_DOCS,
+      },
+      {
+        id: "cursor",
+        displayName: "Cursor",
+        ownership: "cursor",
+        description: "Cursor Agent and Cursor App using the router's separate authenticated adapters.",
+        cliInstalled: Boolean(cursorAgent),
+        ...(cursorVersion ? { cliVersion: cursorVersion } : {}),
+        appInstalled: Boolean(cursorApp),
+        configured: Boolean(cursorLauncher && (!cursorApp || cursorState?.publicOrigin)),
+        agentConfigured: Boolean(cursorLauncher),
+        appConfigured: Boolean(cursorState?.publicOrigin),
+        canInstall: Boolean(cursorAgent || cursorApp),
+        installRequirement: cursorAgent || cursorApp
+          ? !cursorApp
+            ? "Cursor Agent connects locally and always reads the current routed catalog."
+            : cursorState?.publicOrigin
+              ? "Cursor App and Cursor Agent use the shared routed catalog."
+              : "Connect Cursor installs the connector when needed, opens Cloudflare authorization, creates an isolated hostname, publishes the catalog, verifies it, and reopens Cursor."
+          : "Install Cursor App or Cursor Agent first.",
+        tunnel: {
+          provider: "cloudflare",
+          binaryInstalled: Boolean(cloudflared),
+          loggedIn: cloudflareLoggedIn,
+          configured: Boolean(cursorTunnel?.hostname),
+          ...(cursorTunnel?.hostname ? { hostname: cursorTunnel.hostname } : {}),
+          nextAction: !cloudflared
+            ? "install-cloudflared"
+            : cursorTunnel?.hostname
+              ? "ready"
+              : !cloudflareLoggedIn ? "login" : "choose-hostname",
+        },
+        ...(typeof cursorState?.publicOrigin === "string" ? { publicOrigin: cursorState.publicOrigin } : {}),
+        docsUrl: CURSOR_DOCS,
+      },
+      // Detection only: this runs on every page load, so it reads a marker and
+      // looks for an executable and does nothing else. Whether a routed
+      // harness is *correctly* published is a question for its own status
+      // command, which costs a process and is asked when a row is acted on.
+      ...ROUTED_HARNESS_ROWS.map((row) => {
+        const binary = row.executables.map((name) => executablePath(name)).find(Boolean);
+        const version = executableVersion(binary);
+        return {
+          id: row.id,
+          displayName: row.displayName,
+          ownership: row.ownership,
+          description: row.description,
+          cliInstalled: Boolean(binary),
+          ...(version ? { cliVersion: version } : {}),
+          appInstalled: false,
+          configured: existsSync(path.join(stateDirectory, row.marker)),
+          canInstall: row.installable || Boolean(binary),
+          installRequirement: binary ? row.publishHint : row.installHint,
+          // Updating is offered only for a client that is actually here and has
+          // something to run. It is never implied by setup: bumping a global
+          // coding agent is its own decision, so it gets its own button.
+          canUpdate: Boolean(binary) && Boolean(row.updater || row.installable),
+          ...(row.updater ? { updateCommand: row.updater } : {}),
+          docsUrl: row.docs,
+        };
+      }),
     ],
   };
 }
@@ -235,6 +595,296 @@ function openTerminalCommand(executable, args, cwd) {
   });
   if (opened.error || opened.status !== 0) throw new Error("Could not open Terminal.");
   return { opened: true, surface: "terminal" };
+}
+
+// Codex owns the OAuth callback and browser hand-off for ChatGPT login. Spawn
+// it detached instead of wrapping it in Terminal: the CLI starts its local
+// callback server, opens the system browser, and keeps the isolated
+// CODEX_HOME profile while the user completes sign-in.
+export function openBrowserCommand(executable, args, cwd, {
+  environment = {},
+  onSpawn,
+  onExit,
+  openExternal,
+  completionTimeoutMs = CHATGPT_LOGIN_COMPLETION_TIMEOUT_MS,
+} = {}) {
+  if (!executable || !path.isAbsolute(executable) || !Array.isArray(args)) throw new Error("Browser command is unavailable.");
+  if (args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) throw new Error("Browser command is invalid.");
+  if (typeof openExternal !== "function") throw new Error("The default browser opener is unavailable.");
+  if (onSpawn !== undefined && typeof onSpawn !== "function") throw new Error("Browser process ownership callback is invalid.");
+  if (!Number.isFinite(completionTimeoutMs) || completionTimeoutMs <= 0 || completionTimeoutMs > 30 * 60_000) {
+    throw new Error("Browser login completion timeout is invalid.");
+  }
+  const resolvedCwd = cwd ? realpathSync(cwd) : discoverSourceRoot();
+  if (!statSync(resolvedCwd).isDirectory()) throw new Error("The session workspace is unavailable.");
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
+    throw new Error("Browser environment is invalid.");
+  }
+  for (const [name, value] of Object.entries(environment)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || typeof value !== "string" || value.includes("\0")) {
+      throw new Error("Browser environment is invalid.");
+    }
+  }
+  const node = executablePath("node");
+  const childPath = [...new Set([
+    path.dirname(executable),
+    node && path.dirname(node),
+    ...String(environment.PATH || process.env.PATH || "").split(path.delimiter),
+  ].filter(Boolean))].join(path.delimiter);
+  const command = spawnableCommand(executable, args);
+  const child = spawn(command.command, command.args, {
+    cwd: resolvedCwd,
+    env: { ...process.env, ...environment, PATH: childPath },
+    // Codex prints the OAuth authorize URL before waiting for the callback.
+    // Keep its own process detached, but observe that bounded output so the
+    // router can explicitly hand the URL to macOS's default browser when the
+    // CLI's best-effort opener is unavailable from a GUI-launched process.
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
+    windowsHide: true,
+    shell: false,
+    ...command.options,
+  });
+  let browserOpened = false;
+  let urlObserved = false;
+  let childExited = false;
+  let openingBrowser = false;
+  let loginOutput = "";
+  let finished = false;
+  let settled = false;
+  let aborting = false;
+  let terminalError;
+  let urlTimeout;
+  let completionTimeout;
+  let resolveOpen;
+  let rejectOpen;
+  const opened = new Promise((resolve, reject) => {
+    resolveOpen = resolve;
+    rejectOpen = reject;
+  });
+  const finish = (outcome = {}) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(completionTimeout);
+    if (typeof onExit === "function") onExit(outcome);
+  };
+  const fail = (error) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(urlTimeout);
+    rejectOpen(error instanceof Error ? error : new Error(String(error)));
+  };
+  const abort = async (error) => {
+    // Promise settlement is independent from child cleanup. The Codex child
+    // may print its URL and exit while Electron's browser opener is still
+    // pending; a later opener rejection must still reject `opened`, even
+    // though close already delivered the exactly-once onExit notification.
+    if (finished) {
+      fail(error);
+      return;
+    }
+    if (aborting) return;
+    aborting = true;
+    terminalError = error instanceof Error ? error.message : String(error);
+    clearTimeout(urlTimeout);
+    clearTimeout(completionTimeout);
+    // The detached Codex CLI owns the OAuth callback listener and may have
+    // descendants. If browser hand-off fails, leaving that tree alive keeps
+    // the callback port and the per-account in-flight gate occupied forever.
+    try {
+      await terminateProcessTree(child);
+    } catch {
+      try { child.kill("SIGKILL"); } catch {}
+    } finally {
+      finish({ error: terminalError });
+      fail(error);
+    }
+  };
+  const maybeFailAfterExit = () => {
+    if (childExited && !urlObserved && !openingBrowser) {
+      fail(new Error("Codex login exited before providing an OAuth browser URL."));
+    }
+  };
+  const inspectLoginOutput = (chunk) => {
+    if (urlObserved || settled) return;
+    // A GUI-launched child can still emit terminal styling; remove it before
+    // extracting the URL so the browser hand-off does not depend on a TTY.
+    loginOutput = `${loginOutput}${String(chunk).replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, "")}`.slice(-128 * 1024);
+    const match = loginOutput.match(CHATGPT_LOGIN_URL);
+    if (!match) return;
+    urlObserved = true;
+    openingBrowser = true;
+    Promise.resolve()
+      .then(() => openExternal(match[0]))
+      .then(() => {
+        openingBrowser = false;
+        if (settled) return;
+        browserOpened = true;
+        settled = true;
+        clearTimeout(urlTimeout);
+        if (!finished) {
+          completionTimeout = setTimeout(() => {
+            void abort(new Error("Codex login did not finish before the browser sign-in deadline."));
+          }, completionTimeoutMs);
+          completionTimeout.unref?.();
+        }
+        resolveOpen({ opened: true, surface: "browser" });
+      })
+      .catch((error) => {
+        openingBrowser = false;
+        void abort(new Error(`Could not open the default browser: ${error instanceof Error ? error.message : String(error)}`));
+      });
+  };
+  child.stdout?.on("data", inspectLoginOutput);
+  child.stderr?.on("data", inspectLoginOutput);
+  urlTimeout = setTimeout(() => {
+    if (!browserOpened) {
+      void abort(new Error("Codex login did not provide an OAuth browser URL."));
+    }
+  }, 15_000);
+  urlTimeout.unref?.();
+  child.once("error", (error) => {
+    console.error(`Browser login process failed: ${error.message}`);
+    void abort(error);
+  });
+  child.once("close", (code, signal) => {
+    childExited = true;
+    finish({ code, signal, ...(terminalError ? { error: terminalError } : {}) });
+    maybeFailAfterExit();
+  });
+  try {
+    if (typeof onSpawn === "function") onSpawn(child);
+  } catch (error) {
+    void abort(error);
+  }
+  child.unref();
+  return opened;
+}
+
+export function projectChatGPTSubscriptionLoginAttempts(pool, attempts, now = Date.now()) {
+  const loginAttempts = pool?.loginAttempts && typeof pool.loginAttempts === "object"
+    ? { ...pool.loginAttempts }
+    : {};
+  for (const [accountId, attempt] of attempts || []) {
+    const account = pool?.accounts?.[accountId];
+    if (!account) {
+      attempts.delete(accountId);
+      continue;
+    }
+    if (account.subscription?.usable === true) {
+      attempts.delete(accountId);
+      continue;
+    }
+    const expired = Number.isFinite(attempt?.deadlineAt) && now >= attempt.deadlineAt;
+    if (
+      attempt?.status === "pending"
+      && (!expired || account.subscription?.loginInProgress === true)
+    ) {
+      loginAttempts[accountId] = { status: "pending" };
+      continue;
+    }
+    const detail = attempt?.error
+      || (attempt?.signal
+        ? `Codex login ended with ${attempt.signal}.`
+        : Number.isInteger(attempt?.code) && attempt.code !== 0
+          ? `Codex login exited with status ${attempt.code}.`
+          : "Codex login closed before this account became usable.");
+    const coreAttempt = loginAttempts[accountId];
+    loginAttempts[accountId] = {
+      ...(coreAttempt || {}),
+      status: "failed",
+      error: coreAttempt?.error || cleanText(detail, "Codex login did not complete. Try again."),
+      retryable: coreAttempt?.retryable !== false,
+      ...(coreAttempt?.removable === false ? { removable: false } : {}),
+    };
+  }
+  return {
+    ...pool,
+    ...(Object.keys(loginAttempts).length ? { loginAttempts } : {}),
+  };
+}
+
+function cursorConnectorStage(kind, chunk) {
+  const output = String(chunk || "");
+  if (kind === "login") {
+    return /https:\/\/|login|authorize|browser|waiting/i.test(output)
+      ? "Complete Cloudflare authorization in your browser…"
+      : undefined;
+  }
+  if (/download|fetch|manifest/i.test(output)) return "Downloading Cloudflare connector…";
+  if (/install|pour|link/i.test(output)) return "Installing Cloudflare connector…";
+  if (/cleanup|caveat|success|already installed/i.test(output)) return "Finishing Cloudflare connector setup…";
+  return undefined;
+}
+
+function runCursorConnectorCommand(executable, args, {
+  kind,
+  environment = {},
+  progress = () => {},
+  timeoutMs = CURSOR_CONNECTOR_TIMEOUT_MS,
+} = {}) {
+  if (!executable || !path.isAbsolute(executable) || !Array.isArray(args)) {
+    throw new Error("Cloudflare connector command is unavailable.");
+  }
+  if (args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+    throw new Error("Cloudflare connector command is invalid.");
+  }
+  const initial = kind === "login"
+    ? "Opening Cloudflare authorization in your browser…"
+    : "Preparing Cloudflare connector installation…";
+  progress(initial);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let lastStage = initial;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const child = spawn(executable, args, {
+      cwd: discoverSourceRoot(),
+      env: { ...process.env, ...environment },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
+    });
+    const readProgress = (chunk) => {
+      const stage = cursorConnectorStage(kind, chunk);
+      if (stage && stage !== lastStage) {
+        lastStage = stage;
+        progress(stage);
+      }
+    };
+    child.stdout?.on("data", readProgress);
+    child.stderr?.on("data", readProgress);
+    child.once("error", () => finish(new Error(
+      kind === "login"
+        ? "Cloudflare authorization could not start."
+        : "Cloudflare connector installation could not start.",
+    )));
+    child.once("close", (code, signal) => {
+      if (code === 0) return finish(undefined, { exitCode: 0 });
+      const suffix = signal ? ` (${signal})` : Number.isInteger(code) ? ` (exit ${code})` : "";
+      finish(new Error(
+        kind === "login"
+          ? `Cloudflare authorization did not complete${suffix}.`
+          : `Cloudflare connector installation failed${suffix}.`,
+      ));
+    });
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      const force = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      force.unref?.();
+      finish(new Error(
+        kind === "login"
+          ? "Cloudflare authorization timed out."
+          : "Cloudflare connector installation timed out.",
+      ));
+    }, timeoutMs);
+    timeout.unref?.();
+  });
 }
 
 function readBounded(filePath, limit = SESSION_INDEX_LIMIT) {
@@ -285,6 +935,15 @@ function readFileEdges(filePath) {
   }
 }
 
+export function codexSessionProvider(model, sessionProvider) {
+  if (model?.includes("/")) return model.split("/", 1)[0];
+  // Signed routing uses a dedicated transport provider so current Codex can
+  // validate external slugs while keeping ChatGPT authentication. Native GPT
+  // turns still go to OpenAI unless the operator separately enabled native
+  // redirect, so do not label them as router traffic in the session list.
+  return sessionProvider === "codex-router-signed" ? "openai" : sessionProvider;
+}
+
 function codexRolloutMetadata(filePath) {
   let sessionMeta;
   let turnContext;
@@ -311,7 +970,7 @@ function codexRolloutMetadata(filePath) {
     workspace,
     workspaceLabel: workspace ? cleanText(path.basename(workspace), workspace, 100) : undefined,
     model,
-    provider: cleanText(model?.includes("/") ? model.split("/", 1)[0] : sessionMeta?.model_provider, "", 100) || undefined,
+    provider: cleanText(codexSessionProvider(model, sessionMeta?.model_provider), "", 100) || undefined,
     effort: cleanText(turnContext?.effort, "", 40) || undefined,
     originator: cleanText(sessionMeta?.originator, "", 80) || undefined,
     createdAt: safeTimestamp(sessionMeta?.timestamp),
@@ -386,71 +1045,178 @@ function codexSessions() {
   return [...byId.values()];
 }
 
-function sumDeepcodeUsage(entry, modelNames) {
-  const records = entry?.usagePerModel && typeof entry.usagePerModel === "object"
-    ? modelNames.map((model) => entry.usagePerModel[model]).filter((value) => value && typeof value === "object")
-    : entry?.usage && typeof entry.usage === "object" ? [entry.usage] : [];
-  const sum = (key) => records.reduce((total, usage) => total + (finiteNumber(usage[key]) || 0), 0);
-  return {
-    inputTokens: sum("prompt_tokens") || undefined,
-    cachedInputTokens: sum("prompt_cache_hit_tokens") || undefined,
-    totalTokens: sum("total_tokens") || undefined,
-    requestCount: sum("total_reqs") || undefined,
+function dshWorkspaceIndex(dshHome) {
+  const document = readJsonObject(path.join(dshHome, "storages", "workspace.json"));
+  const workspaces = new Map();
+  const archived = new Set();
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 8) return;
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, SESSION_LIST_LIMIT * 3)) visit(item, depth + 1);
+      return;
+    }
+    if (Array.isArray(value.archivedSessionIds)) {
+      for (const id of value.archivedSessionIds) if (typeof id === "string" && DSH_SESSION_ID.test(id)) archived.add(id.toLowerCase());
+    }
+    if (Array.isArray(value.sessionIds)) {
+      const workspace = cleanText(value.path || value.cwd, "", 1024) || undefined;
+      const workspaceLabel = cleanText(value.title, workspace ? path.basename(workspace) : "DeepSeek workspace", 100);
+      for (const id of value.sessionIds) {
+        if (typeof id === "string" && DSH_SESSION_ID.test(id)) workspaces.set(id.toLowerCase(), { workspace, workspaceLabel });
+      }
+    }
+    for (const child of Object.values(value)) visit(child, depth + 1);
   };
+  visit(document);
+  return { workspaces, archived };
 }
 
-function deepcodeSessions() {
-  const deepcodeHome = path.resolve(process.env.CODEX_ROUTER_DEEPCODE_HOME || path.join(os.homedir(), ".deepcode"));
-  const projectsRoot = path.join(deepcodeHome, "projects");
-  let projects;
-  try { projects = readdirSync(projectsRoot, { withFileTypes: true }); } catch { return []; }
+function walkDshSessions(root, files, depth = 0) {
+  if (depth > 5 || files.length >= SESSION_LIST_LIMIT * 2) return;
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (files.length >= SESSION_LIST_LIMIT * 2) break;
+    if (entry.isSymbolicLink()) continue;
+    const target = path.join(root, entry.name);
+    if (entry.isDirectory()) walkDshSessions(target, files, depth + 1);
+    else if (entry.isFile() && (entry.name === "session.jsonl.zstd" || entry.name === "session.jsonl")) {
+      const id = path.basename(path.dirname(target));
+      if (DSH_SESSION_ID.test(id)) files.push({ id: id.toLowerCase(), filePath: target });
+    }
+  }
+}
+
+function dshSessions() {
+  const dshHome = path.resolve(process.env.DSH_HOME || path.join(os.homedir(), ".dsh"));
+  const files = [];
+  walkDshSessions(path.join(dshHome, "sessions"), files);
+  const { workspaces, archived } = dshWorkspaceIndex(dshHome);
+  return files.map(({ id, filePath }) => {
+    let updatedAt = new Date(0).toISOString();
+    try { updatedAt = new Date(statSync(filePath).mtimeMs).toISOString(); } catch {}
+    const workspace = workspaces.get(id);
+    const isArchived = archived.has(id);
+    return {
+      id,
+      harnessId: "dsh",
+      title: workspace?.workspaceLabel || "DeepSeek Harness session",
+      updatedAt,
+      ...(workspace?.workspace ? { workspace: workspace.workspace } : {}),
+      ...(workspace?.workspaceLabel ? { workspaceLabel: workspace.workspaceLabel } : {}),
+      provider: "DeepSeek Harness",
+      status: isArchived ? "archived" : "saved",
+      archived: isArchived,
+      resumable: !isArchived,
+    };
+  });
+}
+
+function cursorAppSessions() {
+  const databasePath = process.env.CODEX_ROUTER_CURSOR_CONVERSATION_DB ||
+    path.join(cursorHome(), "User", "globalStorage", "conversation-search.db");
+  if (!existsSync(databasePath)) return [];
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    const rows = database.prepare(
+      "SELECT source, id, title, updated_at, is_archived FROM conversations ORDER BY updated_at DESC",
+    ).all();
+    const sessions = new Map();
+    for (const row of rows) {
+      const id = typeof row.id === "string" ? row.id.toLowerCase() : "";
+      if (!CURSOR_SESSION_ID.test(id) || sessions.has(id)) continue;
+      const archived = Boolean(row.is_archived);
+      const local = row.source === "local";
+      sessions.set(id, {
+        id,
+        harnessId: "cursor",
+        title: cleanText(row.title, "Untitled Cursor session", 240),
+        updatedAt: Number.isFinite(Number(row.updated_at))
+          ? new Date(Number(row.updated_at)).toISOString()
+          : new Date(0).toISOString(),
+        provider: local ? "Cursor" : "Cursor Cloud",
+        status: archived ? "archived" : local ? "saved" : "cloud_cache",
+        archived,
+        resumable: local && !archived && !id.startsWith("draft-"),
+      });
+    }
+    return [...sessions.values()];
+  } catch {
+    return [];
+  } finally {
+    try { database?.close(); } catch {}
+  }
+}
+
+function cursorAgentSessions() {
+  const chatsRoot = process.env.CODEX_ROUTER_CURSOR_AGENT_CHATS ||
+    path.join(os.homedir(), ".cursor", "chats");
+  let workspaceDirectories;
+  try { workspaceDirectories = readdirSync(chatsRoot, { withFileTypes: true }); } catch { return []; }
   const sessions = [];
-  for (const project of projects.slice(0, SESSION_LIST_LIMIT)) {
-    if (!project.isDirectory() || project.isSymbolicLink()) continue;
-    const text = readBounded(path.join(projectsRoot, project.name, "sessions-index.json"), 2 * 1024 * 1024);
-    if (!text) continue;
-    let index;
-    try { index = JSON.parse(text); } catch { continue; }
-    const workspace = cleanText(index?.originalPath, "", 1024) || undefined;
-    const entries = Array.isArray(index?.entries) ? index.entries.slice(0, 100) : [];
-    for (const entry of entries) {
-      if (typeof entry?.id !== "string" || !SESSION_UUID.test(entry.id)) continue;
-      const modelNames = entry?.usagePerModel && typeof entry.usagePerModel === "object"
-        ? Object.keys(entry.usagePerModel).filter((model) => typeof model === "string").slice(0, 12)
-        : [];
-      const createdAt = safeTimestamp(entry.createTime || entry.createdAt);
-      const updatedAt = safeTimestamp(entry.updateTime || entry.updatedAt, createdAt || new Date(0).toISOString());
+  for (const workspaceDirectory of workspaceDirectories.slice(0, SESSION_LIST_LIMIT)) {
+    if (!workspaceDirectory.isDirectory() || workspaceDirectory.isSymbolicLink()) continue;
+    const workspaceRoot = path.join(chatsRoot, workspaceDirectory.name);
+    let chatDirectories;
+    try { chatDirectories = readdirSync(workspaceRoot, { withFileTypes: true }); } catch { continue; }
+    for (const chatDirectory of chatDirectories.slice(0, SESSION_LIST_LIMIT)) {
+      if (!chatDirectory.isDirectory() || chatDirectory.isSymbolicLink() || !SESSION_UUID.test(chatDirectory.name)) continue;
+      const metadata = readJsonObject(path.join(workspaceRoot, chatDirectory.name, "meta.json"), 256 * 1024);
+      if (!metadata) continue;
+      const createdMs = finiteNumber(metadata.createdAtMs);
+      const updatedMs = finiteNumber(metadata.updatedAtMs) ?? createdMs;
+      const workspace = cleanText(metadata.cwd, "", 1024) || undefined;
       sessions.push({
-        id: entry.id.toLowerCase(),
-        harnessId: "deepcode",
-        title: cleanText(entry.summary || entry.title, "Untitled Deep Code task", 240),
-        updatedAt,
-        ...(createdAt ? { createdAt } : {}),
-        ...(workspace ? { workspace, workspaceLabel: cleanText(path.basename(workspace), workspace, 100) } : { workspaceLabel: cleanText(project.name, "Deep Code project", 100) }),
-        ...(modelNames.length ? { model: modelNames.at(-1), modelHistory: modelNames } : {}),
-        provider: "Deep Code",
-        status: cleanText(entry.status, "saved", 40),
+        id: chatDirectory.name.toLowerCase(),
+        harnessId: "cursor",
+        title: "Cursor Agent session",
+        updatedAt: updatedMs === undefined ? new Date(0).toISOString() : new Date(updatedMs).toISOString(),
+        ...(createdMs === undefined ? {} : { createdAt: new Date(createdMs).toISOString() }),
+        ...(workspace ? { workspace, workspaceLabel: cleanText(path.basename(workspace), workspace, 100) } : {}),
+        provider: "Cursor Agent",
+        status: "saved",
         archived: false,
         resumable: true,
-        activeTokens: finiteNumber(entry.activeTokens),
-        ...sumDeepcodeUsage(entry, modelNames),
       });
     }
   }
   return sessions;
 }
 
+function cursorSessions() {
+  const sessions = new Map(cursorAppSessions().map((session) => [session.id, session]));
+  for (const session of cursorAgentSessions()) {
+    if (!sessions.has(session.id)) sessions.set(session.id, session);
+  }
+  return [...sessions.values()];
+}
+
 export function getContextSessionsSnapshot() {
-  const sessions = [...codexSessions(), ...deepcodeSessions()]
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-    .slice(0, SESSION_LIST_LIMIT);
+  // Each client owns its own bounded index. Applying one cap after merging
+  // them let a busy Codex history crowd every Cursor row out of the result.
+  // Cursor's conversation-search database already enforces its own configured
+  // cap, so return every row it exposes while keeping the filesystem walkers
+  // for Codex and DeepSeek bounded independently.
+  const sessions = [
+    ...codexSessions().sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, SESSION_LIST_LIMIT),
+    ...dshSessions().sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, SESSION_LIST_LIMIT),
+    ...cursorSessions(),
+  ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   return {
     fetchedAt: new Date().toISOString(),
     sessions,
     counts: {
       total: sessions.length,
       codex: sessions.filter((session) => session.harnessId === "codex").length,
-      deepcode: sessions.filter((session) => session.harnessId === "deepcode").length,
+      dsh: sessions.filter((session) => session.harnessId === "dsh").length,
+      cursor: sessions.filter((session) => session.harnessId === "cursor").length,
+      claude: sessions.filter((session) => session.harnessId === "claude").length,
+      gemini: sessions.filter((session) => session.harnessId === "gemini").length,
+      openclaw: 0,
+      // None of the routed harnesses writes a session index this app can read,
+      // so their rows report no sessions rather than an invented number.
+      ...Object.fromEntries(ROUTED_HARNESS_IDS.map((id) => [id, 0])),
       archived: sessions.filter((session) => session.archived).length,
     },
   };
@@ -470,6 +1236,41 @@ function oneOf(value, values, label) {
 
 async function snapshot() {
   return runControlJson(["--json"]);
+}
+
+async function readInstalledControlHealth({ fetchImpl = globalThis.fetch } = {}) {
+  const modulePath = path.join(discoverSourceRoot(), "src", "control-health.mjs");
+  const module = await import(pathToFileURL(modulePath).href);
+  if (typeof module.readControlHealth !== "function") {
+    throw new Error("The installed router does not expose direct health reads.");
+  }
+  return module.readControlHealth({ fetchImpl });
+}
+
+async function installedRouterModule(name) {
+  const packagedPath = typeof process.resourcesPath === "string" && process.resourcesPath
+    ? path.join(process.resourcesPath, "router-src", name)
+    : undefined;
+  const modulePath = packagedPath && existsSync(packagedPath)
+    ? packagedPath
+    : path.join(discoverSourceRoot(), "src", name);
+  return import(pathToFileURL(modulePath).href);
+}
+
+async function discoverInstalledCursorTunnelHostname(options) {
+  const module = await installedRouterModule("cursor-cloudflare-tunnel.mjs");
+  if (typeof module.discoverCursorTunnelHostname !== "function") {
+    throw new Error("The installed router does not support automatic Cursor hostname discovery.");
+  }
+  return module.discoverCursorTunnelHostname(options);
+}
+
+async function readRunningCursorProcesses() {
+  const module = await installedRouterModule("client-restart-notice.mjs");
+  if (typeof module.runningClientProcesses !== "function") {
+    throw new Error("The installed router cannot detect running Cursor processes.");
+  }
+  return module.runningClientProcesses("cursor");
 }
 
 async function modelEntries() {
@@ -512,6 +1313,20 @@ async function validateProvider(providerId, capability) {
     throw new Error(`${provider.displayName || id} does not support CLI sign-in.`);
   }
   return { id, provider };
+}
+
+async function validateCatalogProvider(providerId) {
+  const id = stringValue(providerId, "Provider catalog", PROVIDER_ID);
+  const providers = await providerEntries();
+  for (const provider of providers) {
+    const sources = Array.isArray(provider.catalogSources) ? provider.catalogSources : [];
+    const source = sources.find((entry) => String(entry?.id) === id);
+    if (source) return { id, provider, source };
+    // Compatibility with an older router snapshot: its canonical row has no
+    // source descriptors, but discovery of that exact id was already allowed.
+    if (String(provider.id) === id && sources.length === 0) return { id, provider };
+  }
+  throw new Error(`Unknown provider catalog: ${id}`);
 }
 
 async function validateModel(slug) {
@@ -572,7 +1387,25 @@ async function updateProviderSelection(id, enabled) {
   return snapshot();
 }
 
-export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl = globalThis.fetch, senderGuard = () => true } = {}) {
+export function registerIpcHandlers({
+  ipcMain,
+  BrowserWindow,
+  shell,
+  fetchImpl = globalThis.fetch,
+  healthReader = readInstalledControlHealth,
+  cursorConnectorExecutable = () => executablePath("cloudflared"),
+  cursorConnectorInstaller = cursorConnectorInstallSpec,
+  cursorConnectorRunner = runCursorConnectorCommand,
+  cursorHostnameResolver = discoverInstalledCursorTunnelHostname,
+  cursorProcessReader = readRunningCursorProcesses,
+  cursorWait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  controlJsonRunner = runControlJson,
+  harnessSnapshotReader = getHarnessSnapshot,
+  harnessExecutableResolver = executablePath,
+  cursorAppPath = cursorDesktopPath,
+  openclawAppPath = openclawDesktopPath,
+  senderGuard = () => true,
+} = {}) {
   if (!ipcMain?.handle) throw new TypeError("ipcMain.handle is required.");
   const operations = new Map();
   // Every mutation is a fresh control.mjs process. Keep their read/modify/
@@ -580,20 +1413,31 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
   // each other's snapshots or restore stale state. Reads remain concurrent.
   let mutationTail = Promise.resolve();
   let pendingMutations = 0;
+  // A detached OAuth process can outlive the IPC call. Keep one browser login
+  // per isolated account so a double-click cannot race two Codex callbacks.
+  const subscriptionLoginInFlight = new Set();
+  const subscriptionLoginAttempts = new Map();
   const idleWaiters = new Set();
+  const mutationsIdle = () => pendingMutations === 0 && subscriptionLoginInFlight.size === 0;
+  const settleIdleWaiters = () => {
+    if (!mutationsIdle()) return;
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  };
+  const releaseSubscriptionLogin = (id) => {
+    subscriptionLoginInFlight.delete(id);
+    settleIdleWaiters();
+  };
   const enqueueMutation = (task) => {
     pendingMutations += 1;
     const queued = mutationTail.then(task);
     mutationTail = queued.then(() => undefined, () => undefined);
     return queued.finally(() => {
       pendingMutations -= 1;
-      if (pendingMutations === 0) {
-        for (const resolve of idleWaiters) resolve();
-        idleWaiters.clear();
-      }
+      settleIdleWaiters();
     });
   };
-  const whenMutationsIdle = () => pendingMutations === 0
+  const whenMutationsIdle = () => mutationsIdle()
     ? Promise.resolve()
     : new Promise((resolve) => idleWaiters.add(resolve));
   const emit = (payload) => {
@@ -606,7 +1450,14 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     operations.set(id, name);
     emit({ id, name, action: name, status: "started", message: `${name} started` });
     try {
-      const value = await fn(input);
+      const progress = (message) => emit({
+        id,
+        name,
+        action: name,
+        status: "started",
+        message: cleanText(message, `${name} is running`, 240),
+      });
+      const value = await fn(input, { id, name, progress });
       emit({ id, name, action: name, status: "completed", message: `${name} completed` });
       return value;
     } catch (error) {
@@ -623,13 +1474,21 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
   });
   const handleAction = (name, fn, { requiresCompatibleRouter = true } = {}) => ipcMain.handle(`router-control:${name}`, (event, input) => {
     if (!senderGuard(event)) throw new Error("Untrusted IPC sender.");
-    return enqueueMutation(() => operation(name, async (value) => {
+    return enqueueMutation(() => operation(name, async (value, context) => {
       if (requiresCompatibleRouter) assertMutationCompatibility();
-      return fn(value);
+      return fn(value, context);
     })(event, input));
   });
 
   handle("getSnapshot", async () => snapshot());
+  handle("getChatGptSession", async () => runJson(["chatgpt-session", "status"]));
+  handle("getChatGptAccountPool", async () => projectChatGPTSubscriptionLoginAttempts(
+    await runJson(
+      ["chatgpt-account-pool", "status"],
+      { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS },
+    ),
+    subscriptionLoginAttempts,
+  ));
   const windowFor = (event) => {
     const window = BrowserWindow?.fromWebContents?.(event.sender);
     if (!window || window.isDestroyed?.()) throw new Error("Application window is unavailable.");
@@ -659,7 +1518,7 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
   }, { requiresCompatibleRouter: false });
   handle("getProviders", async () => runJson(["providers"]));
   handle("discoverProviderModels", async ({ providerId, refresh = false } = {}) => {
-    const { id } = await validateProvider(providerId);
+    const { id } = await validateCatalogProvider(providerId);
     if (typeof refresh !== "boolean") throw new Error("refresh must be boolean.");
     // Without --refresh the router answers from the provider's cached list, so
     // opening a provider costs no round trip and works offline. Refreshing is
@@ -676,12 +1535,33 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     }
   });
   handle("getAccountUsage", async () => runJson(["account"], { timeoutMs: 20_000 }));
-  handle("getProviderUsage", async () => runJson(["provider-usage"], { timeoutMs: 20_000 }));
+  handle("getProviderUsage", async () => runJson(
+    ["provider-usage"],
+    { timeoutMs: PROVIDER_USAGE_TIMEOUT_MS },
+  ));
   handle("getLocalModels", async () => runJson(["local-models", "list", "--json"], { timeoutMs: 20_000 }));
   handle("getVisionBridge", async () => runJson(["vision-bridge", "status"], { timeoutMs: 20_000 }));
   handle("getToolResultAging", async () => runJson(["tool-result-aging", "status"], { timeoutMs: 20_000 }));
   handle("getPresence", async () => runJson(["presence", "status"]));
   handle("getHarnesses", async () => getHarnessSnapshot());
+  handle("getAgentBridges", async () => {
+    const module = await installedRouterModule("agent-bridges.mjs");
+    if (typeof module.agentBridgeStatus !== "function") {
+      throw new Error("The Control Center does not include agent bridge status support.");
+    }
+    // Use the same desktop-safe executable resolution as the client rows.
+    // A packaged app has a narrower PATH than an interactive shell; allowing
+    // the bridge module to resolve commands again produced contradictory
+    // "router ready" and "not installed" states for the same client.
+    return module.agentBridgeStatus({
+      ...process.env,
+      ...(executablePath("claude") ? { MODEL_ROUTER_CLAUDE_BIN: executablePath("claude") } : {}),
+      ...(executablePath("agent") || executablePath("cursor-agent")
+        ? { MODEL_ROUTER_CURSOR_AGENT_BIN: executablePath("agent") || executablePath("cursor-agent") }
+        : {}),
+      ...(executablePath("gemini") ? { MODEL_ROUTER_GEMINI_BIN: executablePath("gemini") } : {}),
+    });
+  });
   handle("getContextSessions", async () => getContextSessionsSnapshot());
   handle("getDoctor", async () => {
     const result = await runRouterScript("doctor.mjs", ["--json"], { timeoutMs: 120_000, allowNonZero: true });
@@ -702,27 +1582,44 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
   // when it is needed. Repair is also the one action that must work while the
   // service is down, which is why it reinstalls rather than merely restarting.
   handleAction("repairInstall", async () => {
-    const result = await runRouterScript("doctor.mjs", ["--fix", "--json"], {
-      timeoutMs: REPAIR_TIMEOUT_MS,
-      allowNonZero: true,
-    });
-    let report;
-    try { report = JSON.parse(result.stdout.trim()); }
-    catch { throw new Error("Repair returned invalid JSON."); }
-    // A non-zero exit here means repair ran and some check still fails, not
-    // that repair itself failed. Report that as a completed run with failing
-    // checks so the page can name them; throwing would hide the report.
-    return { ...report, ok: result.code === 0 && report.ok !== false };
+    let response;
+    try {
+      const result = await runRouterScript("doctor.mjs", ["--fix", "--json"], {
+        timeoutMs: REPAIR_TIMEOUT_MS,
+        allowNonZero: true,
+        environmentOverrides: { CODEX_ROUTER_DEFER_TRAY_REBUILD: "1" },
+      });
+      let report;
+      try { report = JSON.parse(result.stdout.trim()); }
+      catch { throw new Error("Repair returned invalid JSON."); }
+      // A non-zero exit here means repair ran and some check still fails, not
+      // that repair itself failed. Report that as a completed run with failing
+      // checks so the page can name them; throwing would hide the report.
+      response = { ...report, ok: result.code === 0 && report.ok !== false };
+    } finally {
+      // Start the detached refresh before this handler settles and releases the
+      // mutation drain, including a partial repair whose final check failed. A
+      // quit already waiting on repair resumes as soon as the drain clears, so
+      // a timer scheduled for later can be discarded with the process and
+      // strand the old companion. Spawn is nonblocking; the updater stages its
+      // replacement before it asks this process to quit.
+      try { await runControlDetached(["tray", "refresh"]); }
+      catch { /* the next update retries a stale tray if spawn itself is unavailable */ }
+    }
+    return response;
   }, { requiresCompatibleRouter: false });
-  // The public health leaf deliberately omits per-service payloads. The
-  // control command reads the protected leaf with the local caller capability
-  // and returns only the redacted service summary the UI needs.
-  handle("getHealth", async () => runJson(["health"]));
+  // Read health in this trusted process instead of spawning a fresh
+  // ELECTRON_RUN_AS_NODE child for every one-second renderer poll. The shared
+  // reader owns the caller capability and preserves the CLI's redacted shape.
+  handle("getHealth", async () => healthReader({ fetchImpl }));
   handle("refreshAll", async () => ({
     snapshot: await snapshot(),
     providers: await runJson(["providers"]),
     accountUsage: await runJson(["account"], { timeoutMs: 20_000 }),
-    providerUsage: await runJson(["provider-usage"], { timeoutMs: 20_000 }),
+    providerUsage: await runJson(
+      ["provider-usage"],
+      { timeoutMs: PROVIDER_USAGE_TIMEOUT_MS },
+    ),
     localModels: await runJson(["local-models", "list", "--json"], { timeoutMs: 20_000 }),
     visionBridge: await runJson(["vision-bridge", "status"]),
     presence: await runJson(["presence", "status"]),
@@ -734,7 +1631,7 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     return updateProviderSelection(id, enabled);
   });
   handleAction("addProviderModels", async ({ providerId, modelIds } = {}) => {
-    const { id } = await validateProvider(providerId);
+    const { id } = await validateCatalogProvider(providerId);
     if (!Array.isArray(modelIds) || modelIds.length < 1 || modelIds.length > 200) {
       throw new Error("Choose between 1 and 200 provider models.");
     }
@@ -760,15 +1657,56 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     return { provider: id, added: unique };
   });
   handleAction("connectProvider", async ({ providerId } = {}) => {
+    const { id, provider } = await validateProvider(providerId, "sign-in");
+    if (id === "antigravity-oauth") {
+      if (provider.action === "blocked") {
+        throw new Error(
+          "Disconnect the incompatible router-owned Antigravity record before signing in.",
+        );
+      }
+      if (provider.action === "probe") {
+        // The button names the live request and its quota cost. Carry both
+        // consent flags only from that explicit action, then publish the
+        // provider after the truthful request has succeeded.
+        await runControl(
+          ["probe-provider", id, "--live", "--yes"],
+          {
+            timeoutMs: ANTIGRAVITY_PROBE_RUNNER_TIMEOUT_MS,
+            environmentOverrides: {
+              CODEX_ROUTER_OPERATION_TIMEOUT_MS: String(
+                ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS,
+              ),
+            },
+          },
+        );
+        return updateProviderSelection(id, true);
+      }
+      // This is the router-owned loopback browser flow, not a vendor CLI. It
+      // works identically on macOS, Windows, and Linux and receives no secret
+      // in argv or IPC.
+      await runControl(["login", id], {
+        timeoutMs: ROUTER_BROWSER_OAUTH_TIMEOUT_MS,
+        environmentOverrides: {
+          CODEX_ROUTER_OPERATION_TIMEOUT_MS: String(
+            ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS,
+          ),
+        },
+      });
+      return { providerId: id, pending: false };
+    }
     if (!terminalAvailable()) {
       throw new Error("Provider CLI sign-in must be run in your own terminal on Windows or Linux.");
     }
-    const { id } = await validateProvider(providerId, "sign-in");
     await runControl(["install-cli", id], { timeoutMs: 120_000 });
     const login = OAUTH_LOGIN_COMMANDS[id];
     if (!login) throw new Error(`Interactive sign-in is not available for ${id}.`);
     const executable = executablePath(login.executable);
     if (!executable) throw new Error(`The official ${login.executable} CLI was not found after installation.`);
+    // The terminal belongs to the provider CLI, so Electron cannot observe
+    // whether it switches accounts. Clear any account-specific model list
+    // before handing off; cancellation costs one later fetch, while retaining
+    // the previous account's entitlements for a day would be incorrect.
+    await runControl(["catalog-cache", "invalidate", id]);
     // OAuth CLIs own browser/device authorization and may require a real TTY.
     // Never hide those prompts behind Electron's piped child-process stdio.
     return {
@@ -793,7 +1731,10 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     return runJson(["providers"]);
   });
   handleAction("removeProviderCredential", async ({ providerId } = {}) => {
-    const { id } = await validateProvider(providerId, "credential");
+    const { id, provider } = await validateProvider(providerId);
+    if (provider.kind !== "api" && id !== "antigravity-oauth") {
+      throw new Error(`${provider.displayName || id} has no router-managed credential to remove.`);
+    }
     // The control command owns credential deletion, provider withdrawal, and
     // publication under the same lock as credential setup. Splitting a
     // pre-disable/apply here would reopen the inter-process race and publish
@@ -811,6 +1752,18 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     const model = await validateModel(slug);
     if (typeof enabled !== "boolean") throw new Error("enabled must be boolean.");
     return runJson(["subagents", "set", model, enabled ? "on" : "off"], { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS });
+  });
+  // A certification run makes live calls to the provider and to a native
+  // parent that delegates to it, so it needs its own ceiling rather than the
+  // catalog mutation one: the delegation alone can take a minute per turn.
+  handleAction("certifySubagentModels", async ({ slugs } = {}) => {
+    if (!Array.isArray(slugs) || !slugs.length) throw new Error("slugs must be a non-empty array.");
+    if (slugs.length > 24) throw new Error("Certify at most 24 routes at once.");
+    const models = [];
+    for (const slug of slugs) models.push(await validateModel(slug));
+    // One command for the whole batch: the runs fan out inside it, and the
+    // proofs write and catalog republish happen once, in that process.
+    return runJson(["subagents", "certify", ...models], { timeoutMs: SUBAGENT_CERTIFY_TIMEOUT_MS });
   });
   handleAction("setSubagentEffort", async ({ slug, effort } = {}) => {
     const model = await validateModel(slug);
@@ -850,17 +1803,17 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     const args = ["local-models", "install", validateLocalTag(tag)];
     if (yes) args.push("--yes");
     if (force) args.push("--force");
-    return runJson(args, { timeoutMs: 330_000 });
+    return runJson(args, { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS });
   });
   handleAction("installLocalMlx", async ({ yes = false } = {}) => {
     if (yes !== true) throw new Error("Installing the MLX runtime and model requires explicit consent.");
     return runJson(["local-models", "mlx-install", "--yes"], { timeoutMs: 30_000 });
   });
   handleAction("cancelLocalMlx", async () => runJson(["local-models", "mlx-cancel"], { timeoutMs: 20_000 }));
-  handleAction("uninstallLocalModel", async ({ tag } = {}) => runJson(["local-models", "uninstall", validateLocalTag(tag), "--yes"], { timeoutMs: 330_000 }));
+  handleAction("uninstallLocalModel", async ({ tag } = {}) => runJson(["local-models", "uninstall", validateLocalTag(tag), "--yes"], { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS }));
   handleAction("setLocalModelEnabled", async ({ tag, enabled } = {}) => {
     if (typeof enabled !== "boolean") throw new Error("enabled must be boolean.");
-    return runJson(["local-models", "set", validateLocalTag(tag), enabled ? "on" : "off"], { timeoutMs: 330_000 });
+    return runJson(["local-models", "set", validateLocalTag(tag), enabled ? "on" : "off"], { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS });
   });
   handleAction("benchmarkLocalModel", async ({ tag } = {}) => runJson(["local-models", "benchmark", validateLocalTag(tag)], { timeoutMs: 5 * 60_000 }));
   handleAction("controlLocalRuntime", async ({ action } = {}) => {
@@ -922,56 +1875,540 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
     if (typeof enabled !== "boolean") throw new Error("enabled must be boolean.");
     return runJson(["signed-routing", enabled ? "on" : "off"], { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS });
   });
+  handleAction("setChatGptSessionSharing", async ({ enabled } = {}) => {
+    if (typeof enabled !== "boolean") throw new Error("enabled must be boolean.");
+    // Renderer input selects one of two fixed control verbs. The upstream
+    // transaction records/revokes consent and republishes every installed
+    // client catalog before this result is returned.
+    return runJson(
+      ["chatgpt-session", enabled ? "enable" : "disable"],
+      { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS },
+    );
+  });
+  handleAction("addChatGptSubscriptionAccount", async ({ label = "" } = {}) => {
+    if (typeof label !== "string" || label.length > 120 || /[\u0000]/.test(label)) {
+      throw new Error("Account label is invalid.");
+    }
+    return runJson(["chatgpt-account-pool", "add", label.trim()], { timeoutMs: 60_000 });
+  });
+  handleAction("loginChatGptSubscriptionAccount", async ({ accountId } = {}) => {
+    const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
+    const pool = await runJson(
+      ["chatgpt-account-pool", "status"],
+      { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS },
+    );
+    const account = pool?.accounts?.[id];
+    if (!account) throw new Error("The subscription account is not registered.");
+    if (account.state !== "active") throw new Error("The subscription account is not active.");
+    if (subscriptionLoginInFlight.has(id)) {
+      return {
+        accountId: id,
+        opened: false,
+        surface: "browser",
+        pending: true,
+        inProgress: true,
+      };
+    }
+    if (
+      account.subscription?.usable === true
+      && subscriptionLoginAttempts.get(id)?.status !== "failed"
+    ) {
+      return {
+        accountId: id,
+        opened: false,
+        surface: "browser",
+        pending: false,
+        alreadyAuthenticated: true,
+      };
+    }
+    const codex = executablePath("codex");
+    if (!codex) throw new Error("Codex CLI is not installed.");
+    const profile = await runJson(["chatgpt-account-pool", "home", id], { timeoutMs: 20_000 });
+    if (typeof profile?.home !== "string" || !path.isAbsolute(profile.home)) {
+      throw new Error("The subscription account profile is unavailable.");
+    }
+    const profileHome = path.resolve(profile.home);
+    const primaryHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"));
+    if (path.basename(profileHome) !== id || profileHome === primaryHome) {
+      throw new Error("The subscription account profile is not isolated from the primary Codex login.");
+    }
+    if (pool?.loginAttempts?.[id]?.status === "failed" && pool.loginAttempts[id].retryable === true) {
+      const reset = await runJson(["chatgpt-account-pool", "login-reset", id], { timeoutMs: 20_000 });
+      if (reset?.reset !== true) {
+        throw new Error("The saved login changed before retry. Refresh the account list and try again.");
+      }
+    }
+    subscriptionLoginInFlight.add(id);
+    subscriptionLoginAttempts.set(id, {
+      status: "pending",
+      deadlineAt: Date.now() + CHATGPT_LOGIN_COMPLETION_TIMEOUT_MS,
+    });
+    let loginLease;
+    let loginFinalization;
+    let resolveLoginExit;
+    const loginExited = new Promise((resolve) => { resolveLoginExit = resolve; });
+    try {
+      // Reserve ownership before spawning. A desktop crash can therefore
+      // never leave a credential writer with no durable pre-auth evidence.
+      loginLease = createChatGPTLoginLease(id, process.pid, {
+        accountHome: profileHome,
+        homesDir: path.dirname(profileHome),
+        phase: "reserved",
+      });
+      const processLoginExit = async (outcome = {}) => {
+        const current = subscriptionLoginAttempts.get(id);
+        if (!current) {
+          releaseSubscriptionLogin(id);
+          return;
+        }
+        if (!loginLease) {
+          releaseSubscriptionLogin(id);
+          subscriptionLoginAttempts.set(id, {
+            ...current,
+            status: "failed",
+            ...(outcome.error ? { error: outcome.error } : {}),
+            ...(outcome.signal ? { signal: outcome.signal } : {}),
+            ...(Number.isInteger(outcome.code) ? { code: outcome.code } : {}),
+          });
+          return;
+        }
+        // Exit status is not credential truth: Codex can persist a valid OAuth
+        // refresh before a later non-zero exit. The protected lease records
+        // the pre-login auth digest; core finalization compares that durable
+        // evidence and clears only an unchanged cancellation.
+        const completionLease = Buffer.from(JSON.stringify(loginLease), "utf8").toString("base64url");
+        subscriptionLoginAttempts.set(id, {
+          ...current,
+          status: "pending",
+          deadlineAt: Date.now() + CATALOG_MUTATION_TIMEOUT_MS + 30_000,
+        });
+        try {
+          const finalized = await enqueueMutation(() => runJson(
+            ["chatgpt-account-pool", "login-finalize", id, completionLease],
+            { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS },
+          ),
+          );
+          const latest = subscriptionLoginAttempts.get(id);
+          if (latest && finalized?.loginFinalizationPending !== true) {
+            subscriptionLoginAttempts.set(id, { ...latest, status: "finished" });
+          }
+        } catch (error) {
+          const latest = subscriptionLoginAttempts.get(id);
+          if (latest) subscriptionLoginAttempts.set(id, {
+            ...latest,
+            status: "failed",
+            error: error instanceof Error ? error.message : "ChatGPT login finalization failed.",
+          });
+        } finally {
+          releaseSubscriptionLogin(id);
+        }
+      };
+      const openedPromise = openBrowserCommand(codex, ["login"], discoverSourceRoot(), {
+          environment: { CODEX_HOME: profileHome },
+          openExternal: shell?.openExternal?.bind(shell),
+          onSpawn: (child) => {
+            loginLease = attachChatGPTLoginLease(id, loginLease, child?.pid, {
+              accountHome: profileHome,
+              homesDir: path.dirname(profileHome),
+            });
+          },
+          onExit: (outcome = {}) => {
+            resolveLoginExit(outcome);
+          },
+        });
+      // A child may persist valid auth and exit before a delayed browser
+      // opener settles. Give every attached writer exactly one completion
+      // owner immediately; the handoff result is not credential truth.
+      loginFinalization = loginExited.then(processLoginExit);
+      const opened = await openedPromise;
+      return {
+        ...opened,
+        accountId: id,
+        pending: true,
+      };
+    } catch (error) {
+      if (loginFinalization) {
+        try { await loginFinalization; } catch {}
+      } else {
+        releaseSubscriptionLogin(id);
+        try {
+          // Synchronous validation can fail after reservation but before a
+          // child owns it. Clear only an unchanged reservation; changed auth
+          // remains durable attention evidence rather than being guessed away.
+          if (
+            loginLease
+            && !chatGPTLoginAuthChanged(id, loginLease, {
+              accountHome: profileHome,
+              homesDir: path.dirname(profileHome),
+            })
+          ) clearChatGPTLoginLease(id, loginLease, {
+            accountHome: profileHome,
+            homesDir: path.dirname(profileHome),
+          });
+        } catch {}
+      }
+      subscriptionLoginAttempts.delete(id);
+      throw error;
+    }
+  });
+  handleAction("removeChatGptSubscriptionAccount", async ({ accountId } = {}) => {
+    const id = stringValue(accountId, "Account id", CHATGPT_ACCOUNT_ID);
+    if (subscriptionLoginInFlight.has(id)) {
+      throw new Error("Cannot remove a ChatGPT account while its browser sign-in is in progress.");
+    }
+    const pool = await runJson(
+      ["chatgpt-account-pool", "status"],
+      { timeoutMs: CATALOG_MUTATION_TIMEOUT_MS },
+    );
+    if (pool?.loginAttempts?.[id]?.status === "failed" && pool.loginAttempts[id].retryable === true) {
+      const reset = await runJson(["chatgpt-account-pool", "login-reset", id], { timeoutMs: 20_000 });
+      if (reset?.reset !== true) {
+        throw new Error("The saved login changed before removal. Refresh the account list and try again.");
+      }
+    }
+    return runJson(["chatgpt-account-pool", "remove", id], { timeoutMs: 60_000 });
+  });
+  handleAction("setChatGptAccountSelection", async ({ selection } = {}) => {
+    return runJson(["chatgpt-account-pool", "select", stringValue(selection, "Account selection", CHATGPT_ACCOUNT_ID)], { timeoutMs: 60_000 });
+  });
   handleAction("setPresence", async ({ mode } = {}) => runJson(["presence", "set", oneOf(mode, PRESENCE_MODES, "Presence mode")]));
   handleAction("controlService", async ({ action = "status" } = {}) => {
     const value = oneOf(action, SERVICE_COMMANDS, "Service action");
-    const timeoutMs = value === "start" ? 330_000 : 120_000;
+    const timeoutMs = ["start", "restart"].includes(value) ? 330_000 : 120_000;
     await runControl(["service", value], { timeoutMs });
     return { action: value, ok: true };
   });
   handleAction("controlTray", async ({ action = "status" } = {}) => {
     const value = oneOf(action, TRAY_COMMANDS, "Tray action");
-    await runControl(["tray", value], { timeoutMs: 120_000 });
-    return { action: value, ok: true };
+    const status = await runControlJson(["tray", "status"], { timeoutMs: 120_000 });
+    if (value === "status") {
+      return { action: value, ok: true, status };
+    }
+    if (status?.supported === false) {
+      throw new Error(
+        cleanText(
+          status.why,
+          "Tray supervision is unavailable on this platform. Launch the Control Center directly.",
+        ),
+      );
+    }
+    // enable/disable/restart may ask this very GUI to drain and quit. Waiting
+    // for that child while the IPC mutation remains active creates a cycle:
+    // the child waits for the mutation, and the mutation waits for the child.
+    // Accept the validated action once the OS confirms the detached control
+    // process spawned, then let it outlive this window and perform the
+    // lifecycle transaction.
+    await runControlDetached(["tray", value]);
+    return { action: value, ok: true, accepted: true };
   });
   handleAction("launchHarness", async ({ harnessId, surface } = {}) => {
     const harness = oneOf(harnessId, HARNESS_IDS, "Harness");
     const destination = oneOf(surface, HARNESS_SURFACES, "Harness surface");
-    if (harness === "deepcode" && destination === "app") {
-      throw new Error("Deep Code is a third-party terminal harness and has no official desktop app.");
-    }
+    const openOfficialSite = async () => {
+      if (!shell?.openExternal) throw new Error("Opening the official client site is unavailable.");
+      await shell.openExternal(HARNESS_SITES[harness]);
+      return { opened: true, surface: "site" };
+    };
     if (harness === "codex" && destination === "app") {
       const appPath = codexDesktopPath();
-      if (!appPath) throw new Error("Codex desktop is not installed. Open the official Codex documentation to download it.");
+      if (!appPath) return openOfficialSite();
       if (!shell?.openPath) throw new Error("Opening desktop apps is unavailable.");
       const failure = await shell.openPath(appPath);
       if (failure) throw new Error("Could not open the Codex desktop app.");
       return { opened: true, surface: "app" };
     }
-    const executable = executablePath(harness === "codex" ? "codex" : "deepcode");
-    if (!executable) throw new Error(`${harness === "codex" ? "Codex" : "Deep Code"} CLI is not installed.`);
+    if (harness === "cursor" && destination === "app") {
+      const appPath = cursorAppPath();
+      if (!appPath) return openOfficialSite();
+      if (!shell?.openPath) throw new Error("Opening desktop apps is unavailable.");
+      const failure = await shell.openPath(appPath);
+      if (failure) throw new Error("Could not open Cursor App.");
+      return { opened: true, surface: "app" };
+    }
+    if (harness === "openclaw" && destination === "app") {
+      const appPath = openclawAppPath();
+      if (!appPath) return openOfficialSite();
+      if (!shell?.openPath) throw new Error("Opening desktop apps is unavailable.");
+      const failure = await shell.openPath(appPath);
+      if (failure) throw new Error("Could not open OpenClaw.");
+      return { opened: true, surface: "app" };
+    }
+    if (harness === "dsh" && destination === "app") {
+      if (!harnessExecutableResolver("dsh")) return openOfficialSite();
+      if (!shell?.openExternal) throw new Error("Opening DeepSeek Harness is unavailable.");
+      const state = await runControlJson(["harness", "start"], { timeoutMs: 120_000 });
+      if (!state?.url) throw new Error("DeepSeek Harness started without a browser URL.");
+      await shell.openExternal(state.url);
+      return { opened: true, surface: "app" };
+    }
+    if (destination === "app") return openOfficialSite();
+    const routed = ROUTED_HARNESS_ROWS.find((row) => row.id === harness);
+    const executable = routed
+      ? routed.executables.map((name) => harnessExecutableResolver(name)).find(Boolean)
+      : executablePath(
+        harness === "codex" ? "codex"
+          : harness === "dsh" ? "dsh"
+            : harness === "claude" ? "claude-router"
+              : harness === "gemini" ? "gemini"
+                : harness === "openclaw" ? "openclaw"
+                : "cursor-router-agent",
+      );
+    const label = routed ? routed.displayName
+      : harness === "codex" ? "Codex"
+        : harness === "dsh" ? "DeepSeek Harness"
+          : harness === "claude" ? "Claude Code Router"
+            : harness === "gemini" ? "Gemini CLI"
+              : harness === "openclaw" ? "OpenClaw"
+              : "Cursor Router Agent";
+    if (!executable) throw new Error(`${label} CLI is not installed or configured.`);
     return openTerminalCommand(executable, [], discoverSourceRoot());
   }, { requiresCompatibleRouter: false });
-  handleAction("installHarness", async ({ harnessId } = {}) => {
-    const harness = oneOf(harnessId, ["deepcode"], "Installable harness");
-    const npm = executablePath("npm");
-    const nodeVersion = executableVersion(executablePath("node"));
-    const nodeMajor = Number.parseInt(String(nodeVersion || "").replace(/^v/, "").split(".", 1)[0], 10);
-    if (!npm) throw new Error("npm is required to install Deep Code.");
-    if (!Number.isInteger(nodeMajor) || nodeMajor < 22) throw new Error("Deep Code requires Node.js 22 or newer.");
-    // The fixed command is shown in a real terminal. No credential, cwd, package,
-    // or argv value crosses the renderer boundary.
-    return openTerminalCommand(npm, ["install", "-g", DEEPCODE_PACKAGE], discoverSourceRoot());
+  handleAction("probeAgentBridge", async ({ bridgeId } = {}) => {
+    const bridge = oneOf(bridgeId, AGENT_BRIDGE_IDS, "Agent bridge");
+    const module = await installedRouterModule("agent-bridges.mjs");
+    if (typeof module.probeAgentBridge !== "function") {
+      throw new Error("The Control Center does not include agent bridge probing support.");
+    }
+    return module.probeAgentBridge(bridge);
   }, { requiresCompatibleRouter: false });
+  handleAction("loginAgentBridge", async ({ bridgeId } = {}) => {
+    const bridge = oneOf(bridgeId, AGENT_BRIDGE_IDS, "Agent bridge");
+    const executable = bridge === "anthropic"
+      ? executablePath("claude")
+      : bridge === "cursor"
+        ? executablePath("agent") || executablePath("cursor-agent")
+        : executablePath("gemini");
+    if (!executable) throw new Error(`${bridge === "anthropic" ? "Claude Code" : bridge === "cursor" ? "Cursor Agent" : "Gemini CLI"} is not installed.`);
+    const args = bridge === "anthropic" ? ["auth", "login"] : bridge === "cursor" ? ["login"] : [];
+    return openTerminalCommand(executable, args, discoverSourceRoot());
+  }, { requiresCompatibleRouter: false });
+  handleAction("setupHarness", async ({ harnessId, hostname, publicUrl } = {}) => {
+    const harness = oneOf(harnessId, HARNESS_IDS, "Harness");
+    const args = ["client-setup", harness];
+    const environmentOverrides = {};
+    if (harness === "cursor") {
+      if (hostname !== undefined) {
+        const selected = stringValue(hostname, "Cursor hostname", /^[A-Za-z0-9](?:[A-Za-z0-9.-]{1,251}[A-Za-z0-9])?$/);
+        args.push("--hostname", selected);
+      }
+      if (publicUrl !== undefined) {
+        if (hostname !== undefined) throw new Error("Use either a managed hostname or an existing public URL, not both.");
+        const origin = stringValue(publicUrl, "Cursor public URL", /^https:\/\/[^\s]{1,1000}$/);
+        args.push("--public-url", origin);
+      }
+    } else if (publicUrl !== undefined || hostname !== undefined) {
+      throw new Error("A hostname or public URL applies only to Cursor setup.");
+    }
+    if (harness === "claude") {
+      // A desktop app does not inherit the login shell's PATH. Detection
+      // deliberately checks the standard per-user CLI directories, so hand
+      // the exact executable it validated to the fixed router command instead
+      // of asking a child with a narrower PATH to discover it a second time.
+      const claude = harnessExecutableResolver("claude");
+      if (!claude) {
+        throw new Error("Claude Code is not installed. Install the official Claude Code CLI, then refresh Harness.");
+      }
+      environmentOverrides.CLAUDE_CODE_BIN = claude;
+    }
+    if (harness === "openclaw") {
+      const openclaw = harnessExecutableResolver("openclaw");
+      if (openclaw) environmentOverrides.OPENCLAW_BIN = openclaw;
+    }
+    // A desktop app does not inherit the login shell's PATH. Detection above
+    // already checked the standard per-user CLI directories, so hand the exact
+    // executable it found to the router rather than asking a child with a
+    // narrower PATH to discover it a second time.
+    const routedSetup = ROUTED_HARNESS_ROWS.find((row) => row.id === harness);
+    if (routedSetup) {
+      const binary = routedSetup.executables.map((name) => harnessExecutableResolver(name)).find(Boolean);
+      if (binary) environmentOverrides[routedSetup.binEnv] = binary;
+    }
+    return controlJsonRunner(args, {
+      timeoutMs: REPAIR_TIMEOUT_MS,
+      ...(Object.keys(environmentOverrides).length ? { environmentOverrides } : {}),
+    });
+  });
+  // Move one routed client, or every installed one, to its latest release.
+  //
+  // A fixed command with a validated id; the renderer supplies no executable
+  // and no argv. It is deliberately not folded into `setupHarness`: publishing
+  // a model list must never be the reason somebody's global coding agent
+  // changed version underneath them.
+  handleAction("updateHarness", async ({ harnessId } = {}) => {
+    const harness = harnessId === "all" ? "--all" : oneOf(harnessId, ROUTED_HARNESS_IDS, "Harness");
+    const environmentOverrides = {};
+    const routed = ROUTED_HARNESS_ROWS.find((row) => row.id === harness);
+    if (routed) {
+      const binary = routed.executables.map((name) => harnessExecutableResolver(name)).find(Boolean);
+      if (binary) environmentOverrides[routed.binEnv] = binary;
+    }
+    return controlJsonRunner(["client-update", harness], {
+      timeoutMs: REPAIR_TIMEOUT_MS,
+      ...(Object.keys(environmentOverrides).length ? { environmentOverrides } : {}),
+    });
+  });
+  handleAction("prepareCursorTunnel", async (_input, context) => {
+    const cloudflared = cursorConnectorExecutable();
+    if (!cloudflared) {
+      // Installing a system connector is intentionally a click-triggered
+      // action. Detection and page load never mutate the host. The renderer
+      // supplies no executable or argv; this fixed command reports sanitized
+      // stages through the existing in-app operation channel.
+      const installer = cursorConnectorInstaller();
+      if (installer) {
+        await cursorConnectorRunner(installer.executable, installer.args, {
+          kind: "install",
+          environment: installer.environment,
+          progress: context.progress,
+        });
+        const installed = cursorConnectorExecutable();
+        if (!installed) throw new Error("Cloudflare connector finished installing but could not be detected.");
+        context.progress("Cloudflare connector installed. Refreshing Cursor setup…");
+        return { installed: true };
+      }
+      if (!shell?.openExternal) throw new Error("Opening Cloudflare installation instructions is unavailable.");
+      await shell.openExternal(CLOUDFLARED_INSTALL_DOCS);
+      return { opened: true, destination: "install" };
+    }
+    const certificate = process.env.TUNNEL_ORIGIN_CERT || path.join(
+      process.env.MODEL_ROUTER_CLOUDFLARED_HOME || path.join(os.homedir(), ".cloudflared"),
+      "cert.pem",
+    );
+    if (existsSync(certificate)) return { loggedIn: true };
+    await cursorConnectorRunner(cloudflared, ["tunnel", "login"], {
+      kind: "login",
+      progress: context.progress,
+    });
+    if (!existsSync(certificate)) {
+      throw new Error("Cloudflare authorization finished without creating its local certificate.");
+    }
+    context.progress("Cloudflare authorization complete. Refreshing Cursor setup…");
+    return { loggedIn: true };
+  });
+  handleAction("connectCursor", async ({ hostname } = {}, context) => {
+    const appPath = cursorAppPath();
+    if (!appPath) throw new Error("Cursor App is not installed.");
+
+    let cloudflared = cursorConnectorExecutable();
+    if (!cloudflared) {
+      const installer = cursorConnectorInstaller();
+      if (!installer) {
+        throw new Error("Automatic Cloudflare connector installation is unavailable on this machine.");
+      }
+      await cursorConnectorRunner(installer.executable, installer.args, {
+        kind: "install",
+        environment: installer.environment,
+        progress: context.progress,
+      });
+      cloudflared = cursorConnectorExecutable();
+      if (!cloudflared) throw new Error("Cloudflare connector finished installing but could not be detected.");
+      context.progress("Cloudflare connector installed.");
+    }
+
+    const certificate = process.env.TUNNEL_ORIGIN_CERT || path.join(
+      process.env.MODEL_ROUTER_CLOUDFLARED_HOME || path.join(os.homedir(), ".cloudflared"),
+      "cert.pem",
+    );
+    if (!existsSync(certificate)) {
+      await cursorConnectorRunner(cloudflared, ["tunnel", "login"], {
+        kind: "login",
+        progress: context.progress,
+      });
+      if (!existsSync(certificate)) {
+        throw new Error("Cloudflare authorization finished without creating its local certificate.");
+      }
+      context.progress("Cloudflare authorization complete.");
+    }
+
+    const savedHostname = harnessSnapshotReader().harnesses.find((entry) => entry.id === "cursor")?.tunnel?.hostname;
+    const selectedHostname = hostname === undefined || !String(hostname).trim()
+      ? savedHostname || await cursorHostnameResolver({ environment: process.env, fetchImpl })
+      : stringValue(hostname, "Cursor hostname", /^[A-Za-z0-9](?:[A-Za-z0-9.-]{1,251}[A-Za-z0-9])?$/);
+    context.progress(`Using ${selectedHostname} for Cursor's private connector.`);
+
+    const quitDeadline = Date.now() + CURSOR_QUIT_TIMEOUT_MS;
+    let waitingAnnounced = false;
+    while ((await cursorProcessReader()).length) {
+      if (!waitingAnnounced) {
+        context.progress("Fully quit Cursor. Setup will resume here automatically…");
+        waitingAnnounced = true;
+      }
+      if (Date.now() >= quitDeadline) {
+        throw new Error("Cursor is still running. Fully quit it, then click Connect Cursor again.");
+      }
+      await cursorWait(1_000);
+    }
+
+    context.progress("Creating the isolated Cursor connector and publishing routed models…");
+    await controlJsonRunner(
+      ["client-setup", "cursor", "--hostname", selectedHostname],
+      { timeoutMs: REPAIR_TIMEOUT_MS },
+    );
+    const cursor = harnessSnapshotReader().harnesses.find((entry) => entry.id === "cursor");
+    if (!cursor?.agentConfigured || !cursor?.appConfigured) {
+      throw new Error("Cursor setup finished without publishing its routed model catalog.");
+    }
+    context.progress("Cursor routing verified. Opening Cursor…");
+    if (!shell?.openPath) throw new Error("Opening Cursor App is unavailable.");
+    const failure = await shell.openPath(appPath);
+    if (failure) throw new Error("Cursor was configured but could not be reopened.");
+    return { configured: true, hostname: selectedHostname, opened: true };
+  });
+  const runCursorDisconnect = async (context) => {
+    const quitDeadline = Date.now() + CURSOR_QUIT_TIMEOUT_MS;
+    let waitingAnnounced = false;
+    while ((await cursorProcessReader()).length) {
+      if (!waitingAnnounced) {
+        context.progress("Fully quit Cursor. Disconnect will resume here automatically…");
+        waitingAnnounced = true;
+      }
+      if (Date.now() >= quitDeadline) {
+        throw new Error("Cursor is still running. Fully quit it, then turn routing off again.");
+      }
+      await cursorWait(1_000);
+    }
+
+    context.progress("Removing router models and restoring Cursor's own endpoint…");
+    await controlJsonRunner(
+      ["client-disconnect", "cursor"],
+      { timeoutMs: REPAIR_TIMEOUT_MS },
+    );
+    const cursor = harnessSnapshotReader().harnesses.find((entry) => entry.id === "cursor");
+    if (cursor?.appConfigured || cursor?.agentConfigured) {
+      throw new Error("Cursor disconnect finished without clearing the routed App and Agent surfaces.");
+    }
+    return { removed: true };
+  };
+  handleAction("disconnectCursor", async (_input, context) => {
+    return runCursorDisconnect(context);
+  });
+  handleAction("disconnectHarness", async ({ harnessId } = {}, context) => {
+    const harness = oneOf(harnessId, HARNESS_IDS, "Harness");
+    if (harness === "cursor") return runCursorDisconnect(context);
+    context.progress(`Removing the routed catalog from ${harness}…`);
+    await controlJsonRunner(
+      ["client-disconnect", harness],
+      { timeoutMs: REPAIR_TIMEOUT_MS },
+    );
+    const next = harnessSnapshotReader().harnesses.find((entry) => entry.id === harness);
+    if (next?.configured) {
+      throw new Error(`${harness} disconnect finished without clearing its router publication.`);
+    }
+    return { removed: true, harnessId: harness };
+  });
   handleAction("openHarnessSession", async ({ harnessId, sessionId, surface, model } = {}) => {
     const harness = oneOf(harnessId, HARNESS_IDS, "Harness");
     const destination = oneOf(surface, HARNESS_SURFACES, "Harness surface");
-    const id = stringValue(sessionId, "Session", SESSION_UUID).toLowerCase();
+    const id = stringValue(
+      sessionId,
+      "Session",
+      harness === "dsh" ? DSH_SESSION_ID : harness === "cursor" ? CURSOR_SESSION_ID : SESSION_UUID,
+    ).toLowerCase();
     const session = getContextSessionsSnapshot().sessions.find((entry) => entry.harnessId === harness && entry.id === id);
     if (!session) throw new Error("That session is not available in its harness store.");
     if (session.archived || !session.resumable) throw new Error("Restore this archived task in its owning harness before resuming it.");
-    if (harness === "deepcode" && destination !== "terminal") {
-      throw new Error("Deep Code sessions resume in an interactive terminal.");
+    if (harness !== "codex" && destination !== "terminal") {
+      throw new Error(`${harness === "dsh" ? "DeepSeek Harness" : "Cursor"} sessions resume in an interactive terminal.`);
     }
     if (model !== undefined && (harness !== "codex" || destination !== "terminal")) {
       throw new Error("A model override is supported only for Codex terminal resumes.");
@@ -981,8 +2418,11 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
       await shell.openExternal(`codex://threads/${id}`);
       return { opened: true, surface: "app", sessionId: id };
     }
-    const executable = executablePath(harness === "codex" ? "codex" : "deepcode");
-    if (!executable) throw new Error(`${harness === "codex" ? "Codex" : "Deep Code"} CLI is not installed.`);
+    const executable = executablePath(
+      harness === "codex" ? "codex" : harness === "dsh" ? "dsh" : "cursor-router-agent",
+    );
+    const label = harness === "codex" ? "Codex" : harness === "dsh" ? "DeepSeek Harness" : "Cursor Router Agent";
+    if (!executable) throw new Error(`${label} CLI is not installed or configured.`);
     const args = harness === "codex"
       ? ["resume", id, ...(model === undefined || model === "" ? [] : ["-m", await validateModel(model)])]
       : ["--resume", id];
@@ -991,7 +2431,7 @@ export function registerIpcHandlers({ ipcMain, BrowserWindow, shell, fetchImpl =
   }, { requiresCompatibleRouter: false });
   return {
     operationNames: [...operations.values()],
-    hasActiveMutations: () => pendingMutations > 0,
+    hasActiveMutations: () => !mutationsIdle(),
     whenMutationsIdle,
   };
 }

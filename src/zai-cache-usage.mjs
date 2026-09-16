@@ -89,8 +89,15 @@ export class ZaiCacheUsageCompatTransform extends Transform {
   }
 }
 
+// opencode-go (Console Go /v1/chat/completions) sends the same shape: usage on
+// the finish_reason chunk with a non-empty choices array, then [DONE]. LiteLLM
+// 1.96 discards it (BerriAI/litellm#36168), so Codex reports cached_tokens=0
+// even though Go caches the prefix (verified 2026-08-26: mimo-v2.5 returned
+// cached_tokens 2560/2571 on a repeated prefix when called directly).
+const CHOICE_BEARING_USAGE_PROVIDERS = ["zai-api", "zai-coding", "opencode-go"];
+
 export function zaiCacheUsageTransform(providerId, contentType = "") {
-  if (!["zai-api", "zai-coding"].includes(String(providerId))) return undefined;
+  if (!CHOICE_BEARING_USAGE_PROVIDERS.includes(String(providerId))) return undefined;
   if (!String(contentType).toLowerCase().includes("text/event-stream")) return undefined;
   return new ZaiCacheUsageCompatTransform();
 }

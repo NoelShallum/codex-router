@@ -9,7 +9,7 @@ import {
   Server,
   Timer,
 } from "lucide-react";
-import { Badge, Button, EmptyState, PageHeader, SectionHeading } from "../components";
+import { Badge, Button, EmptyState, PageHeader, PanelSkeleton, SectionHeading, SkeletonBlock } from "../components";
 import { ProviderLogo } from "../provider-branding";
 import { ServiceHealthPanel } from "../ServiceHealth";
 import {
@@ -25,6 +25,7 @@ import type {
   ProviderUsageSnapshot,
   ProviderModelUsage,
   RouterControlApi,
+  RouterDataReady,
   RouterHealth,
   RouterTarget,
   UsageEvent,
@@ -55,6 +56,7 @@ type UsageEventTelemetry = UsageEvent & {
   emptyCompletion?: boolean;
   emptyCompletionRetried?: boolean;
   emptyCompletionGuardReleased?: boolean;
+  emptyCompletionPreludeLimit?: "bytes" | "time";
 };
 
 type StatusModelUsage = ProviderModelUsage & {
@@ -87,6 +89,7 @@ export function StatusPage({
   providerUsage,
   api,
   refreshing,
+  dataReady,
   onRefresh,
   runAction,
 }: {
@@ -96,6 +99,7 @@ export function StatusPage({
   providerUsage?: ProviderUsageSnapshot;
   api?: RouterControlApi;
   refreshing: boolean;
+  dataReady: RouterDataReady;
   onRefresh: () => void;
   runAction: RunAction;
 }) {
@@ -104,6 +108,10 @@ export function StatusPage({
   const [repairing, setRepairing] = useState(false);
   const [contextSavingsRange, setContextSavingsRange] = useState<ContextSavingsRangeKey>("24h");
   const [contextSavingsRangeSelectedByUser, setContextSavingsRangeSelectedByUser] = useState(false);
+  const healthPending = !dataReady.health && !health;
+  const snapshotPending = !dataReady.snapshot && !target;
+  const usagePending = (!dataReady.accountUsage && !account)
+    || (!dataReady.providerUsage && !providerUsage);
   // The same repair Settings runs, reached from the panel where a stopped
   // service first becomes visible. Settings stays the only page that renders
   // the diagnostic report; here the toast plus the refreshed health rows are
@@ -235,36 +243,43 @@ export function StatusPage({
       value: health ? health.ok ? "Online" : "Offline" : refreshing ? "Checking" : "Unavailable",
       detail: health?.version ? `Version ${health.version}` : health?.error || "Local health endpoint",
       tone: health?.ok ? "success" : "danger",
+      pending: healthPending,
     },
     {
       label: "Running chats",
       value: exactNumber(chatCount),
       detail: "Unique active sessions",
+      pending: healthPending,
     },
     {
       label: "Running agents",
       value: exactNumber(runningAgentCount),
       detail: "Named subagents currently in flight",
+      pending: healthPending,
     },
     {
       label: "Live requests",
       value: exactNumber(activeRequestCount),
       detail: "Concurrent router work",
+      pending: healthPending,
     },
     {
       label: "Model speed",
       value: fastest ? Number(fastest.observedTokensPerSecond).toFixed(1) : "Unmeasured",
       detail: fastest ? `tok/s · ${fastest.displayName || fastest.slug || "fastest sample"}` : "After a metered reply",
+      pending: !dataReady.providerUsage && !providerUsage,
     },
     {
       label: "Context reused",
       value: hasCacheTelemetry ? compactNumber(cachedInputTokens) : "Not reported",
       detail: "Cached input, recent 24h",
+      pending: snapshotPending && !providerUsage,
     },
     {
       label: "Quota reset",
       value: nextReset ? resetCountdown(nextReset.resetAt) : "Not reported",
       detail: nextReset ? `${nextReset.provider}, ${nextReset.label}` : "No reset timestamp exposed",
+      pending: usagePending,
     },
   ];
 
@@ -280,16 +295,23 @@ export function StatusPage({
 
       <StatusSummary items={summary} />
 
-      <ServiceHealthPanel health={health} onRepair={api ? () => void repair() : undefined} repairing={repairing} />
+      {healthPending ? (
+        <section className="panel-section st-service-loading" aria-label="Loading service health" aria-busy="true">
+          <PanelSkeleton label="Loading service health" count={2} />
+        </section>
+      ) : (
+        <ServiceHealthPanel health={health} onRepair={api ? () => void repair() : undefined} repairing={repairing} />
+      )}
 
       <div className="st-primary-grid">
-        <section className="panel-section st-live-panel">
+        <section className={`panel-section st-live-panel${healthPending ? " is-partition-loading" : ""}`} aria-busy={healthPending}>
+          {healthPending ? <div className="st-partition-skeleton"><PanelSkeleton label="Loading live router activity" count={4} /></div> : null}
           <SectionHeading
             title="Router activity"
             description="Live work from the local health endpoint, grouped by chat and named agent."
           />
           <div className="st-router-state">
-            <span className={`st-status-orb state-${state}`} aria-hidden="true"><i /></span>
+            <RouterActivityOrb state={state} />
             <div>
               <strong>{activityLabel(state)}</strong>
               <small>{activity?.model || (health?.ok
@@ -354,7 +376,8 @@ export function StatusPage({
           )}
         </section>
 
-        <section className="panel-section st-context-panel">
+        <section className={`panel-section st-context-panel${snapshotPending && !providerUsage ? " is-partition-loading" : ""}`} aria-busy={snapshotPending && !providerUsage}>
+          {snapshotPending && !providerUsage ? <div className="st-partition-skeleton"><PanelSkeleton label="Loading context efficiency" count={4} /></div> : null}
           <SectionHeading
             title="Context efficiency"
             description="Accumulated cached input tokens saved across the last 24 hours, 7 days, and 30 days."
@@ -464,7 +487,9 @@ export function StatusPage({
             </label>
           ) : undefined}
         />
-        {visibleModels.length ? (
+        {!dataReady.providerUsage && !providerUsage ? (
+          <PanelSkeleton label="Loading model usage" count={6} />
+        ) : visibleModels.length ? (
           <>
             <div className="st-model-list" aria-label="Model usage">
               {visibleModels.map((model) => (
@@ -513,7 +538,9 @@ export function StatusPage({
             title="Quota resets"
             description="Reset timestamps from ChatGPT and connected provider account APIs."
           />
-          {resetRows.length ? (
+          {usagePending ? (
+            <PanelSkeleton label="Loading quota resets" count={3} />
+          ) : resetRows.length ? (
             <div className="st-reset-list">
               {resetRows.slice(0, 10).map((row) => (
                 <article key={row.id}>
@@ -548,7 +575,9 @@ export function StatusPage({
             title="Speed leaders"
             description="Fastest observed output rates from successful requests, not synthetic benchmarks."
           />
-          {speedRows.length ? (
+          {!dataReady.providerUsage && !providerUsage ? (
+            <PanelSkeleton label="Loading model speed" count={3} />
+          ) : speedRows.length ? (
             <div className="st-speed-list">
               {speedRows.slice(0, 12).map((model) => (
                 <article key={`${model.providerId}/${model.slug || model.displayName}`}>
@@ -587,7 +616,9 @@ export function StatusPage({
           title="Recent router activity"
           description="Privacy-safe events from the recent 24-hour telemetry window."
         />
-        {recentEvents.length ? (
+        {snapshotPending ? (
+          <PanelSkeleton label="Loading recent router activity" count={5} />
+        ) : recentEvents.length ? (
           <div className="st-event-list">
             {recentEvents.map((event, index) => (
               <EventRow key={`${event.at}-${event.model}-${index}`} event={event} />
@@ -602,6 +633,20 @@ export function StatusPage({
         )}
       </section>
     </div>
+  );
+}
+
+function RouterActivityOrb({ state }: { state: string }) {
+  return (
+    <span className={`st-status-orb state-${state}`} aria-hidden="true">
+      <i className="st-orb-core" />
+      <span className="st-orb-particle" />
+      <span className="st-orb-particle" />
+      <span className="st-orb-particle" />
+      <span className="st-orb-particle" />
+      <span className="st-orb-particle" />
+      <span className="st-orb-particle" />
+    </span>
   );
 }
 
@@ -645,15 +690,15 @@ function StatusModelRow({ model, peak }: { model: StatusModelUsage; peak: number
 }
 
 function StatusSummary({ items }: {
-  items: Array<{ label: string; value: string; detail: string; tone?: string }>;
+  items: Array<{ label: string; value: string; detail: string; tone?: string; pending?: boolean }>;
 }) {
   return (
     <dl className="st-summary-grid">
       {items.map((item) => (
         <div key={item.label} className={item.tone ? `tone-${item.tone}` : ""}>
           <dt>{item.label}</dt>
-          <dd>{item.value}</dd>
-          <small>{item.detail}</small>
+          {item.pending ? <SkeletonBlock className="st-skeleton-summary-value" /> : <dd>{item.value}</dd>}
+          {item.pending ? <SkeletonBlock className="st-skeleton-summary-detail" /> : <small>{item.detail}</small>}
         </div>
       ))}
     </dl>
@@ -745,6 +790,9 @@ function buildResetRows(
 
 function eventFlag(event: UsageEventTelemetry): string | null {
   if (event.streamAborted) return "truncated";
+  if (event.emptyCompletionPreludeLimit) {
+    return `guard ${event.emptyCompletionPreludeLimit} limit`;
+  }
   if (event.emptyCompletionRetried) return "retried empty";
   if (event.emptyCompletion) return "empty reply";
   if (event.emptyCompletionGuardReleased) return "guard released";
@@ -871,13 +919,14 @@ function cachedTokensForCalendarDays(
   hasTelemetry: boolean,
 ): number | null {
   if (!daily.length) return hasTelemetry ? 0 : null;
+  // Bucket keys are UTC days, so the window bounding them has to be as well.
   const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  start.setDate(start.getDate() - Math.max(0, days - 1));
+  start.setUTCHours(0, 0, 0, 0);
+  start.setUTCDate(start.getUTCDate() - Math.max(0, days - 1));
   const startTimestamp = start.getTime();
   const now = Date.now();
   return daily.reduce((total, bucket) => {
-    const timestamp = Date.parse(`${bucket.startDate}T00:00:00`);
+    const timestamp = Date.parse(`${bucket.startDate}T00:00:00Z`);
     if (!Number.isFinite(timestamp) || timestamp < startTimestamp || timestamp > now) return total;
     return total + Math.max(0, Number(bucket.cachedInputTokens) || 0);
   }, 0);

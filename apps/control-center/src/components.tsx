@@ -1,4 +1,5 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useEffect, useId, useRef, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle, CheckCircle2, RefreshCw, Search, X } from "lucide-react";
 import { classNames } from "./lib";
 
@@ -156,14 +157,89 @@ export function InlineNotice({ tone = "neutral", title, children }: { tone?: "ne
 }
 
 export function Dialog({ open, title, description, children, onClose }: { open: boolean; title: string; description?: string; children: ReactNode; onClose: () => void }) {
+  const backdropRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const closeRef = useRef(onClose);
+  const titleId = useId();
+  const descriptionId = useId();
+
+  useEffect(() => { closeRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    const backdrop = backdropRef.current;
+    const panel = panelRef.current;
+    if (!backdrop || !panel) return;
+
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    // `aria-modal` describes the relationship to assistive technology; inert
+    // enforces the same boundary for keyboard and pointer input. Preserve a
+    // pre-existing inert owner so nested application shells remain untouched.
+    const siblings = backdrop.parentElement
+      ? [...backdrop.parentElement.children].filter((element): element is HTMLElement => (
+        element instanceof HTMLElement && element !== backdrop
+      ))
+      : [];
+    const priorInert = siblings.map((element) => [element, element.inert] as const);
+    for (const element of siblings) element.inert = true;
+
+    panel.focus({ preventScroll: true });
+    const focusableElements = () => [...panel.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = focusableElements();
+      if (!focusable.length) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || active === panel || !panel.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      for (const [element, inert] of priorInert) element.inert = inert;
+      if (previouslyFocused?.isConnected) previouslyFocused.focus({ preventScroll: true });
+    };
+  }, [open]);
+
   if (!open) return null;
-  return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+  // Portalling to body makes the backdrop a sibling of the complete app root,
+  // so the inert boundary covers navigation, title bar, and page content --
+  // not only the Settings column that happened to open the dialog.
+  return createPortal((
+    <div ref={backdropRef} className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section
+        ref={panelRef}
+        className="dialog-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        tabIndex={-1}
+      >
         <header>
           <div>
-            <h2 id="dialog-title">{title}</h2>
-            {description ? <p>{description}</p> : null}
+            <h2 id={titleId}>{title}</h2>
+            {description ? <p id={descriptionId}>{description}</p> : null}
           </div>
           <button className="icon-button" type="button" aria-label="Close dialog" onClick={onClose}>
             <X aria-hidden size={16} strokeWidth={1.7} />
@@ -172,5 +248,5 @@ export function Dialog({ open, title, description, children, onClose }: { open: 
         {children}
       </section>
     </div>
-  );
+  ), document.body);
 }

@@ -20,8 +20,13 @@ import {
   TARGET,
   TARGET_DISPLAY_NAME,
 } from "./paths.mjs";
+import { providerApiKeyServiceEnvironment } from "./provider-api-key-service-environment.mjs";
 import { serviceProxyEnvironment } from "./proxy-environment.mjs";
-import { assertServiceWriteIsolated } from "./service-write-guard.mjs";
+import { serviceGrokPatchHookEnvironment } from "./grok-patch-hook-settings.mjs";
+import {
+  skipServiceManagerCall,
+  assertServiceWriteIsolated,
+} from "./service-write-guard.mjs";
 
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
@@ -65,6 +70,9 @@ function unit() {
     MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
     MODEL_ROUTER_API_PORT: String(PORTS.api),
+    MODEL_ROUTER_GROK_OAUTH_PORT: String(PORTS.grokOauth),
+    MODEL_ROUTER_DEVIN_CLI_PORT: String(PORTS.devinCli),
+    MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(PORTS.antigravityOauth),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     CODEX_ROUTER_QUIET: "1",
@@ -73,6 +81,8 @@ function unit() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...serviceProxyEnvironment(),
+    ...serviceGrokPatchHookEnvironment(),
+    ...providerApiKeyServiceEnvironment(),
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
@@ -106,7 +116,32 @@ WantedBy=default.target
 `;
 }
 
+// Only this platform's own module can reach this machine's service manager.
+// Run anywhere else -- the cross-platform render tests drive all three modules
+// on one host -- systemctl is absent or a test's own stub.
+const HOST_MANAGED = process.platform === "linux";
+
+// The write guard covers the unit file, but a test cannot redirect systemd:
+// XDG_CONFIG_HOME moves where the unit is written, not where the running
+// systemd looks for it, so `enable --now codex-router.service` from an
+// otherwise isolated test acts on the developer's own unit. Same failure the
+// launchd module already skips, same shape.
+//
+// Reads stay live. `status` has to keep answering whether the unit is really
+// active, or the doctor reasons from a state the skip invented.
+const MUTATING_VERBS = new Set([
+  "daemon-reload",
+  "disable",
+  "enable",
+  "restart",
+  "start",
+  "stop",
+]);
+
 function systemctl(args, options = {}) {
+  if (MUTATING_VERBS.has(args[0]) && skipServiceManagerCall({ hostManaged: HOST_MANAGED })) {
+    return "";
+  }
   return execFileSync("systemctl", ["--user", ...args], {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
@@ -125,8 +160,8 @@ function writeUnit() {
   renameSync(temporary, unitPath);
 }
 
-if (!new Set(["install", "uninstall", "start", "stop", "restart", "status", "render"]).has(command)) {
-  console.error("Usage: service-linux.mjs install|uninstall|start|stop|restart|status|render");
+if (!new Set(["install", "uninstall", "start", "stop", "restart", "status", "render", "restart-count"]).has(command)) {
+  console.error("Usage: service-linux.mjs install|uninstall|start|stop|restart|status|render|restart-count");
   process.exit(2);
 }
 
@@ -167,6 +202,23 @@ if (command === "render") {
   process.stdout.write(
     `${JSON.stringify({ installed: existsSync(unitPath), loaded: state === "active", state })}\n`,
   );
+} else if (command === "restart-count") {
+  // The automatic-restart counter systemd tracks for the unit. It is what
+  // moves during a crash loop -- with Restart=always the unit state cycles
+  // back to "active" after every crash -- and it is compared against the
+  // value at wait start, so residue from before this install only ever
+  // understates the loop. A unit systemd does not know reports no count.
+  let restarts = null;
+  try {
+    const parsed = Number.parseInt(
+      systemctl(["show", unitName, "--property=NRestarts", "--value"]).trim(),
+      10,
+    );
+    if (Number.isSafeInteger(parsed) && parsed >= 0) restarts = parsed;
+  } catch {
+    // No user systemd session, or the unit is not loaded.
+  }
+  process.stdout.write(`${JSON.stringify({ restarts })}\n`);
 } else {
   const verb = { start: "start", stop: "stop", restart: "restart" }[command];
   systemctl([verb, unitName], { quiet: true });

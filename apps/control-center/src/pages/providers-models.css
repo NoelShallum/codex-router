@@ -57,13 +57,18 @@
   letter-spacing: -0.04em;
 }
 
-.pm-provider-directory,
 .pm-model-catalog {
   padding: 0;
-  overflow: hidden;
 }
 
-.pm-provider-toolbar,
+.pm-models-loading {
+  min-height: 430px;
+}
+
+.pm-models-loading .panel-skeleton-item {
+  min-height: 58px;
+}
+
 .pm-model-toolbar {
   display: flex;
   min-width: 0;
@@ -71,28 +76,6 @@
   gap: 8px;
   padding: 13px 14px;
   border-bottom: 1px solid var(--line);
-}
-
-.pm-provider-toolbar {
-  display: grid;
-  grid-template-columns: minmax(300px, 1fr) auto;
-  gap: 12px;
-}
-
-.pm-provider-toolbar-primary,
-.pm-provider-toolbar-actions {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-}
-
-.pm-provider-toolbar-primary {
-  gap: 10px;
-}
-
-.pm-provider-toolbar-actions {
-  justify-content: flex-end;
-  gap: 6px;
 }
 
 .pm-filter-menu-wrap {
@@ -151,15 +134,6 @@
   box-shadow: 0 12px 28px var(--shadow);
 }
 
-.pm-filter-menu-label {
-  padding: 5px 8px 4px;
-  color: var(--ink-faint);
-  font-size: 8px;
-  font-weight: 610;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
 .pm-filter-menu button {
   display: flex;
   min-height: 30px;
@@ -187,113 +161,31 @@
   color: var(--accent);
 }
 
-.pm-provider-toolbar .search-field,
+/* One entry per connected account, so this menu grows with the setup while the
+   status one never exceeds four rows. */
+.pm-provider-filter-menu {
+  max-height: 296px;
+  overflow-y: auto;
+}
+
 .pm-model-toolbar .search-field {
   min-width: min(310px, 35%);
 }
 
-.pm-provider-toolbar-primary .search-field {
-  width: min(390px, 100%);
-  min-width: 220px;
-  flex: 1;
-}
-
-.pm-toolbar-summary {
-  display: flex;
-  min-width: 0;
-  flex: 1;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-}
-
-.pm-toolbar-summary > span,
 .pm-results-count {
   color: var(--ink-faint);
   font-size: 9.5px;
   white-space: nowrap;
 }
 
-.pm-provider-list,
 .pm-model-list {
   background: var(--surface-0);
 }
 
-.pm-provider-row {
-  border-bottom: 1px solid var(--line);
-}
-
-.pm-provider-row:last-child {
-  border-bottom: 0;
-}
-
-.pm-provider-summary {
-  display: grid;
-  width: 100%;
-  min-height: 66px;
-  grid-template-columns: 38px minmax(0, 1fr) 16px;
-  align-items: center;
-  gap: 14px;
-  padding: 10px 14px;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  font: inherit;
-  text-align: left;
-  transition: background 130ms ease;
-}
-
-.pm-provider-summary:hover,
 .pm-model-row:hover {
   background: color-mix(in srgb, var(--surface-2) 72%, transparent);
 }
 
-.pm-provider-row[data-expanded="true"] .pm-provider-summary {
-  background: color-mix(in srgb, var(--surface-2) 52%, transparent);
-}
-
-.pm-provider-main {
-  min-width: 0;
-}
-
-.pm-provider-title-line {
-  display: flex;
-  min-width: 0;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.pm-provider-title-line > strong {
-  min-width: min(190px, 34%);
-  padding-top: 3px;
-  overflow: hidden;
-  color: var(--ink-strong);
-  font-size: 11.5px;
-  font-weight: 610;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pm-provider-tags {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 5px;
-}
-
-.pm-provider-requests {
-  display: block;
-  margin-top: 6px;
-  color: var(--ink-faint);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 8px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.25;
-}
-
-.pm-provider-main > small,
 .pm-credential-provider small {
   display: block;
   margin-top: 3px;
@@ -302,220 +194,32 @@
   font-size: 8.5px;
 }
 
-.pm-provider-panel-copy > p {
-  max-width: 690px;
-  margin: 0;
-  color: var(--ink-subtle);
-  font-size: 9.5px;
-  line-height: 1.42;
-}
-
-.pm-curation-note {
-  display: block;
-  margin-top: 4px;
-  color: var(--warning);
-  font-size: 8.5px;
-  line-height: 1.4;
-}
-
-.pm-provider-connection {
-  display: grid;
-  grid-template-columns: minmax(240px, 1fr) auto;
-  align-items: center;
-  gap: 18px;
-  padding: 10px 14px 12px 66px;
-  border-top: 1px solid color-mix(in srgb, var(--line) 74%, transparent);
-  background: color-mix(in srgb, var(--surface-1) 70%, transparent);
-}
-
-.pm-provider-detail[hidden],
 .pm-model-list[hidden] {
   display: none;
 }
 
-.pm-provider-detail {
-  background: color-mix(in srgb, var(--surface-1) 45%, var(--surface-0));
+.pm-add-models-identity > .pm-catalog-block-reason {
+  color: var(--warning);
+  white-space: normal;
 }
-
-.pm-selected-models-heading {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px 8px 66px;
-  border-top: 1px solid color-mix(in srgb, var(--line) 74%, transparent);
-}
-
-.pm-selected-models-heading > div {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.pm-selected-models-heading strong {
-  color: var(--ink-strong);
-  font-size: 10px;
-  font-weight: 610;
-}
-
-.pm-selected-models-heading span {
-  color: var(--ink-faint);
-  font-size: 8.5px;
-}
-
-.pm-live-catalog {
-  margin: 0 14px 14px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-0);
-}
-
-.pm-live-catalog-heading,
-.pm-live-catalog-toolbar,
-.pm-live-catalog-error {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 11px;
-}
-
-.pm-live-catalog-heading,
-.pm-live-catalog-error {
-  justify-content: space-between;
-}
-
-.pm-live-catalog-heading {
-  border-bottom: 1px solid var(--line);
-}
-
-.pm-live-catalog-heading > div:first-child,
-.pm-live-catalog-error > div {
-  display: grid;
-  min-width: 0;
-  gap: 3px;
-}
-
-.pm-live-catalog-heading strong,
-.pm-live-catalog-error strong {
-  color: var(--ink-strong);
-  font-size: 10px;
-  font-weight: 610;
-}
-
-.pm-live-catalog-heading span,
-.pm-live-catalog-error span,
-.pm-live-catalog-toolbar > span,
-.pm-live-catalog-note,
-.pm-live-catalog-limit {
-  color: var(--ink-faint);
-  font-size: 8.5px;
-  line-height: 1.42;
-}
-
-.pm-live-catalog-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-}
-
-.pm-live-catalog-toolbar {
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface-1) 68%, transparent);
-}
-
-.pm-live-catalog-toolbar .search-field {
-  width: min(330px, 42%);
-  margin-right: auto;
-}
-
-.pm-live-catalog-list {
-  max-height: 310px;
-  overflow: auto;
-}
-
-.pm-live-catalog-row {
-  display: grid;
-  min-height: 46px;
-  grid-template-columns: 16px minmax(220px, 1fr) auto auto auto;
-  align-items: center;
-  gap: 9px;
-  padding: 7px 11px;
-  border-bottom: 1px solid var(--line);
-  cursor: pointer;
-}
-
-.pm-live-catalog-row:last-child { border-bottom: 0; }
-.pm-live-catalog-row:hover { background: color-mix(in srgb, var(--surface-2) 72%, transparent); }
-.pm-live-catalog-row[data-published="true"] { cursor: default; }
-.pm-live-catalog-row > input { margin: 0; }
-.pm-live-catalog-row > span:not(.badge) { display: grid; min-width: 0; gap: 2px; }
-.pm-live-catalog-row > span > strong { overflow: hidden; color: var(--ink-strong); font-size: 10px; font-weight: 570; text-overflow: ellipsis; white-space: nowrap; }
-.pm-live-catalog-row small { color: var(--ink-faint); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; }
-.pm-live-catalog-row > span > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-.pm-live-catalog-note,
-.pm-live-catalog-limit {
-  margin: 0;
-  padding: 8px 11px;
-  border-top: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface-1) 52%, transparent);
-}
-
-.pm-live-catalog-limit { color: var(--warning); }
-.pm-live-catalog-empty { padding: 18px 11px; color: var(--ink-faint); font-size: 9px; text-align: center; }
 
 .catalog-skeleton { display: grid; }
+
 .catalog-skeleton-row { display: grid; min-height: 46px; grid-template-columns: 16px minmax(180px, 1fr) minmax(70px, 0.2fr); align-items: center; gap: 9px; padding: 7px 11px; border-bottom: 1px solid var(--line); }
+
 .catalog-skeleton-row:last-child { border-bottom: 0; }
+
 .skeleton-check { width: 14px; height: 14px; border-radius: 3px; }
+
 .skeleton-catalog-name { width: min(290px, 72%); height: 11px; }
+
 .skeleton-catalog-meta { height: 9px; }
-
-.pm-provider-panel-copy {
-  min-width: 0;
-}
-
-.pm-provider-controls {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-}
-
-.pm-provider-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 2px;
-}
-
-.pm-provider-enable {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 7px;
-}
-
-.pm-provider-enable > span {
-  color: var(--ink-faint);
-  font-size: 8.5px;
-  white-space: nowrap;
-}
 
 .pm-accordion-chevron {
   flex: 0 0 auto;
   color: var(--ink-faint);
+  transform: rotate(-90deg);
   transition: transform 150ms ease, color 150ms ease;
-}
-
-.pm-provider-row[data-expanded="true"] .pm-accordion-chevron {
-  color: var(--ink-subtle);
-  transform: rotate(180deg);
 }
 
 .pm-credential-form {
@@ -598,21 +302,8 @@
   margin: 0;
 }
 
-.pm-provider-directory {
-  grid-column: 1 / -1;
-}
-
 .pm-model-toolbar {
   flex-wrap: wrap;
-}
-
-.pm-model-toolbar > select {
-  max-width: 210px;
-}
-
-.pm-toolbar-spacer {
-  min-width: 8px;
-  flex: 1;
 }
 
 .pm-model-list {
@@ -620,16 +311,6 @@
   margin: 0 14px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
-}
-
-.pm-provider-model-empty {
-  margin: 0 14px 14px;
-  padding: 13px;
-  border: 1px dashed var(--line-strong);
-  border-radius: 8px;
-  background: var(--surface-0);
-  color: var(--ink-faint);
-  font-size: 9.5px;
 }
 
 .pm-model-row {
@@ -745,6 +426,322 @@
   background: color-mix(in srgb, var(--accent-soft) 28%, var(--surface-0));
 }
 
+.pm-family-list {
+  background: var(--surface-0);
+}
+
+.pm-family-row {
+  border-bottom: 1px solid var(--line);
+}
+
+.pm-family-row:last-child {
+  border-bottom: 0;
+}
+
+.pm-family-summary {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding-right: 14px;
+  transition: background 130ms ease;
+}
+
+.pm-family-summary:hover,
+.pm-family-summary:focus-within,
+.pm-family-row[data-expanded="true"] .pm-family-summary {
+  background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+}
+
+.pm-family-open {
+  display: grid;
+  width: 100%;
+  min-height: 62px;
+  grid-template-columns: 14px 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.pm-family-action {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.pm-family-action {
+  gap: 9px;
+}
+
+.pm-family-state {
+  min-width: 20px;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  font-weight: 570;
+  text-align: right;
+}
+
+.pm-family-row[data-on="true"] .pm-family-state {
+  color: var(--ink-strong);
+}
+
+.pm-family-row[data-blocked="true"] .pm-family-open {
+  opacity: 0.72;
+}
+
+.pm-family-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.pm-family-main strong {
+  overflow: hidden;
+  color: var(--ink-strong);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-family-main small {
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-family-row[data-expanded="true"] .pm-accordion-chevron {
+  color: var(--ink-subtle);
+  transform: rotate(0deg);
+}
+
+.pm-family-panel[hidden] {
+  display: none;
+}
+
+.pm-family-panel {
+  border-top: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  background: color-mix(in srgb, var(--surface-1) 46%, var(--surface-0));
+}
+
+.pm-family-route-note {
+  padding: 9px 14px 9px 66px;
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+
+.pm-family-panel .pm-model-list {
+  margin: 0;
+  border: 0;
+  border-top: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+  border-radius: 0;
+}
+
+/* Header and rows share one column definition in fixed units, so every cell
+   lines up down the whole list. Per-row `auto` columns are what made each row
+   size itself and the list read as ragged. */
+
+.pm-route-table {
+  background: var(--surface-0);
+}
+
+.pm-route-head,
+.pm-route-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 78px 92px 70px 74px 104px;
+  align-items: center;
+  column-gap: 12px;
+  padding: 0 14px 0 64px;
+}
+
+.pm-route-head {
+  padding-top: 9px;
+  padding-bottom: 6px;
+  color: var(--ink-faint);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.pm-route-row {
+  min-height: 50px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+}
+
+.pm-route-row[data-availability="known"] {
+  background: color-mix(in srgb, var(--surface-1) 55%, var(--surface-0));
+}
+
+.pm-route-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+}
+
+.pm-route-identity > div {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 7px;
+}
+
+.pm-route-identity strong {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--ink-strong);
+  font-size: 11px;
+  font-weight: 580;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-route-free {
+  grid-column: 2;
+  color: var(--success);
+  font-size: 8.5px;
+  font-weight: 600;
+}
+
+.pm-route-identity small {
+  grid-column: 1 / -1;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--ink-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-route-cell {
+  color: var(--ink-subtle);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.pm-route-control .pm-model-control {
+  gap: 7px;
+  flex-wrap: nowrap;
+}
+
+.pm-route-problem {
+  color: var(--danger);
+}
+
+.pm-route-none {
+  color: var(--ink-faint);
+  font-size: 9.5px;
+}
+
+.pm-route-connect {
+  grid-column: 4 / -1;
+  justify-self: start;
+}
+
+/* The effort control, sized to its column so the row stays one line. */
+.pm-effort-menu-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.pm-effort-trigger {
+  display: flex;
+  width: 100%;
+  min-height: 26px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface-0);
+  color: var(--ink-subtle);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.pm-effort-trigger:hover:not(:disabled),
+.pm-effort-trigger[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line-strong));
+  color: var(--ink-strong);
+}
+
+.pm-effort-trigger:disabled {
+  color: var(--ink-faint);
+  cursor: default;
+}
+
+.pm-effort-trigger > svg {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  transition: transform 130ms ease;
+}
+
+.pm-effort-trigger > svg.is-open {
+  transform: rotate(180deg);
+}
+
+/* Anchored to the control it belongs to, unlike a native select's menu, which
+   macOS shifts left by the width of its checkmark gutter. */
+.pm-effort-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  right: 0;
+  display: grid;
+  min-width: 100%;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--raised);
+  box-shadow: 0 12px 28px var(--shadow);
+}
+
+.pm-effort-menu button {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-subtle);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.pm-effort-menu button:hover,
+.pm-effort-menu button.is-selected {
+  background: var(--surface-2);
+  color: var(--ink-strong);
+}
+
+.pm-effort-menu button.is-selected svg {
+  color: var(--accent);
+}
+
 .providers-models-page :is(input, select):focus-visible,
 .providers-models-page .segmented-control button:focus-visible,
 .pm-credential-form input:focus-visible {
@@ -752,135 +749,475 @@
   background-color: color-mix(in srgb, var(--accent-soft) 34%, var(--surface-0));
 }
 
-.pm-provider-summary:focus-visible {
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface-0));
+/* One connections strip stands in for the old per-provider accordion. Chips
+   carry state; everything that changes an account lives in the chip's popover. */
+
+.pm-connections {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+}
+
+.pm-connections-loading {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.7fr) repeat(2, minmax(120px, 1fr));
+}
+
+.pm-connections-loading .skeleton-block {
+  min-height: 34px;
+}
+
+.pm-connections-label {
+  display: grid;
+  gap: 2px;
+}
+
+.pm-connections-label strong {
+  color: var(--ink-strong);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.pm-connections-label small {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+}
+
+.pm-connections-chips {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.pm-chip-wrap {
+  position: relative;
+}
+
+.pm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px 4px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-0);
+  color: var(--ink-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 560;
+  transition: background 130ms ease, border-color 130ms ease;
+}
+
+.pm-chip:hover,
+.pm-chip[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line-strong));
+  background: var(--surface-2);
+}
+
+.pm-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+.pm-chip-dot[data-enabled="true"] {
+  background: var(--success);
+}
+
+.pm-chip-add {
+  padding-left: 10px;
+  border-style: dashed;
+  color: var(--ink-subtle);
+}
+
+.pm-connect-menu,
+.pm-connection-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  left: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--raised);
+  box-shadow: 0 18px 44px var(--shadow);
+}
+
+.pm-connect-menu {
+  display: grid;
+  min-width: 230px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 5px;
+}
+
+.pm-connect-menu button {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  text-align: left;
+}
+
+.pm-connect-menu button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.pm-connect-menu button:disabled {
+  color: var(--ink-faint);
+  cursor: default;
+}
+
+.pm-connect-menu small {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.pm-connection-menu {
+  display: grid;
+  width: 290px;
+  gap: 11px;
+  padding: 13px;
+}
+
+.pm-connection-menu-head {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.pm-connection-menu-head strong {
+  display: block;
+  color: var(--ink-strong);
+  font-size: 11.5px;
+  font-weight: 610;
+}
+
+.pm-connection-menu-head small,
+.pm-connection-menu-usage {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+}
+
+.pm-connection-menu-copy {
+  margin: 0;
+  color: var(--ink-subtle);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.pm-connection-menu-enable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-subtle);
+  font-size: 9.5px;
+}
+
+.pm-connection-menu-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Status groups replace the two-section split: a model's heading says what you
+   can do with it right now, so no row needs a badge to explain itself. */
+
+.pm-group + .pm-group {
+  border-top: 1px solid var(--line);
+}
+
+.pm-group-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  padding: 11px 14px 4px;
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.pm-group-heading small {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  font-weight: 560;
+  letter-spacing: 0;
+}
+
+.pm-group .pm-family-list {
+  border: 0;
+}
+
+.pm-model-control-note {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+/* One add-models surface for every connected provider at once. */
+
+.dialog-panel:has(.pm-add-models) {
+  width: min(100%, 740px);
+}
+
+.pm-add-models {
+  display: grid;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.pm-add-models-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.pm-add-models-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.pm-add-models-row {
+  display: grid;
+  grid-template-columns: 16px 30px minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.pm-add-models-row:last-child {
+  border-bottom: 0;
+}
+
+.pm-add-models-row:hover {
+  background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+}
+
+.pm-add-models-row[data-published="true"],
+.pm-add-models-row[data-blocked="true"] {
+  color: var(--ink-faint);
+  cursor: default;
+}
+
+.pm-add-models-identity {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.pm-add-models-identity strong {
+  overflow: hidden;
+  color: var(--ink-strong);
+  font-size: 10.5px;
+  font-weight: 590;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-add-models-identity small,
+.pm-add-models-provider,
+.pm-add-models-meta > span {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.pm-add-models-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.pm-add-models-more,
+.pm-add-models-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--ink-faint);
+  font-size: 9px;
+}
+
+.pm-add-models-hint {
+  margin-right: auto;
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  line-height: 1.45;
+}
+
+.pm-model-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px 24px;
+  margin: 0;
+  padding: 13px 14px 13px 64px;
+}
+
+.pm-model-details > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.pm-model-details dt {
+  color: var(--ink-faint);
+  font-size: 8.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pm-model-details dd {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-subtle);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.pm-model-details-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9.5px !important;
+}
+
+.pm-model-details dd.pm-model-details-controls {
+  overflow: visible;
+}
+
+.pm-model-details .pm-subagent-controls {
+  margin-top: -2px;
+}
+
+.pm-icon-trigger {
+  display: inline-flex;
+  min-width: 29px;
+  min-height: 29px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface-0);
+  color: var(--ink-subtle);
+  cursor: pointer;
+}
+
+.pm-icon-trigger:hover:not(:disabled),
+.pm-icon-trigger[aria-expanded="true"] {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line-strong));
+  color: var(--ink-strong);
+}
+
+.pm-icon-trigger:disabled {
+  color: var(--ink-faint);
+  cursor: default;
 }
 
 @media (max-width: 1120px) {
-  .pm-provider-toolbar {
-    grid-template-columns: minmax(260px, 1fr) auto;
-  }
-
-  .pm-provider-toolbar-actions {
-    flex-wrap: wrap;
-  }
-
-  .pm-provider-connection {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .pm-provider-controls {
-    justify-content: space-between;
-  }
-
-  .pm-model-row {
+.pm-model-row {
     grid-template-columns: minmax(240px, 1fr) auto;
   }
 
-  .pm-model-meta {
+.pm-model-meta {
     justify-content: flex-end;
   }
 
-  .pm-model-controls {
+.pm-model-controls {
     grid-column: 1 / -1;
     justify-content: flex-end;
     padding-top: 2px;
   }
 }
 
-@media (max-width: 1040px) {
-  .pm-provider-toolbar {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .pm-provider-toolbar-primary,
-  .pm-provider-toolbar-actions {
-    justify-content: flex-start;
-  }
-}
-
 @media (max-width: 820px) {
-  .pm-provider-toolbar,
-  .pm-model-toolbar {
+.pm-model-toolbar {
     align-items: stretch;
   }
 
-  .pm-provider-toolbar-primary,
-  .pm-provider-toolbar-actions {
-    justify-content: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .pm-live-catalog-heading,
-  .pm-live-catalog-toolbar {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .pm-live-catalog-actions { justify-content: flex-start; }
-  .pm-live-catalog-toolbar .search-field { width: 100%; }
-  .pm-live-catalog-row { grid-template-columns: 16px minmax(0, 1fr) auto; }
-  .pm-live-catalog-row > small { grid-column: 2; }
-
-  .pm-provider-toolbar .search-field,
-  .pm-model-toolbar .search-field {
+.pm-model-toolbar .search-field {
     min-width: 100%;
   }
 
-  .pm-toolbar-summary {
-    justify-content: space-between;
+.pm-family-open {
+    grid-template-columns: 14px 38px minmax(0, 1fr);
   }
 
-  .pm-provider-summary {
-    grid-template-columns: 38px minmax(0, 1fr) 16px;
-    align-items: start;
+.pm-family-route-note,
+  .pm-model-details,
+  .pm-route-head,
+  .pm-route-row {
+    padding-left: 14px;
   }
 
-  .pm-provider-summary > .pm-accordion-chevron {
-    grid-column: 3;
-    grid-row: 1;
-    align-self: center;
+.pm-effort-menu-wrap {
+    max-width: 128px;
   }
 
-  .pm-provider-connection {
-    padding-left: 66px;
+.pm-route-head {
+    display: none;
   }
 
-  .pm-selected-models-heading {
-    align-items: flex-start;
-    padding-left: 66px;
+.pm-route-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 6px;
+    padding-top: 8px;
+    padding-bottom: 8px;
   }
 
-  .pm-provider-controls {
-    align-items: flex-start;
-    flex-direction: column;
+.pm-route-row > .pm-route-cell:not(.pm-route-connect) {
+    grid-column: auto;
   }
 
-  .pm-provider-actions {
-    flex-wrap: wrap;
-    justify-content: flex-start;
+.pm-route-connect {
+    grid-column: 2;
   }
 
-  .pm-model-row {
+.pm-model-row {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .pm-model-meta,
+.pm-model-meta,
   .pm-model-controls {
     grid-column: 1;
     justify-content: flex-start;
   }
 
-  .pm-model-controls,
+.pm-model-controls,
   .pm-subagent-controls {
     align-items: flex-start;
     flex-wrap: wrap;
   }
-
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pm-provider-summary,
+.pm-family-summary,
   .pm-model-row,
   .pm-accordion-chevron {
     transition: none;
@@ -890,6 +1227,7 @@
 /* Placeholder rows for models being published to the picker. They hold the
    real row's geometry so the list does not jump when the add completes and the
    actual rows replace them. */
+
 .pm-model-row-pending {
   cursor: default;
 }
@@ -933,4 +1271,49 @@
   width: 78px;
   height: 22px;
   border-radius: 6px;
+}
+
+@media (max-width: 820px) {
+  .pm-connections {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .pm-connection-menu,
+  .pm-connect-menu {
+    left: auto;
+    right: 0;
+  }
+
+  .pm-connection-menu {
+    width: min(78vw, 290px);
+  }
+
+  .pm-family-summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .pm-family-action {
+    justify-content: flex-end;
+    padding-bottom: 10px;
+  }
+
+  .pm-add-models-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .pm-add-models-toolbar .search-field {
+    grid-column: 1 / -1;
+  }
+
+  .pm-add-models-row {
+    grid-template-columns: 16px 30px minmax(0, 1fr) auto;
+  }
+
+  .pm-add-models-provider,
+  .pm-add-models-meta {
+    grid-column: 3;
+  }
 }

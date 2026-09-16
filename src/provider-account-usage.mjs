@@ -10,6 +10,10 @@ import {
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
+import {
+  OPENCODE_SESSION_FALLBACKS,
+  openCodeSessionHeaders,
+} from "./opencode-session.mjs";
 import { cooldownUntil } from "./rate-limit-headers.mjs";
 import { rateLimitSnapshotFor } from "./rate-limit-state.mjs";
 import { VERSION } from "./version.mjs";
@@ -333,6 +337,71 @@ export function commandCodeCreditsMetrics(payload) {
   ].filter(Boolean);
 }
 
+// Venice funds inference from three independent pools -- funded USD, VCU from
+// staked VVV, and the 24-hour DIEM allowance -- and consumes whichever is
+// available at request time, so reporting only one of them would show a user
+// with a full VCU balance a zero. `accessPermitted` is Venice's own answer to
+// "may this key call the API at all"; a key whose plan or per-key spend limit
+// blocks it still reports balances, so the flag rides on every metric rather
+// than suppressing them.
+export function veniceBalanceMetrics(data) {
+  const balances = data?.balances;
+  if (!balances || typeof balances !== "object") return [];
+  const available = data.accessPermitted !== false;
+  return [
+    ["USD", "USD balance", "Funded USD credits"],
+    ["VCU", "VCU balance", "Venice Compute Units from staked VVV"],
+    ["DIEM", "DIEM balance", "Daily DIEM allowance"],
+  ]
+    .map(([code, label, detail]) => {
+      const value = numberValue(balances[code] ?? balances[code.toLowerCase()]);
+      if (!Number.isFinite(value)) return undefined;
+      return { kind: "balance", label, value, currency: code, detail, available };
+    })
+    .filter(Boolean);
+}
+
+// `/api/v1/key` answers for any inference key and is the only OpenRouter route
+// that reports the per-key spend cap. `limit: null` means the key is uncapped,
+// which is not a quota and must not be rendered as a full one.
+export function openRouterKeyMetrics(payload) {
+  const data = payload?.data;
+  if (!data || typeof data !== "object") return [];
+  const limit = numberValue(data.limit);
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+  return [
+    quotaMetric(
+      "Key spend limit",
+      {
+        limit,
+        used: numberValue(data.usage),
+        remaining: numberValue(data.limit_remaining),
+        resetTime: typeof data.limit_reset === "string" ? data.limit_reset : undefined,
+      },
+      "USD",
+    ),
+  ].filter(Boolean);
+}
+
+// `/api/v1/credits` reports the account-wide pool, but OpenRouter serves it
+// only to a management key: an ordinary inference key gets HTTP 403 there
+// while `/api/v1/key` keeps working, so this is an enrichment and never the
+// thing a missing balance is blamed on.
+export function openRouterCreditsMetrics(payload) {
+  const data = payload?.data;
+  const purchased = numberValue(data?.total_credits);
+  const used = numberValue(data?.total_usage);
+  if (!Number.isFinite(purchased) || !Number.isFinite(used)) return [];
+  return [{
+    kind: "balance",
+    label: "Credit balance",
+    value: purchased - used,
+    currency: "USD",
+    detail: `Purchased ${purchased.toFixed(2)} · Used ${used.toFixed(2)}`,
+    available: purchased - used > 0,
+  }];
+}
+
 export function githubCopilotQuotaMetrics(payload) {
   const reset =
     payload?.quota_reset_date ??
@@ -481,7 +550,10 @@ async function opencodeGoAccount(fetchImpl) {
   if (new URL(baseURL).origin !== "https://opencode.ai") {
     return localOnly("Plan usage is unavailable for a custom opencode endpoint");
   }
-  const payload = await requestJson(`${baseURL}/usage`, credential.value, {}, fetchImpl);
+  const payload = await requestJson(`${baseURL}/usage`, credential.value, {
+    "User-Agent": `codex-router/${VERSION}`,
+    ...openCodeSessionHeaders({ fallback: OPENCODE_SESSION_FALLBACKS.usage }),
+  }, fetchImpl);
   const metrics = opencodeGoUsageMetrics(payload);
   if (!metrics.length) throw new Error("opencode usage response was incomplete");
   return { status: "available", source: "official-api", metrics };
@@ -613,6 +685,11 @@ const QWEN_PLAN_DASHBOARD_URL =
   "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=plan#/efm/subscription/token-plan";
 const OLLAMA_DASHBOARD_URL = "https://ollama.com/settings";
 const COMMANDCODE_DASHBOARD_URL = "https://commandcode.ai/studio";
+const OPENROUTER_DASHBOARD_URL = "https://openrouter.ai/settings/credits";
+const VENICE_DASHBOARD_URL = "https://venice.ai/settings/api";
+// Nous publishes no credits or usage route on the inference API (a 404 on both
+// /v1/credits and /v1/key), so the portal page is the only honest destination.
+const NOUS_DASHBOARD_URL = "https://portal.nousresearch.com/manage-subscription";
 
 function zaiWindowLabel(unit, number) {
   if (unit === 6) return number === 1 ? "Weekly limit" : `${number}-week limit`;
@@ -760,6 +837,78 @@ async function githubCopilotAccount(fetchImpl) {
   return account;
 }
 
+async function veniceAccount(fetchImpl) {
+  const provider = PROVIDERS.get("venice");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const fallback = (message) => ({
+    ...withHeaderQuota("venice", localOnly(message)),
+    dashboardUrl: VENICE_DASHBOARD_URL,
+  });
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://api.venice.ai") {
+    return fallback("Account balances are unavailable for a custom Venice endpoint");
+  }
+  let payload;
+  try {
+    payload = await requestJson(`${baseURL}/api_keys/rate_limits`, credential.value, {}, fetchImpl);
+  } catch {
+    return fallback("Venice account balances are unavailable; showing router traffic");
+  }
+  const data = payload?.data ?? payload;
+  const metrics = veniceBalanceMetrics(data);
+  if (!metrics.length) return fallback("Venice reported no balances; showing router traffic");
+  const account = {
+    status: "available",
+    source: "official-api",
+    metrics,
+    dashboardUrl: VENICE_DASHBOARD_URL,
+  };
+  if (typeof data?.apiTier?.id === "string" && data.apiTier.id) account.plan = data.apiTier.id;
+  // The plan note already warns that a free Venice account has no API
+  // entitlement; this is the same fact confirmed against the live key.
+  if (data?.accessPermitted === false) {
+    account.message = "This Venice key is not permitted to call the API; check its tier and spend limits.";
+  }
+  return account;
+}
+
+async function openRouterAccount(fetchImpl) {
+  const provider = PROVIDERS.get("openrouter");
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const fallback = (message) => ({
+    ...withHeaderQuota("openrouter", localOnly(message)),
+    dashboardUrl: OPENROUTER_DASHBOARD_URL,
+  });
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  if (new URL(baseURL).origin !== "https://openrouter.ai") {
+    return fallback("Account credits are unavailable for a custom OpenRouter endpoint");
+  }
+  let key;
+  try {
+    key = await requestJson(`${baseURL}/key`, credential.value, {}, fetchImpl);
+  } catch {
+    return fallback("OpenRouter account usage is unavailable; showing router traffic");
+  }
+  // A management key adds the account-wide pool; an inference key answers 403
+  // here and keeps the per-key metrics it already has.
+  const credits = await requestJson(`${baseURL}/credits`, credential.value, {}, fetchImpl)
+    .then(openRouterCreditsMetrics)
+    .catch(() => []);
+  const metrics = [...credits, ...openRouterKeyMetrics(key)];
+  if (!metrics.length) {
+    return fallback("This OpenRouter key is uncapped and its balance needs a management key");
+  }
+  return {
+    status: "available",
+    source: "official-api",
+    metrics,
+    dashboardUrl: OPENROUTER_DASHBOARD_URL,
+    plan: key?.data?.is_free_tier === true ? "Free tier" : "Paid",
+  };
+}
+
 async function accountUsageFor(providerId, fetchImpl) {
   try {
     if (providerId === "chutes") return await chutesAccount(fetchImpl);
@@ -825,6 +974,23 @@ async function accountUsageFor(providerId, fetchImpl) {
         : { status: "not-configured", source: "official-api", metrics: [] };
     }
     if (providerId === "commandcode") return await commandCodeAccount(fetchImpl);
+    if (providerId === "venice") return await veniceAccount(fetchImpl);
+    if (providerId === "openrouter") return await openRouterAccount(fetchImpl);
+    if (providerId === "nousresearch") {
+      // Nous Portal shows credits and the subscription tier only in the
+      // browser: the inference API answers 404 on both /credits and /key, so
+      // there is no number to fetch and inventing one would be worse than the
+      // link. Router traffic still fills the usage card.
+      return resolveProviderCredential("nousresearch")
+        ? {
+            ...withHeaderQuota(
+              providerId,
+              localOnly("Nous Portal shows credits only on the portal; showing router traffic"),
+            ),
+            dashboardUrl: NOUS_DASHBOARD_URL,
+          }
+        : { status: "not-configured", source: "official-api", metrics: [] };
+    }
     if (providerId === "minimax-token-plan") return await minimaxTokenPlanAccount(fetchImpl);
     if (providerId === "opencode-go") return await opencodeGoAccount(fetchImpl);
     // Keyed on the auth mode rather than on a list of ids: an anonymous
@@ -834,6 +1000,12 @@ async function accountUsageFor(providerId, fetchImpl) {
       return withHeaderQuota(providerId, localOnly("Anonymous free-provider quota is not exposed; showing router traffic"));
     }
     if (providerId === "github-copilot") return await githubCopilotAccount(fetchImpl);
+    if (providerId === "vertex") {
+      return withHeaderQuota(
+        providerId,
+        localOnly("Google Cloud Console shows Vertex spend; showing router traffic"),
+      );
+    }
     // Every remaining provider — including the catalog-only ones — reports its
     // window through response headers or shows router traffic alone.
     return withHeaderQuota(providerId, localOnly("Showing router traffic"));

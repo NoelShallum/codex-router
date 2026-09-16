@@ -317,7 +317,15 @@ export const MAX_BODY_BYTES = Number(
     (TARGET === "codex"
       ? process.env.CODEX_ROUTER_MAX_BODY_BYTES || process.env.KIMI_PROXY_MAX_BODY_BYTES
       : undefined) ||
-    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+);
+
+export const MAX_BUFFERED_RESPONSE_BYTES = Number(
+  process.env.MODEL_ROUTER_MAX_BUFFERED_RESPONSE_BYTES ||
+    (TARGET === "codex"
+      ? process.env.CODEX_ROUTER_MAX_BUFFERED_RESPONSE_BYTES
+      : undefined) ||
+    8 * 1024 * 1024,
 );
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -358,6 +366,114 @@ export function applyKeepAliveTimeouts(server) {
   return server;
 }
 
+// A restart is the one shutdown this service performs on purpose -- publishing
+// a curated model, a repair from the desktop app, a reinstall -- and until now
+// it was indistinguishable from a crash to whatever was mid-turn. The old
+// handler was `server.close(() => process.exit(0))`, and `close` waits for
+// every connection still carrying a request, so a streaming turn held the
+// process open past `start.mjs`'s kill window and the router was SIGKILLed
+// with its sockets open. A killed socket is an RST: the chunked body loses its
+// terminator and Codex reports the whole turn as
+// `stream disconnected before completion: error decoding response body`, which
+// names neither the restart nor the router. Adding a model should not read as
+// a network fault.
+//
+// So: stop accepting, let anything already in flight finish inside a bounded
+// window, and then end what is left the way every other mid-stream failure
+// here ends -- a terminal SSE `error` frame and a clean close, never a reset.
+// The window is short because the process is going away regardless; it exists
+// so the turns that were about to finish do, not to hold a restart open.
+const configuredShutdownDrainMs = Number(
+  process.env.MODEL_ROUTER_SHUTDOWN_DRAIN_MS || 2_000,
+);
+export const SHUTDOWN_DRAIN_MS =
+  Number.isFinite(configuredShutdownDrainMs) && configuredShutdownDrainMs >= 0
+    ? configuredShutdownDrainMs
+    : 2_000;
+
+// Ending a response only queues its last bytes; the socket still has to drain
+// them. Destroying connections the instant the frames are written would undo
+// the whole point of writing them, so allow a short flush before forcing the
+// remaining sockets down.
+export const SHUTDOWN_FLUSH_MS = 1_000;
+
+const SHUTDOWN_MESSAGE = "The local router is restarting; retry the request.";
+
+export function installGracefulShutdown(
+  server,
+  {
+    label,
+    signals = ["SIGINT", "SIGTERM"],
+    drainMs = SHUTDOWN_DRAIN_MS,
+    flushMs = SHUTDOWN_FLUSH_MS,
+    exit = (code) => process.exit(code),
+  } = {},
+) {
+  const live = new Set();
+  // Registered as a second 'request' listener, so it observes every request
+  // the handler passed to `createServer` receives without wrapping it.
+  server.on("request", (_request, response) => {
+    live.add(response);
+    response.once("close", () => live.delete(response));
+  });
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    let exited = false;
+    let drainTimer;
+    let flushTimer;
+    const finish = () => {
+      if (exited) return;
+      exited = true;
+      if (drainTimer) clearTimeout(drainTimer);
+      if (flushTimer) clearTimeout(flushTimer);
+      exit(0);
+    };
+    server.close(finish);
+    // Idle keep-alive sockets are held for two minutes by design
+    // (KEEPALIVE_TIMEOUT_MS), and `close` alone leaves them to expire on their
+    // own schedule. Drop them now: nothing is riding on them.
+    server.closeIdleConnections?.();
+    if (live.size > 0) {
+      console.error(
+        `[${label}] shutting down with ${live.size} request(s) in flight; draining for up to ${drainMs}ms`,
+      );
+    }
+    // The response tracker can already be empty while Node still considers an
+    // aborted request active. In that state server.close() waits for the
+    // two-minute keep-alive timeout, so the bounded backstop is required even
+    // when there is no response left to terminate.
+    drainTimer = setTimeout(() => {
+      for (const response of live) {
+        // A response whose head is still unsent can still say what happened
+        // with a status; one already streaming cannot, and takes the terminal
+        // error frame instead.
+        if (response.headersSent) {
+          endStreamedResponse(response, { message: SHUTDOWN_MESSAGE });
+        } else {
+          writeJson(response, 503, {
+            error: { type: "local_router_restarting", message: SHUTDOWN_MESSAGE },
+          });
+        }
+      }
+      // `close` settles once those final writes drain and the sockets end,
+      // which is the ordinary path. The backstop is for a peer that stops
+      // reading and would otherwise hold the process open.
+      flushTimer = setTimeout(() => {
+        server.closeAllConnections?.();
+        finish();
+      }, flushMs);
+      flushTimer.unref();
+    }, drainMs);
+    // A normal idle close or a drain that empties early calls finish through
+    // server.close's callback and clears this timer.
+    drainTimer.unref();
+  };
+  for (const signal of signals) process.on(signal, shutdown);
+  return server;
+}
+
 // A `listen` that fails emits `'error'`, and with no handler Node rethrows it
 // from the event loop: the log gets `node:events:487 / throw er; // Unhandled
 // 'error' event` and a libuv stack, with the *label of the process that died
@@ -393,19 +509,148 @@ export function reportListenFailure(server, { label, host, port }) {
   return server;
 }
 
-export async function readRequestBody(request) {
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function readWithAbort(reader, signal) {
+  if (!signal) return reader.read();
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      void reader.cancel().catch(() => {});
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+// The decompressed size a Zstandard frame header declares, or undefined when
+// the frame omits it (streaming encoders may) or the bytes are not a zstd frame
+// at all. Only the header is read; nothing is decoded, so this is safe to run
+// on an untrusted body before any native decompressor sees it.
+//
+// Layout, RFC 8878 §3.1.1: the magic number 0xFD2FB528 (little-endian), then
+// a Frame_Header_Descriptor byte whose top two bits size the content-size
+// field (0, 2, 4, or 8 bytes -- with 0 meaning a 1-byte field only when the
+// Single_Segment bit, bit 5, is set), and whose low two bits size the
+// Dictionary_ID (0, 1, 2, or 4 bytes). A Window_Descriptor byte sits between
+// them unless Single_Segment is set. The 2-byte size form stores the value
+// minus 256.
+export function zstdFrameContentSize(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 6) return undefined;
+  if (buffer.readUInt32LE(0) !== 0xfd2fb528) return undefined;
+  const descriptor = buffer[4];
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const sizeFlag = descriptor >> 6;
+  const sizeBytes = sizeFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][sizeFlag];
+  if (sizeBytes === 0) return undefined;
+  const dictionaryBytes = [0, 1, 2, 4][descriptor & 0x03];
+  const offset = 5 + (singleSegment ? 0 : 1) + dictionaryBytes;
+  if (buffer.length < offset + sizeBytes) return undefined;
+  if (sizeBytes === 1) return buffer[offset];
+  if (sizeBytes === 2) return buffer.readUInt16LE(offset) + 256;
+  if (sizeBytes === 4) return buffer.readUInt32LE(offset);
+  const declared = buffer.readBigUInt64LE(offset);
+  return declared > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(declared);
+}
+
+export async function readRequestBody(
+  request,
+  { maxBytes = MAX_BODY_BYTES, signal } = {},
+) {
   const chunks = [];
   let total = 0;
-  for await (const chunk of request) {
-    total += chunk.length;
-    if (total > MAX_BODY_BYTES) {
-      const error = new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes.`);
-      error.status = 413;
-      throw error;
+  let overflow;
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : MAX_BODY_BYTES;
+  const onAbort = () => request?.destroy?.(abortReason(signal));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const chunk of request) {
+      if (overflow) continue;
+      total += chunk.length;
+      if (total > limit) {
+        // Stop retaining caller-controlled bytes immediately, but keep consuming
+        // the stream so the response can stay keep-alive and the next request
+        // cannot be parsed out of the rejected body's tail.
+        overflow = new Error(`Request body exceeds ${limit} bytes.`);
+        overflow.status = 413;
+        continue;
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+    if (overflow) throw overflow;
+    if (signal?.aborted) throw abortReason(signal);
+    return Buffer.concat(chunks);
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
-  return Buffer.concat(chunks);
+}
+
+// Read an upstream body with the limit applied while bytes arrive. The
+// built-in Response helpers buffer first, which lets a provider-controlled
+// error or relay response consume unbounded memory before the caller can
+// reject it. Cancellation releases the upstream stream as soon as the limit
+// is crossed.
+export async function readResponseBody(
+  upstream,
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+) {
+  if (!upstream?.body) return Buffer.alloc(0);
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0
+    ? Math.floor(maxBytes)
+    : MAX_BUFFERED_RESPONSE_BYTES;
+  try {
+    while (true) {
+      const result = await readWithAbort(reader, signal);
+      if (result.done) break;
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value || []);
+      total += chunk.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        const error = new Error(`Upstream response exceeds ${limit} bytes.`);
+        error.status = 502;
+        error.code = "ERR_UPSTREAM_RESPONSE_TOO_LARGE";
+        throw error;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks, total);
 }
 
 export function writeJson(response, status, payload) {
@@ -469,6 +714,24 @@ function isEventStream(response) {
   return String(response.getHeader("content-type") || "")
     .toLowerCase()
     .includes("text/event-stream");
+}
+
+// Headers handed straight to `writeHead` are written to the socket without
+// being cached, so `getHeader` cannot see them -- and `isEventStream` above,
+// which every terminal error frame is gated on, reads exactly that cache. An
+// SSE route that named its content type only in `writeHead` therefore ended
+// mid-turn with no error event at all: a short stream indistinguishable from
+// a completed one, which is the silent corruption the framing exists to
+// prevent. Seat the content type through `setHeader` first (`writeHead` merges
+// over it) so the head is both written and visible.
+export function writeEventStreamHead(response, status = 200, headers = {}) {
+  response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  response.writeHead(status, {
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    ...headers,
+  });
+  return response;
 }
 
 export async function finishResponse(response) {

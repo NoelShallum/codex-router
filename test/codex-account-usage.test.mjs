@@ -1,10 +1,126 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import path from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
+  ACCOUNT_POOL_USAGE_PROBE_LIMIT,
+  attachBoundedChatGPTAccountUsage,
   normalizeCodexAccountUsage,
   readCodexAccountUsage,
 } from "../src/codex-account-usage.mjs";
+
+// `deferred` answers on a later tick, the way a real app-server's pipe does.
+// Answering synchronously runs the probe's line handler inside its own guarded
+// stdin write, whose catch swallowed a ReferenceError on the both-answered
+// path, so every test here stayed green while Control Center failed each poll.
+function fakeAppServer(replies, { deferred = false } = {}) {
+  const stdout = new PassThrough();
+  const stdin = new PassThrough();
+  const child = new EventEmitter();
+  child.stdout = stdout;
+  child.stdin = stdin;
+  // A real ChildProcess emits `exit` when the process ends and `close` only
+  // once its stdio has drained, which is the order the probe depends on.
+  const end = (code, { exited = false } = {}) => {
+    if (!exited) child.emit("exit", code);
+    stdout.once("close", () => child.emit("close", code, null));
+    stdout.end();
+  };
+  child.kill = () => end(0);
+  stdin.on("data", (chunk) => {
+    if (deferred) setImmediate(() => answer(chunk));
+    else answer(chunk);
+  });
+  const answer = (chunk) => {
+    for (const line of String(chunk).split("\n").filter(Boolean)) {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const reply = replies(message);
+      if (!reply) continue;
+      const { exitAfter, exitBeforeWrite, lines, ...payload } = reply;
+      // `exitBeforeWrite` reports the exit while replies are still unwritten,
+      // the way Node can surface `exit` before the stdout pipe is read.
+      if (exitBeforeWrite) child.emit("exit", 1);
+      const outbound = lines ?? (Object.keys(payload).length > 0 ? [payload] : []);
+      for (const item of outbound) stdout.write(`${JSON.stringify(item)}\n`);
+      if (exitAfter || exitBeforeWrite) end(1, { exited: Boolean(exitBeforeWrite) });
+    }
+  };
+  return child;
+}
+
+test("64 slow account probes stay within one capped concurrent usage budget", async () => {
+  const accounts = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+    `acct_${String(index).padStart(8, "0")}`,
+    {
+      id: `acct_${String(index).padStart(8, "0")}`,
+      subscription: { usable: true },
+    },
+  ]));
+  const pool = { accounts };
+  let active = 0;
+  let maximumActive = 0;
+  let calls = 0;
+  const startedAt = Date.now();
+  await attachBoundedChatGPTAccountUsage(pool, {
+    accountHome: (id) => `/isolated/${id}`,
+    timeoutMs: 25,
+    readUsage: async ({ timeoutMs }) => {
+      calls += 1;
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setTimeout(resolve, timeoutMs));
+      active -= 1;
+      throw new Error("slow optional probe");
+    },
+  });
+  assert.equal(calls, ACCOUNT_POOL_USAGE_PROBE_LIMIT);
+  assert.equal(maximumActive, ACCOUNT_POOL_USAGE_PROBE_LIMIT);
+  assert.ok(Date.now() - startedAt < 500, "optional usage probes exceeded their single bounded batch");
+  assert.equal(Object.values(accounts).some((account) => account.subscription.usage), false);
+});
+
+test("the selected account is included before the optional usage probe cap", async () => {
+  const selectedId = "acct_00000063";
+  const accounts = Object.fromEntries(Array.from({ length: 64 }, (_, index) => {
+    const id = `acct_${String(index).padStart(8, "0")}`;
+    return [id, { id, subscription: { usable: true } }];
+  }));
+  const calls = [];
+  await attachBoundedChatGPTAccountUsage({
+    policy: { selectedAccountId: selectedId },
+    accounts,
+  }, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async ({ codexHome }) => {
+      calls.push(path.basename(codexHome));
+      return {};
+    },
+  });
+  assert.equal(calls.length, ACCOUNT_POOL_USAGE_PROBE_LIMIT);
+  assert.equal(calls[0], selectedId);
+});
+
+test("weekly and monthly account usage windows are classified disjointly", async () => {
+  const accounts = {
+    acct_weekly_0001: { id: "acct_weekly_0001", subscription: { usable: true } },
+    acct_monthly_001: { id: "acct_monthly_001", subscription: { usable: true } },
+  };
+  await attachBoundedChatGPTAccountUsage({ accounts }, {
+    accountHome: (id) => `/isolated/${id}`,
+    readUsage: async ({ codexHome }) => path.basename(codexHome) === "acct_weekly_0001"
+      ? { primary: { windowDurationMins: 7 * 24 * 60, remainingPercent: 70 } }
+      : { primary: { windowDurationMins: 30 * 24 * 60, remainingPercent: 30 } },
+  });
+  assert.equal(accounts.acct_weekly_0001.subscription.usage.period, "weekly");
+  assert.equal(accounts.acct_monthly_001.subscription.usage.period, "monthly");
+});
 
 test("normalizes Codex limits and daily usage without account credentials", () => {
   const value = normalizeCodexAccountUsage(
@@ -99,6 +215,7 @@ test("the usage panel reaches an npm-installed Codex through cmd.exe", () => {
   let invocation;
   readCodexAccountUsage({
     binary: "C:\\Users\\ann\\AppData\\Roaming\\npm\\codex.cmd",
+    codexHome: "C:\\Users\\ann\\.codex-secondary",
     platform: "win32",
     spawnImpl: (command, args, options) => {
       invocation = { command, args, options };
@@ -116,6 +233,7 @@ test("the usage panel reaches an npm-installed Codex through cmd.exe", () => {
   assert.ok(invocation.args[3].includes("codex.cmd"), invocation.args[3]);
   assert.equal(invocation.options.windowsVerbatimArguments, true);
   assert.equal(invocation.options.windowsHide, true);
+  assert.equal(invocation.options.env.CODEX_HOME, "C:\\Users\\ann\\.codex-secondary");
 });
 
 test("the usage panel names a missing Codex instead of blaming the app-server", async () => {
@@ -124,4 +242,203 @@ test("the usage panel names a missing Codex instead of blaming the app-server", 
   // machine with Codex installed. It only looked green because CI runners have
   // none -- which is the one environment where this assertion cannot fail.
   await assert.rejects(readCodexAccountUsage({ binary: null }), /no Codex binary was found/);
+});
+
+test("a healthy app-server that answers both account reads returns full usage", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      if (message.id === 2) {
+        return { id: 2, result: { rateLimits: { planType: "pro", primary: { usedPercent: 12 } } } };
+      }
+      if (message.id === 3) {
+        return {
+          id: 3,
+          result: {
+            summary: { lifetimeTokens: 99 },
+            dailyUsageBuckets: [{ startDate: "2026-09-11", tokens: 5 }],
+          },
+        };
+      }
+      return undefined;
+    }, { deferred: true }),
+  });
+
+  assert.equal(value.planType, "pro");
+  assert.equal(value.primary.usedPercent, 12);
+  assert.equal(value.summary.lifetimeTokens, 99);
+  assert.deepEqual(value.dailyUsageBuckets, [{ startDate: "2026-09-11", tokens: 5 }]);
+});
+
+test("a refused rateLimits read still returns usage instead of failing the panel", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      if (message.id === 2) {
+        return { id: 2, error: { code: -32000, message: "limits unavailable" } };
+      }
+      if (message.id === 3) {
+        return {
+          id: 3,
+          result: {
+            summary: { lifetimeTokens: 42, peakDailyTokens: 7, currentStreakDays: 1 },
+            dailyUsageBuckets: [{ startDate: "2026-09-01", tokens: 9 }],
+          },
+        };
+      }
+      return undefined;
+    }),
+  });
+
+  assert.equal(value.planType, null);
+  assert.equal(value.primary, null);
+  assert.equal(value.secondary, null);
+  assert.equal(value.summary.lifetimeTokens, 42);
+  assert.deepEqual(value.dailyUsageBuckets, [{ startDate: "2026-09-01", tokens: 9 }]);
+});
+
+test("an app-server exit after one account read still returns that slice", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      if (message.id === 2) {
+        return {
+          id: 2,
+          result: {
+            rateLimits: {
+              planType: "plus",
+              limitId: "codex",
+              primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+            },
+          },
+          exitAfter: true,
+        };
+      }
+      return undefined;
+    }),
+  });
+
+  assert.equal(value.planType, "plus");
+  assert.equal(value.primary.usedPercent, 40);
+  assert.deepEqual(value.dailyUsageBuckets, []);
+  assert.equal(value.summary.lifetimeTokens, null);
+});
+
+test("an app-server exit with no account replies still fails the probe", async () => {
+  await assert.rejects(readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer(() => ({ exitAfter: true })),
+  }), /exited before replying \(1\)/);
+});
+
+test("replies still in the pipe when the app-server exits are not discarded", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      if (message.id !== 3) return undefined;
+      // Both answers were written before the process ended, but `exit` is
+      // observed first. Settling on it rejected with "exited before replying".
+      return {
+        exitBeforeWrite: true,
+        lines: [
+          { id: 2, result: { rateLimits: { planType: "plus", primary: { usedPercent: 25 } } } },
+          { id: 3, result: { dailyUsageBuckets: [{ startDate: "2026-09-10", tokens: 11 }] } },
+        ],
+      };
+    }),
+  });
+
+  assert.equal(value.planType, "plus");
+  assert.equal(value.primary.usedPercent, 25);
+  assert.deepEqual(value.dailyUsageBuckets, [{ startDate: "2026-09-10", tokens: 11 }]);
+});
+
+test("a refused usage read still returns rate limits instead of failing the panel", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 2_000,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      if (message.id === 2) {
+        return {
+          id: 2,
+          result: {
+            rateLimits: {
+              planType: "pro",
+              limitId: "codex",
+              primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+            },
+          },
+        };
+      }
+      if (message.id === 3) {
+        return { id: 3, error: { code: -32000, message: "usage unavailable" } };
+      }
+      return undefined;
+    }),
+  });
+
+  assert.equal(value.planType, "pro");
+  assert.equal(value.primary.usedPercent, 10);
+  assert.deepEqual(value.dailyUsageBuckets, []);
+  assert.equal(value.summary.lifetimeTokens, null);
+});
+
+test("a rateLimits read that never answers still returns the usage that did", async () => {
+  const value = await readCodexAccountUsage({
+    binary: "/fake/codex",
+    platform: "darwin",
+    timeoutMs: 300,
+    spawnImpl: () => fakeAppServer((message) => {
+      if (message.id === 1) return { id: 1, result: {} };
+      // Silence, not a refusal. Observed in the field: account/rateLimits/read
+      // hung past 20 seconds while account/usage/read answered immediately, and
+      // requiring both discarded a full daily ledger -- which every surface then
+      // published as a confident zero.
+      if (message.id === 2) return undefined;
+      if (message.id === 3) {
+        return {
+          id: 3,
+          result: {
+            summary: { lifetimeTokens: 50_316_410_695, peakDailyTokens: 3_138_996_331, currentStreakDays: 2 },
+            dailyUsageBuckets: [{ startDate: "2026-09-06", tokens: 557_115_160 }],
+          },
+        };
+      }
+      return undefined;
+    }),
+  });
+
+  assert.deepEqual(value.dailyUsageBuckets, [{ startDate: "2026-09-06", tokens: 557_115_160 }]);
+  assert.equal(value.summary.lifetimeTokens, 50_316_410_695);
+  // The half that never answered stays absent rather than becoming a zero.
+  assert.equal(value.planType, null);
+  assert.equal(value.primary, null);
+});
+
+test("a window that produced no answer at all is still a failure", async () => {
+  await assert.rejects(
+    readCodexAccountUsage({
+      binary: "/fake/codex",
+      platform: "darwin",
+      timeoutMs: 300,
+      spawnImpl: () => fakeAppServer((message) => (message.id === 1 ? { id: 1, result: {} } : undefined)),
+    }),
+    /timed out/,
+  );
 });

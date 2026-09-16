@@ -436,6 +436,35 @@ final class ThinkingOrbRenderer {
   }
 }
 
+struct ThinkingOrbRedrawCadence {
+  let interval: TimeInterval
+  private(set) var nextDeadline: TimeInterval?
+
+  init(framesPerSecond: Double = 20) {
+    precondition(framesPerSecond > 0)
+    interval = 1.0 / framesPerSecond
+  }
+
+  mutating func reset() {
+    nextDeadline = nil
+  }
+
+  mutating func shouldSchedule(at now: TimeInterval) -> Bool {
+    guard let deadline = nextDeadline else {
+      nextDeadline = now + interval
+      return true
+    }
+    // Display-link timestamps can land a few ulps below an exact deadline.
+    guard now + interval * 1e-9 >= deadline else { return false }
+
+    // Advance from the ideal phase rather than from this callback. Advancing
+    // from `now` quantizes 20 fps to 16–18 fps on common 60/120/144 Hz panels.
+    let missedIntervals = max(0, floor((now - deadline) / interval))
+    nextDeadline = deadline + (missedIntervals + 1) * interval
+    return true
+  }
+}
+
 final class ThinkingOrbNSView: NSView {
   private let renderer: ThinkingOrbRenderer
   private var displayLink: CVDisplayLink?
@@ -443,6 +472,13 @@ final class ThinkingOrbNSView: NSView {
   private var running = false
   private let redrawLock = NSLock()
   private var redrawScheduled = false
+  private var redrawCadence = ThinkingOrbRedrawCadence()
+  /// The orb animates on wall-clock time, so redraw rate only affects smoothness,
+  /// not speed. The display link fires at the panel's refresh rate (120 Hz on
+  /// ProMotion), and each fire repaints an 18 pt status-bar view and commits it
+  /// to WindowServer — measured at over 15% of a core while a model is thinking.
+  /// The cadence limits main-thread redraw and WindowServer commit work. The
+  /// display link still wakes at the panel refresh rate.
   private var mode: ThinkingOrbMode = .shaping
   var reduceMotion = false {
     didSet {
@@ -511,6 +547,9 @@ final class ThinkingOrbNSView: NSView {
     var link: CVDisplayLink?
     CVDisplayLinkCreateWithActiveCGDisplays(&link)
     guard let link else { return }
+    redrawLock.lock()
+    redrawCadence.reset()
+    redrawLock.unlock()
     displayLink = link
     let unmanaged = Unmanaged.passUnretained(self)
     CVDisplayLinkSetOutputCallback(
@@ -531,11 +570,15 @@ final class ThinkingOrbNSView: NSView {
       CVDisplayLinkStop(displayLink)
       self.displayLink = nil
     }
+    redrawLock.lock()
+    redrawCadence.reset()
+    redrawLock.unlock()
   }
 
   private func scheduleRedraw() {
     redrawLock.lock()
-    guard !redrawScheduled else {
+    let now = CACurrentMediaTime()
+    guard !redrawScheduled, redrawCadence.shouldSchedule(at: now) else {
       redrawLock.unlock()
       return
     }

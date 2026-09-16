@@ -258,9 +258,9 @@ export async function downloadLocalModel(
     capabilitiesFor,
     refreshCatalog = true,
     finalizePublication = applyModelOverlayPublication,
-    restartService = async () => {
+    restartService = async (operation) => {
       const { restartRouterServiceIfInstalled } = await import("./router-restart.mjs");
-      return restartRouterServiceIfInstalled();
+      return restartRouterServiceIfInstalled(operation);
     },
     baseUrl = process.env.MODEL_ROUTER_LOCAL_BASE_URL || DEFAULT_LOCAL_VISION_BASE_URL,
     onProgress,
@@ -392,10 +392,10 @@ export async function downloadLocalModel(
         mutate: activate,
         restart,
         warningOnly: true,
-        applyPublication: async ({ restart: shouldRestart }) => {
+        applyPublication: async ({ restart: shouldRestart, signal, deadline }) => {
           if (!shouldRestart) return {};
           try {
-            await restartService();
+            await restartService({ signal, deadline });
             return {};
           } catch (error) {
             return { restartError: error instanceof Error ? error.message : String(error) };

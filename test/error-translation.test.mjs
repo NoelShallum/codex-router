@@ -117,6 +117,24 @@ test("a 429 mentions rate limiting and the retry hint", () => {
   assert.equal(payload.error.type, "rate_limit_error");
 });
 
+test("a zero-second window asks for patience rather than quoting 0s", () => {
+  // `Retry-After: 0` parses to a real 0 rather than to "no window", which is
+  // the distinction the header parser exists to keep. It still must not become
+  // "retry in about 0s": that reads as a rounding bug, and it is the same
+  // advice as no window at all.
+  const payload = translateGatewayError({
+    status: 429,
+    bodyText: "",
+    modelName: "Kimi K3",
+    providerName: "kimi",
+    retryAfterSeconds: 0,
+  });
+  assert.equal(
+    payload.error.message,
+    "kimi is rate-limiting Kimi K3. Wait a bit and retry. (HTTP 429)",
+  );
+});
+
 test("a 429 without retry-after still reads cleanly", () => {
   const payload = translateGatewayError({
     status: 429,
@@ -163,6 +181,41 @@ test("a 401 from an OAuth provider says sign in again, not re-run setup", () => 
   );
   assert.equal(payload.error.type, "authentication_error");
   assert.ok(!payload.error.message.includes("codex-router setup"));
+});
+
+// Captured from a live opencode-free outage: OpenCode Zen answered 401 with
+// its ModelError while serving an anonymous free model. The provider holds no
+// credential, so advising a setup re-run sends the operator looking for
+// something that does not exist.
+test("a 401 from an anonymous provider never advises refreshing credentials", () => {
+  const payload = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({
+      type: "error",
+      error: { type: "ModelError", message: "Model  is not supported" },
+    }),
+    modelName: "Ox Alpha Free",
+    providerName: "opencode",
+    providerKind: "openai-compatible",
+    providerAuthMode: "anonymous",
+  });
+  assert.equal(
+    payload.error.message,
+    "opencode serves Ox Alpha Free anonymously, so there is no stored credential to refresh. opencode rejected this request on its free route; the free catalog and limits change without notice, so retry later or switch models. (HTTP 401: Model  is not supported)",
+  );
+  assert.equal(payload.error.type, "authentication_error");
+  assert.ok(!payload.error.message.includes("codex-router setup"));
+});
+
+test("an anonymous provider without the auth mode keeps the credential wording", () => {
+  const payload = translateGatewayError({
+    status: 401,
+    bodyText: JSON.stringify({ error: { message: "invalid api key" } }),
+    modelName: "DeepSeek V4 Pro",
+    providerName: "deepseek",
+    providerKind: "openai-compatible",
+  });
+  assert.match(payload.error.message, /Re-run codex-router setup/);
 });
 
 // Captured from a live Kimi OAuth 403: an exhausted plan arrives on the same

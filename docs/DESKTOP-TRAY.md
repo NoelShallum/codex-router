@@ -1,31 +1,40 @@
-# Windows and Linux tray app
+# Desktop tray and Control Center
 
-The desktop tray app brings the Model Router activity surface to Windows and
-Linux without changing the native macOS app. It uses the same local control
-plane and health endpoint as the command line, so provider selection, quota
-data, and token history stay consistent across surfaces.
+The desktop app combines the Codex Router tray and full Electron Control Center
+in one visible installation. It uses the same local control plane and health
+endpoint as the command line, so provider selection, quota data, and token
+history stay consistent across surfaces. macOS retains its Swift-native tray
+and embeds the Control Center in `Codex Router.app`; Windows and Linux use the
+Control Center's native Electron tray.
 
 ## Platform behavior
 
-| Platform | Tray panel | Top-center activity pill | Open behavior |
+| Platform | Native tray | Full Control Center | Open behavior |
 | --- | --- | --- | --- |
-| Windows 10/11 | Yes | Yes | Left-click the tray icon or use its menu |
-| Linux on X11 | Yes | Yes | Use **Open Model Router** in the tray menu |
-| Linux on Wayland | Yes | Disabled | Use **Open Model Router** in the tray menu |
+| macOS 13+ | Swift `NSStatusItem` | Embedded Electron | Open `Codex Router.app` or use **Control Center** in the menu-bar panel |
+| Windows 10/11 | Electron `Tray` | Electron window | Left-click the tray icon or use **Open Control Center** |
+| Linux | Electron `Tray` | Electron window | Left-click the tray icon or use **Open Control Center** |
 
-Wayland intentionally uses the tray-only fallback. Compositors control absolute
-window placement, so claiming a stable top-center pill would create inconsistent
-behavior across GNOME, KDE, Sway, and other compositors. The panel explains this
-and disables its activity-pill switch; router monitoring continues normally.
+Closing the full Control Center window never quits a proven tray owner. On
+Windows, and on Linux while a registered StatusNotifier host is available,
+clicking the Electron tray item restores the window in the same process. On
+macOS, reopen `Codex Router.app` or choose **Control Center** from the native
+menu-bar panel. Use the tray menu's **Quit** action to end the complete
+Windows/Linux app; quitting the native macOS host also terminates its embedded
+Control Center.
 
-## What it shows
+Linux tray-only startup verifies the desktop's registered StatusNotifier host.
+If that proof is unavailable or negative, including when the system `gdbus`
+probe is missing, the launch keeps a visible Control Center window instead of
+leaving an invisible background process. Closing that fallback window exits
+the process because there is no proven tray surface from which to reopen it.
 
-- The compact pill shows router state, the active model, today's tokens, and
-  the active provider's weekly percentage left.
-- Hovering the pill expands a seven-day daily token graph. The series is
-  refreshed in the background rather than recalculated on every hover.
-- The panel shows the same daily graph at a larger size. Hover any point for
-  its date and exact token count.
+## What the Control Center shows
+
+- **Dashboard** summarizes router health, the active model and provider,
+  request activity, token traffic, and recently observed models.
+- **Usage** provides 7-, 30-, and 90-day token views, provider and model
+  breakdowns, and the account limits each connected provider reports.
 - Quota cards use one **Weekly limit** label and one reset line. A reported
   five-hour window appears as its own **5-hour limit** card.
 - Provider cards are absent until that provider has a usable OAuth session or
@@ -33,11 +42,9 @@ and disables its activity-pill switch; router monitoring continues normally.
 - **Connections** includes a **Use without OpenAI login** switch for new Codex
   sessions. It requires a connected, enabled external provider and restores the
   prior model-provider setting when switched off.
-- **Models** has three accordions: **Subagent models** controls which
-  registry-proven v2 models remain available as Codex subagent overrides, and
-  **Model picker** is a persisted allowlist for individual router models
-  without changing their provider connection. Models added in curation are
-  selected automatically.
+- **Models** groups equivalent routes by model family. Each provider route has
+  its own picker visibility, certified subagent selection, and reasoning-effort
+  controls; the provider directory can discover and add catalog models.
 - **Local LLMs** installs, enables, and removes Ollama models on this machine.
   Installs poll their detached download worker and show live percentage;
   removals keep a visible operation banner even when the installed row
@@ -51,9 +58,9 @@ and disables its activity-pill switch; router monitoring continues normally.
   control plane serializes install/removal claims and returns an existing
   operation for repeated requests, so a double-click cannot launch duplicate
   Ollama workers.
-  The Windows/Linux panel also shows the full router catalog under **Discover
-  Ollama**, grouped by family with search, fit warnings, cloud-only labels, and
-  a download action for every local tag. New or uncatalogued Ollama tags remain
+  The same Control Center on every platform also exposes the Ollama catalog,
+  grouped by family with search, fit warnings, cloud-only labels, and a
+  download action for every local tag. New or uncatalogued Ollama tags remain
   installable through the tag or model-page URL field.
 - **Usage** shows the active or most recently used model's observed output
   throughput when the upstream reports output tokens. The rate is calculated
@@ -68,15 +75,12 @@ and disables its activity-pill switch; router monitoring continues normally.
   In**, and Update/Fix maintenance actions.
 - **Vision bridge** exposes the shared native/hosted engine and effort
   selectors, local vision downloads, benchmark/use actions, and the same
-  default-on/fail-closed behavior as macOS. Windows follow mode polls the
-  `ChatGPT.exe`/`codex.exe` process list, hides the companion when both quit,
-  and stops/restarts the router only after the same idle grace period.
+  default-on/fail-closed behavior as macOS.
 
-The status mark uses Thinking Orbs **Shaping** while idle, **Thinking** while a
-model is generating, and **Solving** for errors. Starting retains its colored
-status dot, and the Error label remains explicit. A low-contrast edge signal
-appears only while generating. The app honors the system's reduced-motion
-preference.
+The Control Center honors the system's reduced-motion preference. The native
+macOS host retains its optional Island animations and hover details; Windows
+and Linux expose only the normal Control Center window and native Electron tray,
+with no separate activity-pill or hover window.
 
 ## Opening it in a browser instead
 
@@ -100,95 +104,66 @@ The browser panel is read-only by design. Saving an API key is not something to
 expose to any page that learns the capability, so those commands stay in the
 tray and the desktop shells.
 
-## Building without a Rust toolchain
+## Building the unified app
 
-The Tauri companion needs Rust and Cargo. If they are not installed,
-`tray install` builds the Electron shell instead, which needs only the Node the
-router install already required:
+Windows and Linux build `apps/control-center` directly. The compatibility
+entrypoints keep their old names so existing automation continues to work, but
+they no longer build or select the old Tauri or tray-only Electron shells:
 
 ```powershell
-.\codex-router.ps1 companion
+.\scripts\build-electron-companion.ps1
+.\codex-router.ps1 tray install
 ```
 
-It renders `apps/desktop/ui` verbatim through the same command table, so it is
-the same companion in a different host, and it registers the same logon task.
-Select it explicitly with the command above; `companion status`, `start`,
-`stop`, `restart`, and `uninstall` behave as the tray actions do.
+```sh
+./scripts/build-electron-companion.sh
+./bin/model-router-tray
+```
 
-On Linux, `./bin/model-router-tray` makes the same choice and falls back the
-same way.
+Both scripts verify the renderer, package the native Electron executable, and
+refuse success if the final executable is absent. Node.js 22.19 or newer is the
+only additional build runtime; Rust is not required.
 
-One caveat worth knowing: npm 11 refuses install scripts unless they are
-approved, and electron downloads its runtime from one. `npm ci` therefore exits
-0 with the package installed and no runtime, and the app then fails to start
-with nothing pointing at the cause. `scripts/build-electron-companion.ps1`
-fetches the runtime directly and refuses to report success without it, so use
-that script rather than a bare `npm ci`.
+## Downloading a prebuilt app
 
-## Downloading a prebuilt binary
-
-Building needs a Rust toolchain and several minutes of compilation, which is a
-lot to ask of someone who only wants to run the companion. You do not have to:
-
-**From a release (recommended).** Every release attaches the companion for
-Windows and Linux, checksummed in `SHA256SUMS` and covered by the same build
-provenance attestation as the source archives:
+**From a tagged release (unsigned tester builds).** Tagged releases attach the
+Windows and Linux Control Center packages, checksummed in `SHA256SUMS` and
+covered by the same build provenance attestation as the source archives. These
+packages are unsigned frontends, not standalone router installers: install the
+same Codex Router version first, then run the matching desktop package.
 
 | Asset | Platform |
 | --- | --- |
-| `codex-router-tray-<version>-windows-x64.exe` | Windows 10/11 |
-| `codex-router-tray-<version>-linux-x64` | Linux |
+| `model-router-<version>-windows-x64.exe` | Windows 10/11 unsigned tester installer |
+| `model-router-<version>-linux-x64.tar.gz` | Linux archive containing the executable AppImage |
 
-Download it and run it. Nothing else to install.
+Windows SmartScreen may warn about the unsigned installer. On Linux, extract
+the tarball before launching its AppImage; the archive preserves its executable
+permission. Do not copy the AppImage out through a tool that strips file modes.
+
+Tagged releases do not publish an ad-hoc-signed macOS app. An ad-hoc signature
+only proves bundle integrity on the machine that built it; public macOS
+distribution waits for Developer ID signing and notarization.
 
 **From a CI run (for unreleased changes).** Open the **Actions** tab, pick a
-green **CI** run, and download the **codex-router-tray-Windows** artifact (or
-**codex-router-tray-Linux**) from its Artifacts section. Unzip and run
-`codex-router-desktop.exe`.
-
-Windows 10 and 11 already ship the WebView2 runtime the companion needs, so
-there is nothing else to install. To have it start at logon as well, point the
-tray command at the downloaded binary's location, or build in place with
-`./codex-router.ps1 tray`.
+green **CI** run, and download the Control Center artifact for Windows/Linux or
+the unified macOS app artifact. All are unsigned/test-only; the macOS bundle is
+ad-hoc signed, and each package requires a matching router checkout or install.
+CI no longer publishes the legacy Tauri shell or a standalone macOS Electron
+child.
 
 ## Build prerequisites
 
 - Node.js 22.19 or newer
-- Rust stable and Cargo
-- The normal Model Router checkout and its installed npm dependencies
-
-On Debian or Ubuntu, install Tauri's native libraries first:
-
-```sh
-sudo apt-get update
-sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-```
+- The normal Codex Router checkout and its installed npm dependencies
 
 The build scripts only report missing prerequisites; they do not install a
 system runtime or package manager.
 
 ## Build and run
 
-Linux:
-
-```sh
-./scripts/build-desktop-tray.sh
-./bin/model-router-tray
-```
-
-The first command creates the native packages supported by the current Linux
-host. The second builds a release binary when needed and starts it. For a faster
-unbundled build, use `./scripts/build-desktop-tray.sh --binary-only`.
-
-Windows PowerShell:
-
-```powershell
-.\scripts\build-desktop-tray.ps1
-Start-Process .\apps\desktop\src-tauri\target\release\codex-router-desktop.exe
-```
-
-Pass `-BinaryOnly` for an unbundled executable. Installer artifacts are written
-under `apps\desktop\src-tauri\target\release\bundle` by a full build.
+The build commands above create `linux-unpacked/codex-router-control-center` or
+`win-unpacked/Codex Router.exe` under `apps/control-center/release`.
 
 ## Starting at logon
 
@@ -208,6 +183,31 @@ not a clean exit, so the tray returns at the next logon rather than reappearing
 immediately. Linux has no supervisor — launch it with `./bin/model-router-tray`
 — and the tray commands say so instead of reporting a silent success.
 
+On Windows the same `Codex Router Tray` task is also managed directly through
+the checkout wrapper, which owns the Control Center build and registration.
+`companion` remains a deprecated alias of `tray` for one migration release:
+
+```powershell
+.\codex-router.ps1 tray status          # JSON: installed, loaded, supported, state
+.\codex-router.ps1 tray start          # ask Task Scheduler to run it now
+.\codex-router.ps1 tray stop
+.\codex-router.ps1 tray restart
+.\codex-router.ps1 tray uninstall      # remove the scheduled task
+.\codex-router.ps1 tray rebuild        # stop, rebuild, then re-register
+.\codex-router.ps1 tray repair         # fix task permissions, then reinstall the companion
+```
+
+`tray repair` fixes a `Codex Router Tray` task the current user cannot
+otherwise modify — the catch-22 a router reinstall fails with when an earlier
+elevated install left the task readable but not writable. It validates the
+task's principal, its logon type, and that its action is a genuine companion
+(recognized by shape, so repairing from a dev checkout whose task points at
+`%LOCALAPPDATA%\codex-router` is allowed), then performs a UAC-elevated DACL
+repair and finishes by rebuilding or reinstalling the companion. If you only
+meant to fix permissions, expect that reinstall to follow. When Task Scheduler
+cannot answer at all, `tray status` prints a JSON document with `"state":
+"unknown"` rather than failing the command.
+
 Windows 11 hides new tray icons in the `^` overflow next to the clock. Drag the
 icon onto the taskbar to pin it; an unpinned icon is the most common reason the
 companion looks like it never started.
@@ -222,31 +222,11 @@ the checkout or router service is unavailable.
 
 The webview cannot start arbitrary shell commands. Its backend exposes only a
 small, validated command set for known provider IDs. API keys cross the local
-Tauri IPC boundary once and are written to the router control process through
+Electron preload/IPC boundary once and are written to the router control process through
 standard input; they are never placed in process arguments, logs, settings, or
 the UI after submission. If applying a provider change fails, the previous
 provider selection is restored.
 
-Windows and Linux builds run in CI on every change. UI data shaping and chart
-behavior have platform-neutral Node tests, while the Rust tests cover provider
-validation, health parsing, and multi-monitor placement math.
-
-## Troubleshooting: WebKitGTK crashes on NVIDIA
-
-WebKitGTK's DMA-BUF renderer shares GPU buffers with the Wayland compositor
-(Hyprland, GNOME, KDE, ...) through the graphics driver. With the proprietary
-NVIDIA kernel driver that handoff crashed (SIGSEGV in `libnvidia-eglcore.so`
-on the `SkiaGPUWorker` thread) as soon as the tray panel was shown, which also
-took down the tray app.
-
-The companion now detects the proprietary NVIDIA kernel driver via
-`/proc/driver/nvidia/version` and disables only the DMA-BUF renderer
-(`WEBKIT_DISABLE_DMABUF_RENDERER=1`) before the webviews are created, falling
-back to `wl_shm`. Accelerated compositing stays enabled, and non-NVIDIA
-systems keep the DMA-BUF fast path. Set `CODEX_ROUTER_WEBKIT_DMABUF=1` to
-force the renderer back on (for example after a driver update fixes the
-crash) or `CODEX_ROUTER_WEBKIT_DMABUF=0` to force it off on any system.
-
-To reproduce the exact window-show path in a smoke test, start the binary with
-`CODEX_ROUTER_SHOW_PANEL=1`; the panel opens on startup instead of waiting for
-a tray interaction.
+Windows, Linux, and the combined macOS bundle build in CI on every change. UI
+data shaping, IPC validation, packaging, and lifecycle behavior have focused
+tests in addition to the repository-wide checks.

@@ -1,15 +1,45 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { pickerCommandArgs } from "../src/control-args.mjs";
+import { writePrivateJson } from "../src/file-security.mjs";
 import { userModelEntry } from "../src/user-models.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function writeSignedOutCodexStub(directory) {
+  const windows = process.platform === "win32";
+  const target = path.join(directory, windows ? "codex-signed-out.cmd" : "codex-signed-out");
+  const catalog = JSON.stringify({
+    models: [{
+      slug: "gpt-5.6-sol",
+      display_name: "GPT-5.6-Sol",
+      visibility: "list",
+      priority: 10,
+    }],
+  });
+  writeFileSync(
+    target,
+    windows
+      ? `@echo off\r\n@if "%~1"=="debug" (\r\n  @echo ${catalog}\r\n  @exit /b 0\r\n)\r\n@echo Not logged in 1>&2\r\n@exit /b 1\r\n`
+      : `#!/bin/sh\nif [ "$1" = "debug" ]; then\n  printf '%s\\n' '${catalog}'\n  exit 0\nfi\necho 'Not logged in' >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  if (!windows) chmodSync(target, 0o755);
+  return target;
+}
 
 function probe(target, providers, usageEvents = [], options = {}) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-probe-"));
@@ -65,19 +95,25 @@ function probe(target, providers, usageEvents = [], options = {}) {
     );
   }
   if (options.loginFree) {
+    const loginFreeProvider = options.loginFreeProvider || "custom";
+    const ownershipId = "00000000000000000000000000000000";
     writeFileSync(
       path.join(stateDir, "config.toml"),
-      `model = ${JSON.stringify(options.selectedModel || "deepseek/deepseek-v4-pro")}\nmodel_provider = "codex-router"\n`,
+      `model = ${JSON.stringify(options.selectedModel || "deepseek/deepseek-v4-pro")}\nmodel_provider = ${JSON.stringify(loginFreeProvider)}\n\n# codex-router-signed-provider-tree-slot ${ownershipId} 0\n# BEGIN codex-router-signed-provider-managed\n[model_providers.${loginFreeProvider}]\nname = "Codex Router (external models)"\nbase_url = "http://127.0.0.1:4202/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_standalone_web_search = true\nsupports_websockets = false\n[model_providers.${loginFreeProvider}.auth]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(root, "src", "caller-key-auth-command.mjs"))}, ${JSON.stringify(path.join(stateDir, "caller-secret"))}]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n# END codex-router-signed-provider-managed\n`,
       { mode: 0o600 },
     );
-    writeFileSync(
+    writePrivateJson(
       path.join(stateDir, "codex-provider-mode.json"),
-      `${JSON.stringify({
-        version: 1,
-        previousPresent: false,
+      {
+        version: 3,
+        mode: "provider-table",
+        managedProvider: loginFreeProvider,
+        managedBaseUrl: "http://127.0.0.1:4202/v1",
+        ownershipId,
+        previousProviderSections: [],
         previousModelPresent: false,
-      })}\n`,
-      { mode: 0o600 },
+        loginFree: true,
+      },
     );
   }
   try {
@@ -103,26 +139,6 @@ test("codex probe reports enabled models", () => {
   assert.equal(slice.target, "codex");
   const deepseek = slice.models.filter((m) => m.provider === "deepseek");
   assert.ok(deepseek.length > 0 && deepseek.every((m) => m.enabled));
-});
-
-test("desktop snapshots expose Ox Alpha Free instead of its opaque OpenCode id", () => {
-  const stored = {
-    ...userModelEntry({
-      providerId: "opencode-free",
-      upstreamId: "x-preview-f-free",
-      priority: 100,
-      metadata: { isFree: true },
-    }),
-    // Simulate curation written by an older router. Registry normalization
-    // updates presentation without changing the routing identity.
-    displayName: "x-preview-f-free (curated)",
-  };
-  const slice = probe("codex", ["opencode-free"], [], { userModels: [stored] });
-  const model = slice.models.find((entry) => entry.slug === "opencode-free/x-preview-f-free");
-  assert.equal(model.displayName, "Ox Alpha Free");
-  assert.equal(model.slug, "opencode-free/x-preview-f-free");
-  assert.equal(model.provider, "opencode-free");
-  assert.equal(model.enabled, true);
 });
 
 test("codex probe folds protocol variants into one provider family", () => {
@@ -196,6 +212,7 @@ test("codex probe includes native GPT models and the configured default", () => 
       enabled: true,
       native: true,
       multiAgentVersion: "v1",
+      subagentCertification: "unknown",
       visible: true,
     },
   );
@@ -212,6 +229,22 @@ test("codex probe includes native GPT models and the configured default", () => 
   assert.equal(slice.modelSettings.localModels.lmstudio.provider, "lmstudio");
   assert.equal(typeof slice.modelSettings.localModels.lmstudio.reachable, "boolean");
   assert.ok(Array.isArray(slice.modelSettings.localModels.lmstudio.models));
+});
+
+test("codex probe preserves an explicit repository v1 verdict", () => {
+  const slice = probe("codex", [], [], {
+    nativeModels: [
+      {
+        slug: "gpt-reviewed-v1",
+        display_name: "GPT Reviewed V1",
+        visibility: "list",
+        multi_agent_version: "v1",
+      },
+    ],
+  });
+  const model = slice.models.find((entry) => entry.slug === "gpt-reviewed-v1");
+  assert.equal(model.multiAgentVersion, "v1");
+  assert.equal(model.subagentCertification, "v1");
 });
 
 // The row is the whole feature: an entry the operator cannot find is an entry
@@ -248,7 +281,7 @@ test("a login-free probe draws no extended-context variant", () => {
   assert.ok(slice.models.some((model) => model.slug === "gpt-5.6-sol"));
 });
 
-test("codex probe reports the effective v2 state of selected native GPT models", () => {
+test("codex probe does not turn a selected native v1 model into v2", () => {
   const slice = probe("codex", [], [], {
     nativeModels: [
       {
@@ -273,7 +306,7 @@ test("codex probe reports the effective v2 state of selected native GPT models",
 
   assert.equal(
     slice.models.find((model) => model.slug === "gpt-5.6-terra")?.multiAgentVersion,
-    "v2",
+    "v1",
   );
   assert.equal(
     slice.models.find((model) => model.slug === "gpt-5.6-luna")?.multiAgentVersion,
@@ -293,6 +326,9 @@ test("control exposes subagent and picker settings without credentials", () => {
   try {
     const env = {
       ...process.env,
+      // Without this the command republishes into the operator's real
+      // ~/.codex/agents and clears every routed subagent definition there.
+      CODEX_HOME: stateDir,
       MODEL_ROUTER_TARGET: "codex",
       MODEL_ROUTER_STATE_DIR: stateDir,
     };
@@ -320,10 +356,164 @@ test("control exposes subagent and picker settings without credentials", () => {
   }
 });
 
+test("control refuses to enable a repository-certified v1 model as a v2 subagent", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-subagent-v1-"));
+  const env = {
+    ...process.env,
+    // Without this the command republishes into the operator's real
+    // ~/.codex/agents and clears every routed subagent definition there.
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  };
+  writeFileSync(
+    path.join(stateDir, "merged-models.json"),
+    `${JSON.stringify({ models: [{ slug: "gpt-reviewed-v1", multi_agent_version: "v1" }] })}\n`,
+    { mode: 0o600 },
+  );
+  try {
+    assert.throws(
+      () => execFileSync(
+        process.execPath,
+        [path.join(root, "src", "control.mjs"), "subagents", "set", "gpt-reviewed-v1", "on"],
+        { cwd: root, encoding: "utf8", env, stdio: "pipe" },
+      ),
+      /repository-certified v1/,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a disabled repository-certified native v2 model can be turned back on", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-subagent-native-v2-"));
+  const slug = "gpt-5.6-luna";
+  const env = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  };
+  writeFileSync(
+    path.join(stateDir, "native-models.json"),
+    `${JSON.stringify({ models: [{
+      slug,
+      display_name: "GPT-5.6-Luna",
+      visibility: "list",
+      multi_agent_version: "v1",
+    }] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "merged-models.json"),
+    `${JSON.stringify({ models: [{ slug, multi_agent_version: "v1" }] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "multi-agent-settings.json"),
+    `${JSON.stringify({ version: 2, mode: "selected", enabled: [], disabled: [slug] })}\n`,
+    { mode: 0o600 },
+  );
+  try {
+    const snapshot = probe("codex", [], [], {
+      nativeModels: [{
+        slug,
+        display_name: "GPT-5.6-Luna",
+        visibility: "list",
+        multi_agent_version: "v1",
+      }],
+      subagentSettings: { mode: "selected", enabled: [], disabled: [slug] },
+    });
+    const row = snapshot.models.find((model) => model.slug === slug);
+    assert.equal(row.multiAgentVersion, "v1");
+    assert.equal(row.subagentCertification, "v2");
+
+    const state = JSON.parse(execFileSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "subagents", "set", slug, "on"],
+      { cwd: root, encoding: "utf8", env, stdio: "pipe" },
+    ));
+    assert.deepEqual(state.disabled, []);
+    assert.deepEqual(state.enabled, [slug]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("an unknown native route is not mistaken for the merged catalog's conservative v1", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-subagent-native-unknown-"));
+  const slug = "gpt-native-candidate";
+  const env = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  };
+  writeFileSync(
+    path.join(stateDir, "native-models.json"),
+    `${JSON.stringify({ models: [{ slug, visibility: "list" }] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "merged-models.json"),
+    `${JSON.stringify({ models: [{ slug, multi_agent_version: "v1" }] })}\n`,
+    { mode: 0o600 },
+  );
+  try {
+    const state = JSON.parse(execFileSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "subagents", "set", slug, "on"],
+      { cwd: root, encoding: "utf8", env, stdio: "pipe" },
+    ));
+    assert.deepEqual(state.enabled, [slug]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("control can test an uncertified route despite its conservative merged-catalog v1", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-subagent-unknown-"));
+  const slug = "deepseek/deepseek-v4-flash";
+  const env = {
+    ...process.env,
+    // Without this the command republishes into the operator's real
+    // ~/.codex/agents and clears every routed subagent definition there.
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  };
+  writeFileSync(
+    path.join(stateDir, "merged-models.json"),
+    `${JSON.stringify({ models: [{ slug, multi_agent_version: "v1" }] })}\n`,
+    { mode: 0o600 },
+  );
+  // A settled candidate prevents this command-level regression test from
+  // launching the detached, quota-spending probe worker.
+  writeFileSync(
+    path.join(stateDir, "multi-agent-proofs.json"),
+    `${JSON.stringify({ version: 1, proofs: { [slug]: { status: "candidate" } } })}\n`,
+    { mode: 0o600 },
+  );
+  try {
+    const state = JSON.parse(execFileSync(
+      process.execPath,
+      [path.join(root, "src", "control.mjs"), "subagents", "set", slug, "on"],
+      { cwd: root, encoding: "utf8", env, stdio: "pipe" },
+    ));
+    assert.equal(state.mode, "selected");
+    assert.deepEqual(state.enabled, [slug]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("control toggles tool-result aging without a router restart", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-tool-result-aging-"));
   const env = {
     ...process.env,
+    // Without this the command republishes into the operator's real
+    // ~/.codex/agents and clears every routed subagent definition there.
+    CODEX_HOME: stateDir,
     MODEL_ROUTER_TARGET: "codex",
     MODEL_ROUTER_STATE_DIR: stateDir,
   };
@@ -419,8 +609,34 @@ test("set-apply keeps provider mutation, publication, and rollback in one transa
   assert.match(source, /args\[0\] === "set-apply"[\s\S]{0,260}runSetApply\(args\[1\], args\[2\]\)/);
 });
 
+test("OpenClaw client setup uses the shared transactional enable path", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const setup = source.match(
+    /async function handleClientSetup[\s\S]*?\r?\n}\r?\n\r?\nasync function handleClientExport/,
+  )?.[0];
+  assert.ok(setup, "client setup helper should be readable");
+  assert.match(setup, /"openclaw"/);
+  assert.match(setup, /currentCheckoutInstaller\(process\.platform, target, \{ posixScript: "enable" \}\)/);
+  assert.doesNotMatch(setup, /setupOpenClaw/);
+});
+
+test("Cursor client disconnect uses the Node uninstall path on every platform", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const start = source.indexOf("async function handleClientDisconnect");
+  const end = source.indexOf("async function handleClientUpdate", start);
+  assert.ok(start >= 0 && end > start, "client disconnect helper should be readable");
+  const disconnect = source.slice(start, end);
+  assert.match(disconnect, /cursor-config-manager\.mjs", "uninstall"/);
+  assert.match(disconnect, /config-manager\.mjs", "disable"/);
+  assert.match(disconnect, /installedTargets\(\)/);
+  assert.match(disconnect, /service\.mjs/);
+  assert.doesNotMatch(disconnect, /currentCheckoutInstaller\(/);
+  assert.doesNotMatch(disconnect, /posixScript:\s*"disable"/);
+});
+
 test("login-free control selects a ready external model and restores Codex defaults", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-login-free-"));
+  const signedOutCodex = writeSignedOutCodexStub(stateDir);
   writeFileSync(path.join(stateDir, "config.toml"), `model = "gpt-5.6-sol"\n`, {
     mode: 0o600,
   });
@@ -462,7 +678,7 @@ test("login-free control selects a ready external model and restores Codex defau
           env: {
             ...process.env,
             CODEX_HOME: stateDir,
-            CODEX_BIN: process.execPath,
+            CODEX_BIN: signedOutCodex,
             MODEL_ROUTER_TARGET: "codex",
             MODEL_ROUTER_STATE_DIR: stateDir,
           },
@@ -475,6 +691,15 @@ test("login-free control selects a ready external model and restores Codex defau
     assert.equal(enabled.login_free, true);
     assert.equal(enabled.model, "gpt-5.6-sol");
     assert.equal(enabled.model_provider, "codex-router");
+    const providerModePath = path.join(stateDir, "codex-provider-mode.json");
+    const providerMode = JSON.parse(readFileSync(providerModePath, "utf8"));
+    assert.equal(providerMode.version, 1);
+    assert.equal(providerMode.previousPresent, false);
+    assert.equal(providerMode.previousModelPresent, true);
+    assert.equal(providerMode.previousModel, "gpt-5.6-sol");
+    const loginFreeConfig = readFileSync(path.join(stateDir, "config.toml"), "utf8");
+    assert.match(loginFreeConfig, /^model_provider = "codex-router"$/m);
+    assert.match(loginFreeConfig, /\[model_providers\.codex-router\]/);
     const catalog = JSON.parse(readFileSync(path.join(stateDir, "merged-models.json"), "utf8"));
     const aliasEntry = catalog.models.find((model) => model.slug === "gpt-5.6-sol");
     assert.match(aliasEntry.display_name, /DeepSeek/);
@@ -485,7 +710,9 @@ test("login-free control selects a ready external model and restores Codex defau
         .map((model) => [model.slug, model.visibility]),
       [
         ["deepseek/deepseek-v4-flash", "hide"],
+        ["deepseek/deepseek-v4-flash-vision-exp", "list"],
         ["deepseek/deepseek-v4-pro", "list"],
+        ["deepseek/deepseek-v4.1-flash", "list"],
       ],
     );
     const aliases = JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8"));
@@ -493,6 +720,53 @@ test("login-free control selects a ready external model and restores Codex defau
       version: 1,
       aliases: { "gpt-5.6-sol": "deepseek/deepseek-v4-flash" },
     });
+
+    // A later catalog rebuild has no mode-toggle override. It must recover
+    // login-free mode remains discoverable from the ownership-validated
+    // fallback state even though the Codex stub reports no ChatGPT session.
+    execFileSync(process.execPath, [path.join(root, "src", "catalog.mjs")], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: stateDir,
+        CODEX_BIN: signedOutCodex,
+        MODEL_ROUTER_TARGET: "codex",
+        MODEL_ROUTER_STATE_DIR: stateDir,
+      },
+    });
+    assert.deepEqual(
+      JSON.parse(readFileSync(path.join(stateDir, "native-aliases.json"), "utf8")),
+      aliases,
+    );
+
+    execFileSync(process.execPath, [path.join(root, "src", "refresh-catalog.mjs")], {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: stateDir,
+        CODEX_BIN: signedOutCodex,
+        MODEL_ROUTER_TARGET: "codex",
+        MODEL_ROUTER_STATE_DIR: stateDir,
+      },
+    });
+    const afterRefresh = JSON.parse(
+      execFileSync(process.execPath, [path.join(root, "src", "config-manager.mjs"), "status"], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_HOME: stateDir,
+          CODEX_BIN: signedOutCodex,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+        },
+      }),
+    );
+    assert.equal(afterRefresh.login_free, true);
+    assert.equal(afterRefresh.model_provider, "codex-router");
+    assert.equal(afterRefresh.model, "gpt-5.6-sol");
 
     const disabled = runMode("off");
     assert.equal(disabled.login_free, false);
@@ -626,6 +900,7 @@ test("model-set switches the login-free model and rejects unavailable models", (
     runControl("auth-mode", "on");
     const switched = runControl("model-set", "deepseek/deepseek-v4-flash");
     assert.equal(switched.model, "gpt-5.6-sol");
+    // The built-in OpenAI identity takes the cross-version-safe provider switch.
     assert.equal(switched.model_provider, "codex-router");
     assert.equal(switched.login_free, true);
 
@@ -770,6 +1045,16 @@ test("aggregate overview covers every target", () => {
 test("aggregate overview exposes the router-owned catalog separately from client probes", () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-catalog-"));
   try {
+    const userModel = userModelEntry({
+      providerId: "deepseek",
+      upstreamId: "operator-curated-preview",
+      priority: 1,
+    });
+    writeFileSync(
+      path.join(stateDir, "user-models.json"),
+      `${JSON.stringify({ version: 1, models: [userModel] })}\n`,
+      { mode: 0o600 },
+    );
     const output = execFileSync(process.execPath, [path.join(root, "src", "control.mjs"), "--json"], {
       cwd: root,
       encoding: "utf8",
@@ -782,9 +1067,40 @@ test("aggregate overview exposes the router-owned catalog separately from client
     const parsed = JSON.parse(output);
     assert.equal(parsed.catalog.source, "codex-router");
     assert.ok(Array.isArray(parsed.catalog.models));
+    assert.ok(Array.isArray(parsed.catalog.knownModels));
     assert.ok(Array.isArray(parsed.catalog.enabledProviders));
     assert.ok(Array.isArray(parsed.catalog.picker.hidden));
     assert.ok(Array.isArray(parsed.catalog.picker.visible));
+    assert.equal(
+      parsed.catalog.knownModels.some((model) => model.slug === userModel.slug),
+      false,
+      "operator-curated models must not be described as checked-in research routes",
+    );
+    const oxAlphaRoutes = parsed.catalog.knownModels
+      .filter((model) => model.displayName.startsWith("Ox Alpha") || model.slug.endsWith("/ox-alpha"))
+      .map((model) => [model.slug, model.available])
+      .sort(([left], [right]) => left.localeCompare(right));
+    assert.deepEqual(oxAlphaRoutes, []);
+    assert.deepEqual(
+      parsed.catalog.models
+        .filter((model) => model.slug.endsWith("/ox-alpha"))
+        .map((model) => model.slug),
+      [],
+      "withdrawn research routes must not enter the routable catalog",
+    );
+    for (const slug of [
+      "commandcode/ox-alpha",
+      "opencode-free/ox-alpha",
+      "openrouter/ox-alpha",
+      "nousresearch/ox-alpha",
+      "venice/ox-alpha",
+    ]) {
+      assert.equal(parsed.catalog.knownModels.some((model) => model.slug === slug), false, slug);
+    }
+    const flash = parsed.catalog.knownModels.find(
+      (model) => model.slug === "opencode-go/glm-5.3-flash",
+    );
+    assert.equal(flash.available, false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -820,11 +1136,26 @@ test("the tray usage advertises rebuild alongside the supervised actions", () =>
           },
         ),
       (error) => {
-        assert.match(String(error.stderr), /Usage: control tray enable\|disable\|status\|restart\|rebuild/);
+        assert.match(String(error.stderr), /Usage: control tray enable\|disable\|status\|restart\|refresh\|rebuild/);
         return true;
       },
     );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("Windows tray enable uses the durable package and task transaction", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const tray = source.slice(source.indexOf("function handleTray("), source.indexOf("async function handleNativeRedirect("));
+  assert.match(tray, /value === "enable" && process\.platform === "win32"/);
+  assert.match(
+    tray,
+    /powershell\.exe[\s\S]*codex-router\.ps1[\s\S]*"tray"[\s\S]*"install"[\s\S]*"--preserve-window"/,
+  );
+  assert.ok(
+    tray.indexOf('path.join(REPO_ROOT, "codex-router.ps1")')
+      < tray.indexOf('path.join(REPO_ROOT, "src", "tray-service.mjs"), subcommand'),
+    "Windows enable must choose the transaction before the raw supervisor fallback",
+  );
 });

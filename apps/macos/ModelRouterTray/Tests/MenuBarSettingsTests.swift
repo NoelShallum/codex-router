@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 
@@ -5,8 +6,142 @@ import Testing
 
 @Suite("Menu bar settings", .serialized)
 struct MenuBarSettingsTests {
-  @Test("a missing key keeps the shipped activity-dot look")
-  func missingKeysKeepShippedLook() {
+  @Test("the borderless tray panel accepts text-field focus")
+  @MainActor
+  func trayPanelCanBecomeKeyWithoutBecomingMain() {
+    let panel = TrayInputPanel(
+      contentRect: .zero,
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    #expect(panel.canBecomeKey)
+    #expect(!panel.canBecomeMain)
+    #expect(panel.styleMask.contains(.nonactivatingPanel))
+  }
+
+  @Test("the visible tray keeps enabled controls in their colored key state")
+  func trayControlsUseKeyAppearance() {
+    #expect(TrayControlAppearance.activeState == .key)
+  }
+
+  @Test("visible unverified subagent models remain selectable")
+  func subagentTogglePolicyKeepsTheVerificationPathReachable() {
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "unknown"))
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "v2"))
+    #expect(TraySubagentTogglePolicy.isDisabled(certification: "v1"))
+  }
+
+  @Test("subagent switches follow the effective router selection")
+  func subagentSelectionDoesNotSnapBackToRegistryProvenance() {
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "all",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "proven",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "v2",
+      mode: "proven",
+      explicitlyEnabled: false,
+      explicitlyDisabled: false
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "v2",
+      mode: "all",
+      explicitlyEnabled: true,
+      explicitlyDisabled: true
+    ))
+    #expect(!TraySubagentSelectionPolicy.isOn(
+      certification: "v1",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+  }
+
+  @Test("picker-hidden models remain independently selectable as subagents")
+  func pickerVisibilityDoesNotDisableSubagents() {
+    #expect(!TraySubagentTogglePolicy.isDisabled(certification: "unknown"))
+    #expect(TraySubagentSelectionPolicy.isOn(
+      certification: "unknown",
+      mode: "selected",
+      explicitlyEnabled: true,
+      explicitlyDisabled: false
+    ))
+  }
+
+  @Test("global click dismissal preserves tray controls")
+  func globalClickDismissalIgnoresPanelAndStatusItem() {
+    let panel = NSRect(x: 100, y: 100, width: 320, height: 500)
+    let statusItem = NSRect(x: 390, y: 610, width: 30, height: 20)
+
+    #expect(!TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 400, y: 350),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+    #expect(!TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 400, y: 615),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+    #expect(TrayPanelClickPolicy.shouldClose(
+      screenPoint: NSPoint(x: 50, y: 50),
+      panelFrame: panel,
+      statusItemFrame: statusItem
+    ))
+  }
+
+  @Test("activity dot keeps an explicit state color")
+  func activityDotUsesNonTemplateImage() {
+    let image = MenuBarActivityDotImage.make(state: .generating, size: 6)
+    let color = RouterActivityState.generating.menuBarColor.usingColorSpace(.genericRGB)
+    #expect(image.isTemplate == false)
+    #expect(image.size == NSSize(width: 6, height: 6))
+    #expect(abs((color?.redComponent ?? 0) - 0.68) < 0.001)
+    #expect(abs((color?.greenComponent ?? 0) - 0.40) < 0.001)
+    #expect(abs((color?.blueComponent ?? 0) - 0.03) < 0.001)
+  }
+
+  @Test("the bundled router SVG loads as a menu bar template image")
+  func bundledRouterMarkLoadsAsTemplate() {
+    guard let image = MenuBarRouterMarkImage.make() else {
+      Issue.record("RouterMark.svg could not be loaded from the SwiftPM resource bundle")
+      return
+    }
+    #expect(image.isTemplate)
+    #expect(image.size == NSSize(width: 32, height: 32))
+
+    guard let statusImage = MenuBarRouterMarkImage.make(size: 15) else {
+      Issue.record("RouterMark.svg could not be sized for the menu bar")
+      return
+    }
+    #expect(statusImage.isTemplate)
+    #expect(statusImage.size == NSSize(width: 15, height: 15))
+
+    guard let activeImage = MenuBarRouterMarkImage.make(resourceName: "RouterMarkActive", size: 15) else {
+      Issue.record("RouterMarkActive.svg could not be loaded from the SwiftPM resource bundle")
+      return
+    }
+    #expect(activeImage.isTemplate)
+    #expect(activeImage.size == NSSize(width: 15, height: 15))
+  }
+
+  @Test("a missing key uses the bundled router mark")
+  func missingKeysUseRouterMark() {
     let settings = RouterStore.resolveMenuBarSettings(
       storedDisplayMode: nil,
       storedShowModelName: nil,
@@ -14,14 +149,14 @@ struct MenuBarSettingsTests {
       storedPresetIcon: nil,
       storedCustomIconPath: nil
     )
-    #expect(settings.displayMode == .standard)
+    #expect(settings.displayMode == .iconOnly)
     #expect(settings.showModelName == true)
-    #expect(settings.iconStyle == .indicator)
+    #expect(settings.iconStyle == .router)
     #expect(settings.presetIcon == "cpu")
     #expect(settings.customIconPath == nil)
   }
 
-  @Test("an explicit choice always wins", arguments: ["provider", "indicator", "preset", "custom"])
+  @Test("an explicit choice always wins", arguments: ["router", "provider", "indicator", "preset", "custom"])
   func explicitIconStyleWins(raw: String) {
     let expected = TrayMenuBarIconStyle(rawValue: raw)
     let settings = RouterStore.resolveMenuBarSettings(
@@ -47,23 +182,178 @@ struct MenuBarSettingsTests {
       storedPresetIcon: nil,
       storedCustomIconPath: ""
     )
-    #expect(settings.displayMode == .standard)
-    #expect(settings.iconStyle == .indicator)
+    #expect(settings.displayMode == .iconOnly)
+    #expect(settings.iconStyle == .router)
     #expect(settings.presetIcon == "cpu")
     #expect(settings.customIconPath == nil)
   }
 
-  @Test("standard mode keeps a reserved width even when the name is hidden")
-  func standardWidthIsReserved() {
+  @Test("standard mode sizes to its content instead of reserving the full slot")
+  func standardWidthTracksContent() {
+    #expect(MenuBarLayoutMetrics.standardIconSize == 15)
+    #expect(MenuBarLayoutMetrics.iconOnlyIconSize == MenuBarLayoutMetrics.standardIconSize)
+    #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard) == 22)
+    #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly) == 22)
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 22)
+
+    // Hiding the model name is the case issue #646 called out: the slot used to
+    // stay 180 points wide around a single 15pt mark.
+    let iconOnlyContent = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: false,
+      nameText: "Sonnet",
+      detailText: ""
+    )
+    #expect(iconOnlyContent < MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(iconOnlyContent >= MenuBarLayoutMetrics.standardMinimumWidth)
+
+    // A short label must still be narrower than a long one.
+    let short = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let long = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "Claude Opus 4.1 Extended Thinking",
+      detailText: "88% · 4h"
+    )
+    #expect(short > iconOnlyContent)
+    #expect(long > short)
+
+    // ...and an overlong one still truncates rather than growing without bound.
+    #expect(long == MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(
+        displayMode: .standard,
+        standardContentWidth: long
+      ) == MenuBarLayoutMetrics.standardMaximumWidth
+    )
+
+    // A caller that cannot measure yet keeps the historical full slot.
     #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard) == 180)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 24)
   }
 
-  @Test("the activity badge is not a second dot on the indicator style")
-  func indicatorHasNoSideBadge() {
-    #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .indicator, isIdle: false) == false)
-    #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .provider, isIdle: false) == true)
-    #expect(MenuBarLayoutMetrics.showsActivityBadge(iconStyle: .provider, isIdle: true) == false)
+  @Test("the indicator style measures its dot, not the full mark")
+  func indicatorStyleMeasuresTheDot() {
+    let indicator = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let mark = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    #expect(indicator < mark)
+    // A pulse scales the glyph in place, so the slot has to grow with it.
+    let pulsing = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: "",
+      pulsing: true
+    )
+    #expect(pulsing > indicator)
+  }
+
+  @Test("the icon-only mark stays inside the native square during a pulse")
+  func iconOnlyPulseKeepsScaledContentInsideBounds() {
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly, pulsing: true) == 22)
+    #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly, pulsing: true) == 22)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard, pulsing: true) == 180
+    )
+    #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard, pulsing: true) == 22)
+  }
+
+  @Test("provider marks fit transparent crops without leaving the target slot")
+  func providerMarkCropFitsTargetSlot() {
+    let drawRect = ProviderIconLayout.fittedRect(
+      sourceRect: NSRect(x: 2, y: 1, width: 6, height: 8),
+      targetSize: NSSize(width: 20, height: 20)
+    )
+    #expect(drawRect.width == 15)
+    #expect(drawRect.height == 20)
+    #expect(drawRect.minX >= 0)
+    #expect(drawRect.maxX <= 20)
+    #expect(drawRect.minY >= 0)
+    #expect(drawRect.maxY <= 20)
+  }
+
+  @Test("provider layout finds visible content in a transparent bitmap")
+  func providerLayoutFindsVisibleContent() {
+    let url = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .appendingPathComponent("Sources/Resources/ProviderIcons/openai.png")
+    guard let image = NSImage(contentsOf: url) else {
+      Issue.record("Provider icon fixture could not be loaded")
+      return
+    }
+
+    let visibleRect = ProviderIconLayout.visibleImageRect(image)
+    #expect(visibleRect.width > 0)
+    #expect(visibleRect.height > 0)
+    #expect(visibleRect.width <= image.size.width)
+    #expect(visibleRect.height <= image.size.height)
+    #expect(visibleRect.width < image.size.width || visibleRect.height < image.size.height)
+    let drawRect = ProviderIconLayout.fittedRect(
+      sourceRect: visibleRect,
+      targetSize: NSSize(width: 18, height: 18)
+    )
+    #expect(drawRect.minX >= 0)
+    #expect(drawRect.maxX <= 18)
+    #expect(drawRect.minY >= 0)
+    #expect(drawRect.maxY <= 18)
+  }
+
+  @Test("provider layout handles alpha-first bitmap representations")
+  func providerLayoutHandlesAlphaFirstBitmaps() {
+    guard let representation = NSBitmapImageRep(
+      bitmapDataPlanes: nil,
+      pixelsWide: 10,
+      pixelsHigh: 8,
+      bitsPerSample: 8,
+      samplesPerPixel: 4,
+      hasAlpha: true,
+      isPlanar: false,
+      colorSpaceName: .deviceRGB,
+      bitmapFormat: .alphaFirst,
+      bytesPerRow: 0,
+      bitsPerPixel: 0
+    ) else {
+      Issue.record("Alpha-first bitmap fixture could not be created")
+      return
+    }
+
+    func setPixel(_ values: [Int], atX x: Int, y: Int) {
+      var values = values
+      values.withUnsafeMutableBufferPointer { buffer in
+        representation.setPixel(buffer.baseAddress!, atX: x, y: y)
+      }
+    }
+
+    for y in 0..<representation.pixelsHigh {
+      for x in 0..<representation.pixelsWide {
+        setPixel([0, 0, 0, 0], atX: x, y: y)
+      }
+    }
+    setPixel([255, 255, 255, 255], atX: 2, y: 1)
+    setPixel([255, 255, 255, 255], atX: 7, y: 6)
+    let image = NSImage(size: NSSize(width: 10, height: 8))
+    image.addRepresentation(representation)
+
+    let visibleRect = ProviderIconLayout.visibleImageRect(image)
+    #expect(visibleRect.minX == 2)
+    #expect(visibleRect.minY == 1)
+    #expect(visibleRect.width == 6)
+    #expect(visibleRect.height == 6)
   }
 
   @Test("choosing a custom image copies it into Application Support")

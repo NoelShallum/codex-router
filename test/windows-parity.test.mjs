@@ -62,3 +62,10 @@ test("every detached worker is spawned without a console window", () => {
     }
   }
 });
+
+test("Windows start uses the managed service and keeps foreground explicit", () => {
+  const dispatcher = readFileSync(path.join(root, "codex-router.ps1"), "utf8");
+  assert.match(dispatcher, /"start"\s*\{[\s\S]{0,800}src\\service\.mjs[\s\S]{0,100}@\("start"\)/);
+  assert.match(dispatcher, /--foreground/);
+  assert.match(dispatcher, /src\\foreground-start\.mjs/);
+});

@@ -90,6 +90,10 @@ function renderBlock(values) {
   return lines;
 }
 
+export function geminiManagedBlockPresent(document) {
+  return Boolean(locateBlock(splitLines(String(document ?? ""))));
+}
+
 /** Every managed key assigned outside our block, with its 1-based line number. */
 export function conflictingAssignments(document) {
   const lines = splitLines(String(document ?? ""));

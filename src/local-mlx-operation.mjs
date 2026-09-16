@@ -31,6 +31,7 @@ import {
   localMlxStatus,
 } from "./local-mlx.mjs";
 import { STATE_DIR } from "./paths.mjs";
+import { detachedOperationEnvironment } from "./process-tree.mjs";
 
 export const LOCAL_MLX_OPERATION_PATH =
   process.env.MODEL_ROUTER_LOCAL_MLX_OPERATION_STATE ||
@@ -281,6 +282,7 @@ export function startLocalMlxOperation({
       try {
         child = spawnImpl(process.execPath, [fileURLToPath(import.meta.url), "worker"], {
           detached: true,
+          env: detachedOperationEnvironment(),
           stdio: "ignore",
           windowsHide: true,
         });

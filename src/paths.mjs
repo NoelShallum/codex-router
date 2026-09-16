@@ -1,10 +1,11 @@
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { trayBundleDir } from "./tray-install.mjs";
 
-const supportedTargets = new Set(["codex", "dsh", "gemini"]);
+const supportedTargets = new Set(["codex", "dsh", "gemini", "cursor", "claude", "openclaw"]);
 
 export const TARGET = process.env.MODEL_ROUTER_TARGET || "codex";
 if (!supportedTargets.has(TARGET)) {
@@ -28,6 +29,9 @@ export const ROUTER_PLANE_TARGET = "codex";
 const TARGET_DISPLAY_NAMES = Object.freeze({
   dsh: "DeepSeek Harness Router",
   gemini: "Gemini CLI Router",
+  cursor: "Cursor Router",
+  claude: "Claude Code Router",
+  openclaw: "OpenClaw Router",
   codex: "Codex Router",
 });
 export const TARGET_DISPLAY_NAME = TARGET_DISPLAY_NAMES[TARGET] || TARGET_DISPLAY_NAMES.codex;
@@ -78,6 +82,77 @@ export const GEMINI_HOME = path.join(
 export const GEMINI_ENV_PATH =
   process.env.MODEL_ROUTER_GEMINI_ENV || path.join(GEMINI_HOME, ".env");
 
+export const CURSOR_HOME = process.env.CURSOR_HOME || (
+  process.platform === "darwin"
+    ? path.join(os.homedir(), "Library", "Application Support", "Cursor")
+    : process.platform === "win32"
+      ? path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Cursor")
+      : path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "Cursor")
+);
+export const CURSOR_STATE_DB_PATH = process.env.MODEL_ROUTER_CURSOR_STATE_DB ||
+  path.join(CURSOR_HOME, "User", "globalStorage", "state.vscdb");
+export const CURSOR_LAUNCHER_PATH = process.env.MODEL_ROUTER_CURSOR_LAUNCHER || (
+  process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "codex-router", "bin", "cursor-router-agent.cmd")
+    : path.join(os.homedir(), ".local", "bin", "cursor-router-agent")
+);
+// The five OpenAI/Anthropic-wire harnesses published by `routed-harness-*.mjs`.
+// Each one owns a single user-visible configuration document that the router
+// edits one key of; every path below resolves the way that client resolves it,
+// with a `MODEL_ROUTER_*` override so a test never writes into a real home.
+//
+// opencode reads a global config from `$XDG_CONFIG_HOME/opencode/opencode.json`
+// and lets `OPENCODE_CONFIG` name a file outright. Honour both, in that order,
+// or a user who moved theirs gets a provider nothing reads.
+export const OPENCODE_CONFIG_PATH =
+  process.env.MODEL_ROUTER_OPENCODE_CONFIG ||
+  process.env.OPENCODE_CONFIG ||
+  path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
+    "opencode",
+    "opencode.json",
+  );
+// pi keeps its agent state in `~/.pi/agent`; custom providers live in
+// `models.json` beside the session store. Its override is
+// `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`, i.e. `PI_CODING_AGENT_DIR`
+// (read from the shipped `dist/config.js`, not guessed from the docs).
+export const PI_AGENT_HOME =
+  process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+export const PI_MODELS_PATH =
+  process.env.MODEL_ROUTER_PI_MODELS || path.join(PI_AGENT_HOME, "models.json");
+// omp (can1357/oh-my-pi) inherits pi's `PI_CODING_AGENT_DIR` override and
+// defaults to `~/.omp/agent`. It reads `models.yml`, then `models.yaml`, so an
+// existing `models.yaml` with no `models.yml` beside it is the document to edit:
+// creating a `models.yml` would silently shadow the user's file.
+export const OMP_AGENT_HOME =
+  process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".omp", "agent");
+const OMP_MODELS_YML = path.join(OMP_AGENT_HOME, "models.yml");
+const OMP_MODELS_YAML = path.join(OMP_AGENT_HOME, "models.yaml");
+export const OMP_MODELS_PATH =
+  process.env.MODEL_ROUTER_OMP_MODELS ||
+  (!existsSync(OMP_MODELS_YML) && existsSync(OMP_MODELS_YAML) ? OMP_MODELS_YAML : OMP_MODELS_YML);
+// Command Code keeps BYOK provider declarations in their own document, apart
+// from `auth.json` where its own credentials live. The router only ever writes
+// the former, and never a raw secret into it. Command Code has no directory
+// override: it joins the home directory with `.commandcode`.
+export const COMMANDCODE_HOME = path.join(os.homedir(), ".commandcode");
+export const COMMANDCODE_PROVIDERS_PATH =
+  process.env.MODEL_ROUTER_COMMANDCODE_PROVIDERS ||
+  path.join(COMMANDCODE_HOME, "providers.json");
+// Hermes Agent keeps every non-secret setting in one YAML document. Named
+// custom providers live under its `providers:` mapping.
+export const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), ".hermes");
+export const HERMES_CONFIG_PATH =
+  process.env.MODEL_ROUTER_HERMES_CONFIG || path.join(HERMES_HOME, "config.yaml");
+
+export const CLAUDE_HOME = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+export const CLAUDE_SETTINGS_PATH = path.join(CLAUDE_HOME, "settings.json");
+export const CLAUDE_LAUNCHER_PATH = process.env.MODEL_ROUTER_CLAUDE_LAUNCHER || (
+  process.platform === "win32"
+    ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "codex-router", "bin", "claude-router.cmd")
+    : path.join(os.homedir(), ".local", "bin", "claude-router")
+);
+
 function managedStateDir() {
   return (
     process.env.CODEX_ROUTER_STATE_DIR ||
@@ -107,25 +182,92 @@ export const DSH_CATALOG_PATH = path.join(STATE_DIR, "dsh-models.json");
 // be there and trusting the answer. Its presence is what says the integration
 // is installed.
 export const GEMINI_CATALOG_PATH = path.join(STATE_DIR, "gemini-models.json");
+export const CURSOR_CATALOG_PATH = path.join(STATE_DIR, "cursor-models.json");
+export const CLAUDE_CATALOG_PATH = path.join(STATE_DIR, "claude-models.json");
+export const OPENCLAW_CATALOG_PATH = path.join(STATE_DIR, "openclaw-models.json");
+// One publication marker per routed harness, on the same rule as every other
+// client: it records what this router last wrote into somebody else's
+// document, so drift is detected against a snapshot rather than by
+// re-deriving what "should" be there and trusting the answer. Its presence is
+// what says the integration is installed.
+export const ROUTED_HARNESS_CATALOG_PATHS = Object.freeze({
+  opencode: path.join(STATE_DIR, "opencode-models.json"),
+  pi: path.join(STATE_DIR, "pi-models.json"),
+  omp: path.join(STATE_DIR, "omp-models.json"),
+  commandcode: path.join(STATE_DIR, "commandcode-models.json"),
+  hermes: path.join(STATE_DIR, "hermes-models.json"),
+});
+// Router-owned Cloudflare named-tunnel metadata. The tunnel exposes only the
+// separately keyed Cursor App edge on 4214; it never points at the main router.
+export const CURSOR_TUNNEL_STATE_PATH = path.join(STATE_DIR, "cursor-tunnel.json");
+export const CURSOR_TUNNEL_CONFIG_PATH = path.join(STATE_DIR, "cursor-cloudflared.yml");
 export const NATIVE_ALIAS_PATH = path.join(STATE_DIR, "native-aliases.json");
 export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json");
 export const LITELLM_CONFIG_PATH = path.join(STATE_DIR, "litellm.yaml");
 export const INTERNAL_SECRET_PATH = path.join(STATE_DIR, "internal-secret");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
+export const CURSOR_PUBLIC_SECRET_PATH = path.join(STATE_DIR, "cursor-public-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
+export const LOGIN_FREE_REFRESH_JOURNAL_PATH = path.join(
+  STATE_DIR,
+  "login-free-refresh.json",
+);
 export const SIGNED_PROVIDER_MODE_PATH = path.join(STATE_DIR, "signed-provider-mode.json");
 // An opt-in routed default for signed-in Codex. The router owns this small
 // state file, while Codex continues to own the actual config document.
 export const CODEX_DEFAULT_MODEL_PATH = path.join(STATE_DIR, "codex-default-model.json");
 export const PROVIDER_SELECTION_PATH = path.join(STATE_DIR, "enabled-providers.json");
 export const DISCOVERY_MODE_PATH = path.join(STATE_DIR, "discovery-mode.json");
+// Explicit, shared-plane consent for letting router-authenticated local clients
+// use the ChatGPT session owned by this user's Codex installation. The file
+// carries no credential; its presence records only the user's authorization.
+export const NATIVE_SESSION_CONSENT_PATH = path.join(
+  STATE_DIR,
+  "native-session-consent.json",
+);
 // The last model list each provider published for itself. It is a convenience
 // cache for the curation surfaces, never an authority: what is registered
 // locally is always recomputed from the live registry.
 export const PROVIDER_CATALOG_CACHE_PATH = path.join(STATE_DIR, "provider-catalog-cache.json");
+export const PROVIDER_API_KEY_POOL_PATH =
+  process.env.MODEL_ROUTER_API_KEY_POOL_PATH ||
+  path.join(STATE_DIR, "provider-api-key-pools.json");
 export const INSTALL_MANIFEST_PATH = path.join(STATE_DIR, "install-manifest.json");
 export const SKILL_OWNERSHIP_PATH = path.join(STATE_DIR, "managed-skills.json");
 export const MIGRATIONS_DIR = path.join(STATE_DIR, "migrations");
+// Provider credential metadata contains only opaque references. The actual
+// token remains in the existing provider file/keychain/OAuth store.
+export const PROVIDER_CREDENTIAL_STORE_PATH =
+  process.env.MODEL_ROUTER_PROVIDER_CREDENTIAL_STORE ||
+  path.join(STATE_DIR, "provider-credentials.json");
+export const PROVIDER_CREDENTIAL_MIGRATIONS_DIR =
+  process.env.MODEL_ROUTER_PROVIDER_CREDENTIAL_MIGRATIONS ||
+  path.join(MIGRATIONS_DIR, "provider-credentials");
+// Account-pool policy contains only opaque account ids and routing metadata;
+// native OAuth credentials stay owned by the Codex login implementation.
+export const CHATGPT_ACCOUNT_POOL_PATH =
+  process.env.MODEL_ROUTER_CHATGPT_ACCOUNT_POOL ||
+  path.join(STATE_DIR, "chatgpt-account-pool.json");
+// Each ChatGPT subscription account gets its own Codex home.  The home keeps
+// the OAuth refresh state under Codex's normal ownership boundary instead of
+// copying a token into the router's pool metadata.  The account id is always
+// validated before it is appended to this directory.
+export const CHATGPT_ACCOUNT_HOMES_DIR =
+  process.env.MODEL_ROUTER_CHATGPT_ACCOUNT_HOMES ||
+  path.join(STATE_DIR, "chatgpt-accounts");
+export const CHATGPT_PROFILE_SWITCH_PATH = path.join(STATE_DIR, "chatgpt-profile-switch.json");
+// User-defined OpenAI-compatible provider descriptors. The document contains
+// no raw credentials; credentialRef values point to the provider-neutral store.
+export const GENERIC_PROVIDERS_PATH =
+  process.env.MODEL_ROUTER_GENERIC_PROVIDERS ||
+  path.join(STATE_DIR, "generic-providers.json");
+export const GENERIC_PROVIDER_CREDENTIALS_DIR = path.join(STATE_DIR, "generic-provider-credentials");
+// Explicit Codex-only bindings from a routed model to a separately
+// credentialed search provider. The document contains provider ids and policy
+// bounds only; endpoints and secrets remain owned by generic provider state.
+export const SEARCH_SIDECARS_PATH =
+  process.env.MODEL_ROUTER_SEARCH_SIDECARS ||
+  path.join(STATE_DIR, "search-sidecars.json");
 export const SUPPORT_DIR = path.join(STATE_DIR, "support");
 export const LOG_PATH = path.join(STATE_DIR, "router.log");
 export const SERVICE_PROCESS_STATE_PATH = path.join(STATE_DIR, "service-process.json");
@@ -157,7 +299,14 @@ export const TRAY_LAUNCH_AGENT_PATH = path.join(
 // resolves by name and can be found and quit like any other. This constant and
 // scripts/build-macos-tray-app.sh's default must name the same directory.
 export const TRAY_APP_PATH =
-  trayBundleDir("darwin", os.homedir()) ?? path.join(os.homedir(), "Applications", "Model Router.app");
+  trayBundleDir("darwin", os.homedir()) ?? path.join(os.homedir(), "Applications", "Codex Router.app");
+// The previous unified native host used this visible name. It is migration
+// evidence only: launch, status, and new packages must resolve TRAY_APP_PATH.
+export const LEGACY_USER_TRAY_APP_PATH = path.join(
+  os.homedir(),
+  "Applications",
+  "Model Router.app",
+);
 export const LEGACY_TRAY_APP_PATH = path.join(SOURCE_ROOT, "dist", "Model Router.app");
 export const TRAY_APP_BINARY = path.join(TRAY_APP_PATH, "Contents", "MacOS", "ModelRouterTray");
 // Task Scheduler names the tray separately from the router's own task so
@@ -175,8 +324,7 @@ function port(name, fallback) {
 // Keep the defaults in an unassigned IANA range. 4101-4104 are the registered
 // BrlAPI ports on Linux; binding an HTTP service there makes xbrlapi wait for a
 // protocol response during GNOME login. gateway/oauth/router/api are the
-// original four; grokOauth is a fifth forwarder port for the Grok OAuth
-// provider.
+// original four; the remaining entries are dedicated provider forwarders.
 export const DEFAULT_PORTS = Object.freeze({
   gateway: 4200,
   oauth: 4201,
@@ -184,6 +332,8 @@ export const DEFAULT_PORTS = Object.freeze({
   api: 4203,
   grokOauth: 4208,
   devinCli: 4210,
+  antigravityOauth: 4212,
+  cursorPublic: 4214,
 });
 
 // Ports used before the BrlAPI-safe defaults shipped. They remain recognized
@@ -216,6 +366,8 @@ export const PORTS = {
   ),
   grokOauth: port("MODEL_ROUTER_GROK_OAUTH_PORT", DEFAULT_PORTS.grokOauth),
   devinCli: port("MODEL_ROUTER_DEVIN_CLI_PORT", DEFAULT_PORTS.devinCli),
+  antigravityOauth: port("MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT", DEFAULT_PORTS.antigravityOauth),
+  cursorPublic: port("MODEL_ROUTER_CURSOR_PUBLIC_PORT", DEFAULT_PORTS.cursorPublic),
 };
 
 export function loopback(portNumber, suffix = "") {

@@ -476,26 +476,26 @@ test("--json prints the same verdict as the text form", async () => {
   assert.equal(code, 0);
 });
 
-test("a missing provider module is named, with the branch that carries it", async () => {
+test("a missing provider module points to the current main checkout", async () => {
   const absent = { missing: "./devin-proto.mjs", reason: "Cannot find module './devin-proto.mjs'" };
   const { code, checks, output } = await probe([], absent, async () => assert.fail("nothing should be sent"));
   const check = checkOf(checks, "devin provider sources");
   assert.equal(check.status, "fail");
   assert.match(check.detail, /devin-proto\.mjs is not present/);
-  assert.match(check.fix, /feat\/devin-cli-provider/);
+  assert.match(check.fix, /ship on main/);
+  assert.match(check.fix, /npm install/);
   assert.match(output, /VERDICT FAIL/);
   assert.equal(code, 1);
 });
 
-test("with nothing injected the probe resolves the real modules, on either branch", async () => {
-  // The provider's sources are absent on main and present on the Devin CLI
-  // branch. Both are legitimate; what must never happen is an unhandled module
-  // resolution error, so this asserts the probe reached one outcome or the other.
+test("with nothing injected the probe resolves the real modules from main", async () => {
+  // What must never happen is an unhandled module resolution error, so this
+  // asserts the probe reached a named outcome even in an incomplete checkout.
   const { checks } = await probe([], undefined, async () => {
     throw new Error("the network is not reachable from a test");
   });
   const missing = checkOf(checks, "devin provider sources");
-  if (missing) assert.match(missing.fix, /feat\/devin-cli-provider/);
+  if (missing) assert.match(missing.fix, /ship on main/);
   else assert.ok(checks.some((check) => check.name === "devin cli session"), "the probe should have gone on to read the session");
 });
 
@@ -509,6 +509,7 @@ test("the tester guide names the probe, the paid flag, and the cap the probe act
   assert.match(guide, /`--live` is the only flag that spends anything/);
   assert.match(guide, new RegExp(`default ${DEFAULT_MAX_TOKENS}`));
   assert.match(guide, /issues\/270/);
+  assert.doesNotMatch(guide, /feat\/devin/);
 });
 
 test("every failure the checks can emit is explained in the guide", () => {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -73,7 +74,7 @@ const CONTENT_SSE = [
   "",
 ].join("\n");
 
-// Large enough to force the guard past its 1 MiB pre-content hold budget
+// Large enough to exceed the guard's 10 MiB incomplete-event ceiling
 // before any client-visible output arrives. Deliberately not a reasoning event:
 // reasoning releases the hold on liveness long before the byte cap, so a
 // reasoning prelude would exercise the wrong release path.
@@ -84,7 +85,7 @@ const BUDGET_RELEASE_REASONING_SSE = [
   "event: response.in_progress",
   `data: ${JSON.stringify({
     type: "response.in_progress",
-    response: { id: "r-budget", status: "x".repeat(2 * 1024 * 1024) },
+    response: { id: "r-budget", status: "x".repeat(11 * 1024 * 1024) },
   })}`,
   "",
 ].join("\n");
@@ -281,8 +282,9 @@ async function mockServer(handler) {
   return { server, port: server.address().port };
 }
 
-function run(env) {
+function run(env, setupState) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "empty-completion-router-state-"));
+  setupState?.(stateDir);
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
     env: {
@@ -420,6 +422,7 @@ function routerEnv(gatewayPort, routerPort) {
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
   };
 }
@@ -429,6 +432,59 @@ const TURN_BODY = {
   input: "hello",
   stream: true,
 };
+
+test("a large initial event preserves a namespaced tool call without retrying", async () => {
+  const tool = {
+    type: "function_call", id: "fc_1", call_id: "call_1",
+    name: "fixture__probe", arguments: "{}",
+  };
+  const prologue = `event: response.created\ndata: ${JSON.stringify({
+    type: "response.created", response: { id: "r-large", metadata: "x".repeat(1_440_000) },
+  })}\n\n`;
+  const answer = [
+    { type: "response.output_item.added", output_index: 0, item: tool },
+    { type: "response.output_item.done", output_index: 0, item: tool },
+    { type: "response.completed", response: { id: "r-large", output: [tool] } },
+  ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+  for (const model of [TURN_BODY.model, "deepseek/deepseek-v4.1-flash"]) {
+    const paths = [];
+    const gw = await gateway((request, response) => {
+      paths.push(request.url);
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      for (let at = 0; at < prologue.length; at += 4096) {
+        response.write(prologue.slice(at, at + 4096));
+      }
+      response.end(answer);
+    });
+    const routerPort = await openPort();
+    const router = run({
+      ...routerEnv(gw.port, routerPort),
+      CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${gw.port}/native`,
+    });
+    try {
+      await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+      const result = await readRouted(routerPort, {
+        ...TURN_BODY, model,
+        tools: [{ type: "namespace", name: "fixture", tools: [{ type: "function", name: "probe" }] }],
+      });
+      assert.equal(result.status, 200);
+      assert.equal(result.complete, true);
+      const calls = result.body.split("\n")
+        .filter((line) => line.startsWith("data: {"))
+        .map((line) => JSON.parse(line.slice(6)))
+        .flatMap((event) => event.item ? [event.item] : event.response?.output || []);
+      assert.deepEqual(
+        calls.map(({ name, namespace }) => ({ name, namespace })),
+        Array.from({ length: 3 }, () => ({ name: "probe", namespace: "fixture" })),
+      );
+      assert.ok(!result.body.includes("event: error"));
+      assert.deepEqual(paths, [model === TURN_BODY.model ? "/v1/responses" : "/native/responses"]);
+    } finally {
+      await stopChild(router);
+      await closeServer(gw.server);
+    }
+  }
+});
 
 // An empty completion used to reach the client as a clean 200 the app
 // recorded as a successful turn with no content. The router must retry the
@@ -483,6 +539,119 @@ test("an empty completion is retried once and the retry's content reaches the cl
   }
 });
 
+test("an empty-completion retry stops when its search sidecar disappears", async () => {
+  const providerId = "perplexity-sidecar";
+  const credentialRef = "cred_perplexity_sidecar_01";
+  const model = "deepseek/deepseek-v4-pro";
+  let sidecarsFile;
+  let stateDir;
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    if (posts === 1) {
+      writeFileSync(
+        sidecarsFile,
+        `${JSON.stringify({ version: 1, bindings: [] })}\n`,
+        { mode: 0o600 },
+      );
+    }
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+      "X-Upstream-Attempt": "discarded-first",
+    });
+    response.end(posts === 1 ? EMPTY_SSE_METERED : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort), (directory) => {
+    stateDir = directory;
+    sidecarsFile = path.join(directory, "search-sidecars.json");
+    writeFileSync(
+      path.join(directory, "generic-providers.json"),
+      `${JSON.stringify({
+        version: 1,
+        providers: [{
+          id: providerId,
+          displayName: "Perplexity Search",
+          baseUrl: "https://api.perplexity.ai",
+          adapter: "openai-chat",
+          headers: {},
+          credentialRef,
+          allowPrivate: false,
+          enabled: true,
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      sidecarsFile,
+      `${JSON.stringify({
+        version: 1,
+        bindings: [{
+          model,
+          providerId,
+          adapter: "perplexity-search",
+          enabled: true,
+          timeoutMs: 1_000,
+          maxResults: 8,
+          cacheTtlMs: 60_000,
+          cacheMaxEntries: 128,
+          maxAttempts: 2,
+          retryDelayMs: 100,
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      path.join(directory, "provider-credentials.json"),
+      `${JSON.stringify({
+        schemaVersion: 2,
+        credentials: [{
+          id: credentialRef,
+          providerId,
+          providerType: "generic",
+          kind: "api_key",
+          secretRef: { type: "provider-file", providerId, target: "codex" },
+          state: "active",
+          createdAt: "2026-08-31T00:00:00.000Z",
+          updatedAt: "2026-08-31T00:00:00.000Z",
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    mkdirSync(path.join(directory, "generic-provider-credentials"), { mode: 0o700 });
+    writeFileSync(
+      path.join(directory, "generic-provider-credentials", `${providerId}.key`),
+      "pplx-0123456789abcdefghijklmnopqrstuv\n",
+      { mode: 0o600 },
+    );
+  });
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, {
+      ...TURN_BODY,
+      tools: [{ type: "web_search" }],
+    });
+
+    assert.equal(result.status, 400, router.testErrors());
+    assert.equal(JSON.parse(result.body).error.type, "model_search_not_supported");
+    assert.equal(result.headers["cache-control"], undefined);
+    assert.equal(result.headers["x-upstream-attempt"], undefined);
+    assert.equal(posts, 1, "the retry must not reach the gateway after sidecar removal");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 400);
+    assert.equal(event.inputTokens, 100);
+    assert.equal(event.cachedInputTokens, 60);
+    assert.equal(event.emptyCompletion, true);
+    assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // The counterpart to the test above. Once the upstream streams reasoning, the
 // hold is over and the attempt is on the wire, so the router cannot substitute
 // a retry for it. It states the failure into the open stream instead. Holding
@@ -514,15 +683,54 @@ test("a reasoning turn that ends empty is relayed and stated, never retried", as
     // ...followed by a stated failure rather than a silent stop.
     assert.match(result.body, /event: error/);
     assert.match(result.body, /empty_completion/);
+    assert.doesNotMatch(result.body, /event: response\.(?:completed|done)/);
     // No second attempt: the response had already started.
     assert.equal(posts, 1, "a relayed attempt must not be retried");
     assert.doesNotMatch(result.body, /Recovered|r-content/);
     assert.equal(result.headers["x-upstream-attempt"], "first");
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
     assert.equal(event.emptyCompletion, true);
     assert.equal(event.emptyCompletionUnrepairable, true);
     assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a headers-only attempt times out, retries once, and returns content", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Upstream-Attempt": posts === 1 ? "first" : "retry",
+    });
+    response.flushHeaders();
+    if (posts === 1) return;
+    response.end(CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+  });
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
+    assert.equal(result.status, 200);
+    assert.match(result.body, /Recovered/);
+    assert.equal(result.headers["x-upstream-attempt"], "retry");
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);
@@ -638,7 +846,7 @@ test("a retried turn meters the tokens of both attempts", async () => {
   }
 });
 
-test("a retry that crosses the guard byte budget records the release", async () => {
+test("a retry that crosses the guard byte limit returns an explicit error", async () => {
   let posts = 0;
   const gw = await gateway((_request, response) => {
     posts += 1;
@@ -652,15 +860,46 @@ test("a retry that crosses the guard byte budget records the release", async () 
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
     const result = await readRouted(routerPort, TURN_BODY);
 
+    assert.equal(result.status, 502);
+    assert.equal(result.complete, true);
+    assert.doesNotMatch(result.body, /r-budget/);
+    assert.match(result.body, /precontent_limit/);
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a first-attempt byte limit retries without leaking its staged response", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(posts === 1 ? BUDGET_RELEASE_REASONING_SSE : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort));
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
     assert.equal(result.status, 200);
     assert.equal(result.complete, true);
-    assert.match(result.body, /r-budget/);
+    assert.match(result.body, /Recovered/);
+    assert.doesNotMatch(result.body, /r-budget/);
     assert.equal(posts, 2);
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
     assert.equal(event.status, 200);
     assert.equal(event.emptyCompletionRetried, true);
-    assert.equal(event.emptyCompletionGuardReleased, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);
@@ -1212,6 +1451,436 @@ test("a content turn is not retried and carries no empty-completion markers", as
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
     assert.equal(event.status, 200);
     assert.equal(event.emptyCompletion, undefined);
+    assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+const GROK_OAUTH_MODEL = "grok-oauth/grok-4.6";
+const GROK_API_MODEL = "grok-api/grok-4.5";
+const REASONING_DELTA_SSE = [
+  "event: response.reasoning_text.delta",
+  'data: {"type":"response.reasoning_text.delta","delta":"thinking"}',
+  "",
+  "",
+].join("\n");
+const GROK_GATEWAY_ERROR_SSE = [
+  'data: {"error":{"message":"list index out of range","type":"None","param":"None","code":"500"}}',
+  "",
+  "",
+].join("\n");
+
+function writeReasoningDelta(response) {
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  response.write(REASONING_DELTA_SSE);
+}
+
+// Holds `later` until `delayMs` passes, or until the router closes the upstream
+// first. A route whose bound fires closes the attempt, so content can never win
+// a race against that timer on a loaded runner: the delay only decides when a
+// route that is *not* bounded receives its content. `onSettled` is called
+// exactly once, with "content" or "closed" for whichever happened first; the
+// upstream close can reach the gateway after the client's response has ended,
+// so tests await it rather than reading a flag.
+function delayedAfterReasoning(later, delayMs, onPost, onSettled) {
+  return (_request, response) => {
+    onPost?.();
+    writeReasoningDelta(response);
+    const timer = setTimeout(() => {
+      onSettled?.("content");
+      response.end(later);
+    }, delayMs);
+    response.once("close", () => {
+      clearTimeout(timer);
+      if (!response.writableEnded) onSettled?.("closed");
+    });
+  };
+}
+
+function upstreamOutcome() {
+  let settle;
+  const settled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  return { settle, settled };
+}
+
+for (const model of [GROK_OAUTH_MODEL, GROK_API_MODEL, "deepseek/deepseek-v4-pro"]) {
+  test(`${model} uses its own bound after reasoning starts`, async () => {
+    const oauth = model === GROK_OAUTH_MODEL;
+    let posts = 0;
+    const upstream = upstreamOutcome();
+    // Grok OAuth gets its content a whole second after reasoning -- forty times
+    // the 25ms prelude -- so a route that wrongly applied the prelude closes the
+    // attempt long before it arrives. Bounded routes are held until the router
+    // closes them; the ten-second fallback only turns a missing bound into a
+    // failed assertion instead of a hung test.
+    const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, oauth ? 1_000 : 10_000, () => {
+      posts += 1;
+    }, upstream.settle));
+    const routerPort = await openPort();
+    const router = run({
+      ...routerEnv(gw.port, routerPort),
+      CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+    });
+    try {
+      await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+      const result = await readRouted(routerPort, { ...TURN_BODY, model });
+      const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+      assert.equal(posts, 1, "never replay a visible stream");
+      if (oauth) {
+        assert.match(result.body, /Recovered/);
+        assert.doesNotMatch(result.body, /event: error/);
+        assert.equal(await upstream.settled, "content");
+        assert.equal(event.status, 200);
+        assert.equal(event.emptyCompletionPreludeLimit, undefined);
+      } else {
+        assert.doesNotMatch(result.body, /Recovered/);
+        assert.match(result.body, /precontent_limit/);
+        assert.equal(await upstream.settled, "closed", "the router's bound closed the attempt");
+        assert.equal(event.status, 502);
+      }
+    } finally {
+      await stopChild(router);
+      await closeServer(gw.server);
+    }
+  });
+}
+
+test("invalid Grok stall env keeps the ten-minute default instead of the prelude", async () => {
+  let posts = 0;
+  const upstream = upstreamOutcome();
+  // Forty times the prelude, for the same reason as the bound test above.
+  const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, 1_000, () => {
+    posts += 1;
+  }, upstream.settle));
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+    CODEX_ROUTER_GROK_STREAM_STALL_MS: "nope",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: GROK_OAUTH_MODEL });
+    assert.equal(posts, 1);
+    assert.match(result.body, /Recovered/);
+    assert.doesNotMatch(result.body, /precontent_limit/);
+    assert.equal(await upstream.settled, "content");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a Grok headers-only attempt still uses the 30-second prelude, not the stall bound", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Upstream-Attempt": posts === 1 ? "first" : "retry",
+    });
+    response.flushHeaders();
+    if (posts === 1) return;
+    response.end(CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: GROK_OAUTH_MODEL });
+    // The alternative is the ten-minute stall bound, so a generous ceiling still
+    // tells the two apart without timing a loaded runner to the millisecond.
+    assert.ok(Date.now() - started < 5_000, "Grok headers-only still uses the prelude");
+    assert.match(result.body, /Recovered/);
+    assert.equal(result.headers["x-upstream-attempt"], "retry");
+    assert.equal(posts, 2);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a genuinely stalled Grok stream respects the separate bound without replay", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    // The prelude sits far above the ceiling below, so the stall bound is the
+    // only timer that can end this stream inside it, even on a loaded runner.
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "10000",
+    CODEX_ROUTER_GROK_STREAM_STALL_MS: "50",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: GROK_OAUTH_MODEL });
+    assert.ok(Date.now() - started < 5_000, "uses the independent stall bound");
+    assert.match(result.body, /precontent_limit/);
+    assert.equal(posts, 1);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a silent Grok stream relays heartbeats that no other provider receives", async () => {
+  const prologue = [
+    "event: response.created",
+    'data: {"type":"response.created","response":{"id":"resp_heartbeat","object":"response","created_at":1700000000,"status":"in_progress","output":[]}}',
+    "",
+    "",
+  ].join("\n") + REASONING_DELTA_SSE;
+  for (const model of [GROK_OAUTH_MODEL, "deepseek/deepseek-v4-pro"]) {
+    let posts = 0;
+    const gw = await gateway((_request, response) => {
+      posts += 1;
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(prologue);
+      const timer = setTimeout(() => response.end(CONTENT_SSE), 1_000);
+      response.once("close", () => clearTimeout(timer));
+    });
+    const routerPort = await openPort();
+    const router = run({
+      ...routerEnv(gw.port, routerPort),
+      CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "5000",
+      CODEX_ROUTER_GROK_HEARTBEAT_MS: "200",
+    });
+    try {
+      await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+      const result = await readRouted(routerPort, { ...TURN_BODY, model });
+      assert.equal(result.status, 200, `${model}: ${result.body}`);
+      assert.match(result.body, /Recovered/, model);
+      assert.equal(posts, 1, model);
+      const beats = result.body
+        .split(/\r?\n\r?\n/)
+        .filter((block) => /^event: response\.in_progress$/m.test(block) && block.includes('"resp_heartbeat"'));
+      if (model === GROK_OAUTH_MODEL) {
+        assert.ok(beats.length >= 2, `expected heartbeats during the silence:\n${result.body}`);
+        for (const block of beats) {
+          const data = JSON.parse(block.slice(block.indexOf("data: ") + 6));
+          assert.deepEqual(Object.keys(data).sort(), ["response", "type"]);
+          assert.equal(data.response.status, "in_progress");
+        }
+      } else {
+        assert.equal(beats.length, 0, `${model} must not receive Grok heartbeats`);
+      }
+      const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+      assert.equal(event.status, 200, model);
+    } finally {
+      await stopChild(router);
+      await closeServer(gw.server);
+    }
+  }
+});
+
+test("a Grok gateway error before content reaches the client at once and only once", { timeout: 30_000 }, async () => {
+  let held;
+  const gw = await gateway((_request, response) => {
+    held = response;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    // The gateway states the failure and then keeps its stream open.
+    response.write(GROK_GATEWAY_ERROR_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "1500",
+    CODEX_ROUTER_GROK_STREAM_STALL_MS: "2500",
+  });
+  let request;
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const base = new URL(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`);
+    const started = Date.now();
+    let body = "";
+    let firstErrorAt;
+    request = http.request(
+      {
+        host: "127.0.0.1",
+        port: routerPort,
+        path: base.pathname,
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer codex-caller-auth" },
+      },
+      (response) => {
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (firstErrorAt === undefined && /event: error/.test(body)) firstErrorAt = Date.now() - started;
+        });
+        response.on("error", () => {});
+      },
+    );
+    request.on("error", () => {});
+    request.end(JSON.stringify({ ...TURN_BODY, model: GROK_OAUTH_MODEL }));
+    // Outlast the prelude plus the Grok stall bound while the gateway holds
+    // its stream open after the failure.
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    assert.ok(firstErrorAt !== undefined, `no error reached the client: ${body}`);
+    assert.ok(firstErrorAt < 1_000, `the error was held for ${firstErrorAt}ms`);
+    assert.equal(body.match(/event: error/g).length, 1, body);
+    assert.doesNotMatch(body, /precontent_limit|list index out of range/);
+  } finally {
+    request?.destroy();
+    held?.end();
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a Grok idle past the 30-second prelude still completes", { timeout: 90_000 }, async () => {
+  let posts = 0;
+  const gw = await gateway(delayedAfterReasoning(CONTENT_SSE, 35_000, () => {
+    posts += 1;
+  }));
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "30000",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: GROK_OAUTH_MODEL });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 35_000, "waited through a 35-second reasoning idle");
+    assert.ok(elapsed < 60_000, "did not wait for the ten-minute stall");
+    assert.equal(posts, 1, "never replay a visible stream");
+    assert.match(result.body, /Recovered/);
+    assert.doesNotMatch(result.body, /precontent_limit|event: error/);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionPreludeLimit, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("another provider still stalls at the 30-second prelude after reasoning", { timeout: 90_000 }, async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "30000",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, TURN_BODY);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 29_000, "other providers keep the existing stall");
+    assert.ok(elapsed < 40_000, "did not inherit the Grok ten-minute bound");
+    assert.match(result.body, /precontent_limit/);
+    assert.doesNotMatch(result.body, /Recovered/);
+    assert.equal(posts, 1);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("an explicit Grok cancel after reasoning does not wait for the stall bound", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "1000",
+    CODEX_ROUTER_GROK_STREAM_STALL_MS: "2000",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    await new Promise((resolve, reject) => {
+      const base = new URL(`${callerBaseUrl(routerPort, CALLER_KEY)}/responses`);
+      const request = http.request(
+        {
+          host: "127.0.0.1",
+          port: routerPort,
+          path: base.pathname,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer codex-caller-auth",
+          },
+        },
+        (response) => {
+          response.once("data", () => {
+            request.destroy();
+            resolve();
+          });
+        },
+      );
+      request.once("error", (error) => {
+        if (error.code === "ECONNRESET") resolve();
+        else reject(error);
+      });
+      request.end(JSON.stringify({ ...TURN_BODY, model: GROK_OAUTH_MODEL }));
+    });
+    assert.ok(Date.now() - started < 900, "cancel does not wait for the stall bound");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(posts, 1, "never replay a visible stream");
+    assert.equal(event.status, 0);
+    assert.equal(event.emptyCompletionPreludeLimit, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a Grok terminal error after reasoning is not retried", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    writeReasoningDelta(response);
+    response.end(GROK_GATEWAY_ERROR_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+    CODEX_ROUTER_GROK_STREAM_STALL_MS: "50",
+  });
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const started = Date.now();
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: GROK_OAUTH_MODEL });
+    assert.ok(Date.now() - started < 900, "terminal error does not wait for the stall bound");
+    assert.equal(posts, 1, "never replay a visible stream");
+    assert.match(result.body, /event: error/);
+    assert.doesNotMatch(result.body, /Recovered|precontent_limit|list index out of range/);
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionPreludeLimit, undefined);
     assert.equal(event.emptyCompletionRetried, undefined);
   } finally {
     await stopChild(router);

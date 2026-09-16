@@ -104,6 +104,50 @@ struct LocalizationTests {
     }
   }
 
+  @Test(
+    "session-sharing consent and status are translated in every explicit locale",
+    arguments: [TrayLanguage.chinese, .arabic, .hindi, .japanese, .korean]
+  )
+  func sessionSharingConsentIsLocalized(language: TrayLanguage) {
+    let original = RouterLanguage.selection
+    defer { RouterLanguage.setSelection(original) }
+    RouterLanguage.setSelection(language)
+    for english in [
+      "Share ChatGPT subscription",
+      "Sharing status unavailable",
+      "Sharing enabled",
+      "login usable",
+      "login expired",
+      "Enable ChatGPT session sharing?",
+      "Enabling lets other local Codex Router clients spend this user's ChatGPT subscription. Only continue for clients you trust on this Mac.",
+      "A usable ChatGPT login is required before sharing can be enabled. Run codex login first.",
+      "ChatGPT session sharing disabled. Installed client catalogs were refreshed.",
+    ] {
+      #expect(routerLocalized(english) != english, "\(language.rawValue) did not translate \(english)")
+    }
+  }
+
+  @Test(
+    "daily-usage fallback provenance is translated in every explicit locale",
+    arguments: [TrayLanguage.chinese, .arabic, .hindi, .japanese, .korean]
+  )
+  func dailyUsageFallbackIsLocalized(language: TrayLanguage) {
+    let original = RouterLanguage.selection
+    defer { RouterLanguage.setSelection(original) }
+    RouterLanguage.setSelection(language)
+    for english in [
+      "LOCAL FALLBACK",
+      "local fallback",
+      "1 local fallback date",
+      "%d local fallback dates",
+      "OpenAI account usage; missing dates use local router fallback",
+      "OpenAI supplied no account bucket for these dates; local router traffic fills the gap. These are not global account totals.",
+    ] {
+      #expect(routerLocalized(english) != english, "\(language.rawValue) did not translate \(english)")
+    }
+    #expect(routerFormat("%d local fallback dates", 2).contains("2"))
+  }
+
   @Test("interpolated strings keep their format specifiers")
   func formatSpecifiersSurvive() {
     let original = RouterLanguage.selection

@@ -61,7 +61,6 @@ const FLAGSHIP_VISION = {
   inputModalities: ["text", "image"],
   priority: 1,
 };
-
 function userTurn(parts) {
   return [{ type: "message", role: "user", content: parts }];
 }
@@ -822,6 +821,68 @@ test("a read that fails transiently is asked again; a refusal is not", async () 
   assert.equal(attempts, 3);
 });
 
+test("a quota-window 429 is not retried and keeps only safe routing metadata", async () => {
+  let calls = 0;
+  const observedAt = Date.now();
+  await assert.rejects(
+    describeImage({
+      engine: FLASH_VISION,
+      imageUrl: "data:image/png;base64,AAAA",
+      gatewayBase: "http://127.0.0.1:4100/v1",
+      headers: {},
+      retryDelaysMs: [1, 1],
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "Usage limit reached for 5 hour. Your limit will reset later. secret-body-marker",
+            },
+          }),
+          { status: 429, headers: { "Retry-After": "600" } },
+        );
+      },
+    }),
+    (error) => {
+      assert.equal(error.message, "Qwen3.6 Flash answered HTTP 429");
+      assert.equal(error.status, 429);
+      assert.equal(error.failureKind, "out_of_usage");
+      assert.ok(Date.parse(error.cooldownUntil) >= observedAt + 599_000);
+      assert.doesNotMatch(error.message, /secret-body-marker|Usage limit reached/);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, "a known exhausted quota must not spend the retry ladder");
+});
+
+test("an explicit rate-limit reset is not retried on the same vision engine", async () => {
+  let calls = 0;
+  await assert.rejects(
+    describeImage({
+      engine: FLASH_VISION,
+      imageUrl: "data:image/png;base64,AAAA",
+      gatewayBase: "http://127.0.0.1:4100/v1",
+      headers: {},
+      retryDelaysMs: [1, 1],
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ error: { message: "Too many requests" } }), {
+          status: 429,
+          headers: { "Retry-After": "120" },
+        });
+      },
+    }),
+    (error) => {
+      assert.equal(error.status, 429);
+      assert.equal(error.failureKind, undefined);
+      assert.ok(error.cooldownUntil);
+      return true;
+    },
+  );
+  assert.equal(calls, 1, "a provider-named reset must be honored instead of blind retrying");
+});
+
 // A slow engine is not retried: the per-attempt budget is already two minutes,
 // and spending another two turns one late answer into a turn that never ends.
 test("a timeout is reported rather than tried again", async () => {
@@ -1549,6 +1610,38 @@ test("a bridged read is recorded rather than spent silently", async () => {
 // The list only helps if the read path actually walks it. Asserted against the
 // source because the loop lives inside the request handler, the same way the
 // QUIET and usage-event rules above are asserted.
+test("the router remembers provider quota evidence and skips sibling vision engines", async () => {
+  const source = await readFile(path.join(repoRoot, "src/router.mjs"), "utf8");
+  const evidence = source.slice(
+    source.indexOf("async function readVisionEvidence"),
+    source.indexOf("// DeepSeek thinking mode"),
+  );
+  assert.match(evidence, /const errorStatus = Number\(error\?\.status\)/);
+  assert.match(evidence, /recordProviderCooldown\(visionEngineProvider\(engine\)/);
+  assert.match(source, /const VISION_FAILURE_BACKOFF_MS = 60_000/);
+  assert.match(source, /const visionFailedReads = new Map\(\)/);
+  assert.match(source, /function visionFailureCacheKey\(readKey\)/);
+  assert.match(source, /createHash\("sha256"\)\.update\(readKey\)\.digest\("base64url"\)/);
+  const readPath = source.slice(
+    source.indexOf("async function visionEvidenceFor"),
+    source.indexOf("async function readVisionEvidence"),
+  );
+  assert.match(readPath, /cachedVisionFailure\(readKey\)/);
+  assert.match(readPath, /rememberVisionFailure\(readKey, error\)/);
+  assert.match(source, /error\?\.failureKind !== "out_of_usage"/);
+  const bridge = source.slice(
+    source.indexOf("async function bridgeVisionInput"),
+    source.indexOf("function isOpaqueEncryptedContent"),
+  );
+  assert.match(bridge, /const exhaustedProviders = new Set\(\)/);
+  assert.match(bridge, /providerCooldown\(provider\)/);
+  assert.match(bridge, /exhaustedProviders\.has\(provider\)/);
+  assert.match(
+    bridge,
+    /error\?\.failureKind === "out_of_usage"\) exhaustedProviders\.add\(provider\)/,
+  );
+});
+
 test("the read path tries every resolved engine before giving up on an image", async () => {
   const source = await readFile(path.join(repoRoot, "src/router.mjs"), "utf8");
   const bridge = source.slice(

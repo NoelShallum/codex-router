@@ -2,6 +2,8 @@ import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
 import { HeaderlessSseDetector } from "./sse-prefix.mjs";
+import { promptImageUsage } from "./prompt-image-usage.mjs";
+import { knownServiceTier } from "./request-diagnostics.mjs";
 
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 
@@ -25,8 +27,8 @@ const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 // compaction fires somewhere between 690,000 and 900,000 real tokens.
 //
 // That band only holds if the bytes handed to it are bytes the model reads.
-// See NON_VISIBLE_KEY below for the one class that is not, and issue #266 for
-// what happened when it was counted anyway.
+// See NON_VISIBLE_KEY below and the provider-scoped image bound, and issue #266
+// for what happened when non-text bytes were counted anyway.
 const ESTIMATE_BYTES_PER_TOKEN = 3.3;
 
 // Below this the substitution could not affect compaction anyway, and leaving
@@ -58,12 +60,10 @@ const MIN_ESTIMATED_INPUT_TOKENS = 1_000;
 // the router sends. That is the regime issue #266 was reported from, and 64%
 // of the bytes charged at 3.3 each is where 3.9x-4.7x comes from.
 //
-// Everything else stays counted. JSON escaping (0.2%-3%) and structural
+// Other text stays counted. JSON escaping (0.2%-3%) and structural
 // scaffolding (1%-5%) are small and keep the estimate erring high, which is the
-// direction that matters. Base64 image data is far larger than the tokens an
-// image really costs, but what it really costs is a per-provider tiling formula
-// the router has no business inventing, so it too stays counted at the byte
-// rate -- wrong, but wrong upward.
+// direction that matters. Images use a separate token bound only when the
+// provider documents one; otherwise their bytes remain counted at this rate.
 //
 // Subtracting what is provably invisible rather than summing what is visible is
 // the point. An unrecognized field is counted by default, so a body shape
@@ -159,6 +159,17 @@ export function normalizeTokenUsage(value) {
       value.prompt_tokens_details?.cached_tokens ??
       value.prompt_cache_hit_tokens,
   );
+  // Reasoning tokens are the silent thinking tokens generated before visible
+  // output. Providers report them in output_tokens_details.reasoning_tokens,
+  // completion_tokens_details.reasoning_tokens, or reasoning_tokens directly.
+  // A missing or non-numeric value stays absent; only an actual number 0 is a
+  // measured zero. `tokenCount(null)` would otherwise coerce null to 0.
+  const reasoningRaw =
+    value.output_tokens_details?.reasoning_tokens ??
+    value.completion_tokens_details?.reasoning_tokens ??
+    value.reasoning_tokens;
+  const reasoningTokens =
+    typeof reasoningRaw === "number" ? tokenCount(reasoningRaw) : undefined;
   const retries = tokenCount(value.retries);
   const progressOnlyRetried =
     value.progress_only_retried === true || value.progressOnlyRetried === true;
@@ -173,6 +184,7 @@ export function normalizeTokenUsage(value) {
     outputTokens: outputTokens || 0,
     totalTokens,
     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     ...(retries !== undefined && retries > 0 ? { retries } : {}),
     ...(progressOnlyRetried ? { progressOnlyRetried: true } : {}),
     ...(billedInputTokens !== undefined ? { billedInputTokens } : {}),
@@ -184,12 +196,22 @@ export function normalizeTokenUsage(value) {
 // send twice cost twice; the meter has to say so, or the retry marker names a
 // turn whose reported spend still looks like one attempt.
 export function mergeTokenUsage(first, second) {
-  if (!first) return second;
-  if (!second) return first;
+  if (!first || !second) {
+    // Only one attempt reported usage, but the turn was still sent twice, so
+    // that attempt's service tier cannot label the pair.
+    const only = first || second;
+    if (!only) return only;
+    const { serviceTier: _serviceTier, serviceTierUnknown: _serviceTierUnknown, ...rest } = only;
+    return rest;
+  }
   const cachedInputTokens =
     first.cachedInputTokens === undefined && second.cachedInputTokens === undefined
       ? undefined
       : (first.cachedInputTokens || 0) + (second.cachedInputTokens || 0);
+  const reasoningTokens =
+    first.reasoningTokens === undefined && second.reasoningTokens === undefined
+      ? undefined
+      : (first.reasoningTokens || 0) + (second.reasoningTokens || 0);
   const retries =
     first.retries === undefined && second.retries === undefined
       ? undefined
@@ -199,16 +221,24 @@ export function mergeTokenUsage(first, second) {
     outputTokens: (first.outputTokens || 0) + (second.outputTokens || 0),
     totalTokens: (first.totalTokens || 0) + (second.totalTokens || 0),
     ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     ...(retries !== undefined && retries > 0 ? { retries } : {}),
   };
 }
 
-export function tokenUsageFromPayload(payload) {
+export function tokenUsageFromPayload(payload, { grokServiceTier = false } = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  // Forwarder-origin metadata survives the locked LiteLLM Responses bridge;
+  // a request's service_tier is never an authoritative response measurement.
+  const reported = grokServiceTier ? (payload.response || payload)?.provider_specific_fields?.grok_service_tier : undefined;
+  const tier = knownServiceTier(reported);
+  const tierMetadata = tier ? { serviceTier: tier }
+    : reported === "unknown" ? { serviceTierUnknown: true } : {};
   for (const candidate of [payload.usage, payload.response?.usage]) {
     const usage = normalizeTokenUsage(candidate);
-    if (usage) return usage;
+    if (usage) return { ...usage, ...tierMetadata };
   }
+  if (Object.keys(tierMetadata).length) return tierMetadata;
   return undefined;
 }
 
@@ -220,14 +250,16 @@ export function tokenUsageFromPayload(payload) {
 // Returns undefined when the request is too small for the estimate to matter,
 // which is also what keeps it away from genuinely small turns.
 //
-// The bytes counted are the body minus its `encrypted_content` ciphertext.
+// The bytes counted are the body minus its `encrypted_content` ciphertext and,
+// when configured, actual image references plus a documented per-image bound.
 // Anything that is not JSON -- a compressed frame, an opaque buffer, a plain
 // string -- simply finds no key to discount and is counted whole, exactly as
 // before.
-export function estimateInputTokens(body, { contextWindow } = {}) {
+export function estimateInputTokens(body, { contextWindow, maxTokensPerImage } = {}) {
   const buffer = Buffer.isBuffer(body) ? body : Buffer.from(String(body ?? ""), "utf8");
-  const bytes = buffer.byteLength - nonVisibleBytes(buffer);
-  const estimate = Math.ceil(bytes / ESTIMATE_BYTES_PER_TOKEN);
+  const images = promptImageUsage(buffer, maxTokensPerImage);
+  const bytes = buffer.byteLength - nonVisibleBytes(buffer) - images.bytes;
+  const estimate = Math.ceil(bytes / ESTIMATE_BYTES_PER_TOKEN) + images.tokens;
   if (estimate < MIN_ESTIMATED_INPUT_TOKENS) return undefined;
   // A request the provider answered cannot have exceeded the window, so the
   // estimate is never allowed to claim it did.
@@ -240,15 +272,15 @@ export function estimateInputTokens(body, { contextWindow } = {}) {
   // every one of those turns compacted for nothing. That was the bug: not the
   // clamp, but what was allowed to reach it.
   //
-  // Counting only model-visible bytes puts a floor under it. For the estimate
-  // to exceed the window the visible text must exceed `contextWindow * 3.3`
+  // For text-only requests, counting only model-visible bytes puts a floor
+  // under it. To exceed the window the visible text must exceed `contextWindow * 3.3`
   // bytes, and real text tokenizes between 3.3 (code) and 4.0 (prose) bytes per
   // token -- so a clamped estimate means the true count is between 82.5% and
   // 100% of the window. `autoCompact` sits at 85%. Compacting there is correct:
   // the conversation really is against the limit, and the alternative, reporting
   // something below the threshold, would skip the compaction and hand the next
   // turn to the provider to reject. Erring high costs a summary; erring low
-  // costs the turn.
+  // costs the turn. Vision requests add the provider's per-image upper bound.
   return Number.isInteger(contextWindow) && contextWindow > 0
     ? Math.min(estimate, contextWindow)
     : estimate;
@@ -300,6 +332,10 @@ export function substituteZeroInputUsage(payload, estimate) {
 
 const LINE_FEED = 0x0a;
 
+function nonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
 export class ResponseUsageTransform extends Transform {
   #eventStream;
   #decoder = new StringDecoder("utf8");
@@ -320,13 +356,24 @@ export class ResponseUsageTransform extends Transform {
   // first token appears, and counting that silence as generation is what makes
   // a fast model read as slow. See #192.
   #firstTokenAt;
+  // Whether the stream carried reasoning deltas (summary or raw text). When it
+  // did, the reasoning tokens were generated after the first token and belong
+  // in the tokens-per-second numerator; when it did not, the provider thought
+  // in silence before the first visible token and those tokens belong to
+  // time-to-first-token instead. The aggregator picks the numerator from this.
+  #reasoningStreamed = false;
+  #onEvent;
+  #grokServiceTier;
   #completedResponseObserved = false;
+  #terminalErrorObserved = false;
 
   // `estimatedInputTokens` arrives only on routed requests large enough that a
   // reported zero cannot be true. Without it this transform observes and
   // forwards the response byte for byte, exactly as it always did.
-  constructor(contentType = "", { estimatedInputTokens } = {}) {
+  constructor(contentType = "", { estimatedInputTokens, onEvent, grokServiceTier = false } = {}) {
     super();
+    this.#onEvent = typeof onEvent === "function" ? onEvent : undefined;
+    this.#grokServiceTier = grokServiceTier === true;
     const declared = String(contentType).toLowerCase();
     this.#eventStream = declared.includes("text/event-stream");
     // The ChatGPT backend answers /responses with an SSE body and no
@@ -511,6 +558,7 @@ export class ResponseUsageTransform extends Transform {
     if (!data || data === "[DONE]") return undefined;
     try {
       const payload = JSON.parse(data);
+      if (payload?.type === "error") this.#terminalErrorObserved = true;
       this.#observe(payload);
       return payload;
     } catch {
@@ -520,29 +568,45 @@ export class ResponseUsageTransform extends Transform {
   }
 
   #observe(payload) {
+    // Diagnostics must not change parsing, metering, or the relayed bytes.
+    try { this.#onEvent?.(payload); } catch { /* Observer failure is non-fatal. */ }
     this.#noteFirstToken(payload);
     if (payload?.type === "response.completed") this.#completedResponseObserved = true;
-    const usage = tokenUsageFromPayload(payload);
-    if (usage) this.#usage = usage;
+    const usage = tokenUsageFromPayload(payload, { grokServiceTier: this.#grokServiceTier });
+    if (usage) {
+      // A tier-only terminal event must not erase earlier measured counters.
+      this.#usage = usage.inputTokens === undefined
+        ? { ...this.#usage, serviceTier: usage.serviceTier, serviceTierUnknown: usage.serviceTierUnknown }
+        : usage;
+    }
   }
 
-  // The first event that carries visible generated text. Reasoning summaries
-  // and tool-call argument deltas are output the model is producing, so they
-  // count too -- what must not count is the wait before any of it starts.
+  // The first event that carries generated output of any kind. Reasoning
+  // deltas, visible text, and tool-call arguments all count -- what must not
+  // count is the wait before any of it starts. Reasoning is also remembered on
+  // its own, at any point in the stream, because the tokens-per-second
+  // numerator has to include reasoning exactly when its generation time sits
+  // inside the measured window (see aggregateProviderUsage).
   #noteFirstToken(payload) {
-    if (this.#firstTokenAt !== undefined) return;
-    const type = payload?.type;
-    if (typeof type !== "string") return;
-    const producesOutput =
-      type === "response.output_text.delta" ||
+    // Chat-completions bridges stream choices[].delta instead of typed events;
+    // chat.completion.chunk often has no `type` field, so check the delta
+    // shape independently of the type.
+    const chatDelta = payload?.choices?.[0]?.delta;
+    const type = typeof payload?.type === "string" ? payload.type : undefined;
+    const reasoningDelta =
+      nonEmptyString(chatDelta?.reasoning_content) ||
+      nonEmptyString(chatDelta?.reasoning) ||
       type === "response.reasoning_summary_text.delta" ||
+      type === "response.reasoning_text.delta";
+    if (reasoningDelta) this.#reasoningStreamed = true;
+    if (this.#firstTokenAt !== undefined) return;
+    const visibleDelta =
+      nonEmptyString(chatDelta?.content) ||
+      (Array.isArray(chatDelta?.tool_calls) && chatDelta.tool_calls.length > 0) ||
+      type === "response.output_text.delta" ||
       type === "response.function_call_arguments.delta" ||
       type === "response.audio_transcript.delta";
-    // Chat-completions bridges stream choices[].delta instead of typed events.
-    const chatDelta = payload?.choices?.[0]?.delta;
-    const chatProducesOutput =
-      typeof chatDelta?.content === "string" && chatDelta.content.length > 0;
-    if (producesOutput || chatProducesOutput) this.#firstTokenAt = Date.now();
+    if (reasoningDelta || visibleDelta) this.#firstTokenAt = Date.now();
   }
 
   // Epoch milliseconds of the first generated token, or undefined when the
@@ -551,7 +615,17 @@ export class ResponseUsageTransform extends Transform {
     return this.#firstTokenAt;
   }
 
+  // True when at least one reasoning delta was relayed, so the reasoning
+  // tokens in the final usage were generated inside the timed window.
+  reasoningStreamed() {
+    return this.#reasoningStreamed;
+  }
+
   completedResponseObserved() {
     return this.#completedResponseObserved;
+  }
+
+  terminalErrorObserved() {
+    return this.#terminalErrorObserved;
   }
 }

@@ -1,11 +1,12 @@
 #!/bin/sh
 set -eu
 
-# Rebuild the macOS icon set from apps/macos/ModelRouterTray/Resources/AppIcon.svg.
+# Rebuild every desktop icon from
+# apps/macos/ModelRouterTray/Resources/AppIcon.svg.
 #
-# The .icns it produces is committed, so a normal tray build never runs this
+# The generated assets are committed, so a normal tray build never runs this
 # script and never needs a rasterizer. Run it only after editing the SVG, and
-# commit the regenerated .icns alongside it.
+# commit the regenerated native and Control Center icons alongside it.
 #
 # `sips` is the rasterizer because it is part of macOS: adding librsvg or
 # ImageMagick would make the icon unbuildable on a clean machine for the sake
@@ -16,6 +17,7 @@ set -eu
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 source_svg="$repo_dir/apps/macos/ModelRouterTray/Resources/AppIcon.svg"
 output_icns=${1:-"$repo_dir/apps/macos/ModelRouterTray/Resources/AppIcon.icns"}
+control_center_assets="$repo_dir/apps/control-center/assets"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   printf 'codex-router: the icon set is built with macOS sips/iconutil.\n' >&2
@@ -46,6 +48,17 @@ render() {
   fi
 }
 
+render_to() {
+  size=$1
+  destination=$2
+  sips -s format png -z "$size" "$size" "$source_svg" \
+    --out "$destination" >/dev/null 2>&1 || true
+  if [ ! -s "$destination" ]; then
+    printf 'codex-router: sips could not rasterize %s at %spx.\n' "$source_svg" "$size" >&2
+    exit 1
+  fi
+}
+
 # The exact face list iconutil expects. A missing face is not an error to
 # iconutil -- it just ships an icon that degrades to a blurry upscale in
 # whichever view wanted that size.
@@ -63,4 +76,28 @@ render 1024 icon_512x512@2x.png
 mkdir -p "$(dirname "$output_icns")"
 iconutil --convert icns --output "$output_icns" "$iconset"
 
+mkdir -p "$control_center_assets"
+render_to 32 "$control_center_assets/32x32.png"
+render_to 128 "$control_center_assets/128x128.png"
+render_to 256 "$control_center_assets/128x128@2x.png"
+render_to 512 "$control_center_assets/icon.png"
+
+ico_dir="$work_dir/ControlCenter.iconset"
+mkdir -p "$ico_dir"
+for size in 16 24 32 48 64 256; do
+  face="$ico_dir/icon_${size}.png"
+  render_to "$size" "$face"
+done
+# PNG payloads inside ICO keep their alpha channel and let Windows select the
+# native face instead of repeatedly scaling one large bitmap.
+node "$repo_dir/scripts/build-ico.mjs" "$control_center_assets/icon.ico" \
+  "$ico_dir/icon_16.png" \
+  "$ico_dir/icon_24.png" \
+  "$ico_dir/icon_32.png" \
+  "$ico_dir/icon_48.png" \
+  "$ico_dir/icon_64.png" \
+  "$ico_dir/icon_256.png"
+
 printf '%s\n' "$output_icns"
+printf '%s\n' "$control_center_assets/icon.png"
+printf '%s\n' "$control_center_assets/icon.ico"

@@ -6,14 +6,16 @@
       "gatewayModel": "opencode-go-muse-spark-1-2-contributor-legacy",
       "upstreamModel": "muse-spark-1.2-contributor",
       "provider": "opencode-go",
-      "listed": false
+      "listed": false,
+      "toolSchemaRecursion": "flatten"
     },
     {
       "slug": "opencode-go/muse-spark-1.3-contributor",
       "gatewayModel": "opencode-go-muse-spark-1-3-contributor-legacy",
       "upstreamModel": "muse-spark-1.3-contributor",
       "provider": "opencode-go",
-      "listed": false
+      "listed": false,
+      "toolSchemaRecursion": "flatten"
     }
   ]
 }

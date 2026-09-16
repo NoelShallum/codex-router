@@ -235,6 +235,7 @@ async function startBridgedRouter(upstreams, { enabled = true, engine = "local" 
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstreams.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
   });
   await waitFor(`${routerBase(routerPort)}/models`, child);
@@ -743,6 +744,7 @@ test("an unreachable local engine degrades with the transport's own wording", as
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${upstreams.port}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${upstreams.port}/health`,
   });
 

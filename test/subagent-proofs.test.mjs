@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 // Point the proofs file and the user-model overlay at empty temp state before
 // the modules read their paths, the same isolation the registry tests use.
 const stateDir = mkdtempSync(path.join(os.tmpdir(), "subagent-proofs-test-"));
 process.env.MODEL_ROUTER_SUBAGENT_PROOFS = path.join(stateDir, "multi-agent-proofs.json");
 process.env.MODEL_ROUTER_USER_MODELS = path.join(stateDir, "user-models.json");
+after(() => rmSync(stateDir, { recursive: true, force: true }));
 
 const {
   applySubagentProofs,
@@ -27,17 +28,17 @@ const { subagentVerificationCandidates, verifySubagentCandidates } = await impor
   "../src/subagent-verify.mjs"
 );
 
-test("a proof walks checking -> experimental -> proven, and failures carry reasons", () => {
+test("a compatibility check walks checking -> candidate, while only legacy records retain proven", () => {
   const slug = "example/alpha";
   assert.equal(recordProbeStarted(slug).status, "checking");
   assert.equal(awaitingSpawnProof(slug), false);
 
-  const experimental = recordProbeResult(slug, {
+  const candidate = recordProbeResult(slug, {
     ok: true,
     checks: [{ name: "tool calling", ok: true }],
   });
-  assert.equal(experimental.status, "experimental");
-  assert.equal(awaitingSpawnProof(slug), true);
+  assert.equal(candidate.status, "candidate");
+  assert.equal(awaitingSpawnProof(slug), false);
 
   const proven = recordSpawnObserved(slug, { status: 200 });
   assert.equal(proven.status, "proven");
@@ -59,34 +60,30 @@ test("a proof walks checking -> experimental -> proven, and failures carry reaso
   assert.equal(subagentProofSnapshot()["example/gamma"], undefined);
 });
 
-// Issue #257(b): `proven` was terminal, so the oldest observation on the wire
-// beat every later one. Promotion is still a one-time event, but the window in
-// which evidence can be *taken away* stays open for as long as this machine's
-// traffic is what the v2 advertisement rests on.
-test("a proven slug stays revocable while an unproven or settled one is untouchable", () => {
+test("a candidate never supplies a locally revocable v2 claim", () => {
   const slug = "example/revocable";
   recordProbeResult(slug, { ok: true, checks: [] });
-  assert.equal(spawnProofRevocable(slug), true, "the experimental window is revocable");
+  assert.equal(spawnProofRevocable(slug), false);
 
   recordSpawnObserved(slug, { status: 200 });
-  assert.equal(awaitingSpawnProof(slug), false, "a first clean turn is only news once");
-  assert.equal(spawnProofRevocable(slug), true, "promotion must not close the demotion path");
+  assert.equal(awaitingSpawnProof(slug), false);
+  assert.equal(spawnProofRevocable(slug), false);
 
-  // The counts that condemned it travel with the record, so `control subagents
+  // The counts that rejected it travel with the record, so `control subagents
   // status` and the tray can say how much of a spawn it took.
-  const demoted = recordSpawnFailure(slug, {
+  const rejected = recordSpawnFailure(slug, {
     status: 200,
     reason: "one child spawn ran 6 turns without converging",
     turns: 6,
     newInputTokens: 2_100,
   });
-  assert.equal(demoted.status, "failed");
-  assert.equal(demoted.spawn.turns, 6);
-  assert.equal(demoted.spawn.newInputTokens, 2_100);
+  assert.equal(rejected.status, "failed");
+  assert.equal(rejected.spawn.turns, 6);
+  assert.equal(rejected.spawn.newInputTokens, 2_100);
   assert.equal(
     spawnProofRevocable(slug),
     false,
-    "a slug already demoted has nothing left for traffic to take",
+    "a local record has nothing to take from a repository v2 claim",
   );
 
   // Nothing local to revoke: a checking slug is not advertised yet, and a
@@ -111,7 +108,7 @@ test("a proofs file that cannot be read promotes nothing", () => {
   assert.deepEqual(readSubagentProofs(invented).proofs, {});
 });
 
-test("proof promotion respects demotions and never touches registry claims", () => {
+test("local proof records never promote or demote repository claims", () => {
   const models = [
     { slug: "vendor/experimental" },
     { slug: "vendor/proven" },
@@ -119,6 +116,7 @@ test("proof promotion respects demotions and never touches registry claims", () 
     { slug: "vendor/checking" },
     { slug: "vendor/hidden" },
     { slug: "vendor/disabled" },
+    { slug: "vendor/reviewed-v1", multiAgentVersion: "v1" },
     { slug: "vendor/registry", multiAgentVersion: "v2" },
   ];
   const proofs = {
@@ -134,33 +132,30 @@ test("proof promotion respects demotions and never touches registry claims", () 
     disabled: ["vendor/disabled"],
   });
   const bySlug = new Map(promoted.map((model) => [model.slug, model.multiAgentVersion]));
-  assert.equal(bySlug.get("vendor/experimental"), "v2");
-  assert.equal(bySlug.get("vendor/proven"), "v2");
+  assert.equal(bySlug.get("vendor/experimental"), undefined);
+  assert.equal(bySlug.get("vendor/proven"), undefined);
   assert.equal(bySlug.get("vendor/failed"), undefined);
   assert.equal(bySlug.get("vendor/checking"), undefined);
   assert.equal(bySlug.get("vendor/hidden"), undefined);
   assert.equal(bySlug.get("vendor/disabled"), undefined);
+  assert.equal(bySlug.get("vendor/reviewed-v1"), "v1");
   assert.equal(bySlug.get("vendor/registry"), "v2");
   // No proofs at all is a pass-through, not a rewrite.
   assert.equal(applySubagentProofs(models, {}), models);
 });
 
-test("verification skips registry-v2 models, unknown slugs, and settled proofs", () => {
+test("verification skips reviewed v1/v2 models, unknown slugs, and settled candidates", () => {
   recordProbeResult("deepseek/deepseek-v4-pro", { ok: true, checks: [] });
   const candidates = subagentVerificationCandidates([
     "kimi-oauth/k3", // registry v2: shipped with the full native proof
-    "deepseek/deepseek-v4-pro", // already experimental locally
+    "deepseek/deepseek-v4-pro", // already a settled local candidate
     "deepseek/deepseek-v4-flash", // real, unproven: the one that needs research
     "not-a/model", // unknown slugs cannot be probed
     "deepseek/deepseek-v4-flash", // duplicates collapse
   ]);
   assert.deepEqual(candidates, ["deepseek/deepseek-v4-flash"]);
-  // force re-researches a settled slug.
-  assert.ok(
-    subagentVerificationCandidates(["deepseek/deepseek-v4-pro"], { force: true }).includes(
-      "deepseek/deepseek-v4-pro",
-    ),
-  );
+  // force may retry a candidate, but never a reviewed registry v1/v2 verdict.
+  assert.ok(subagentVerificationCandidates(["deepseek/deepseek-v4-pro"], { force: true }).includes("deepseek/deepseek-v4-pro"));
   clearSubagentProof("deepseek/deepseek-v4-pro");
 });
 
@@ -168,8 +163,8 @@ test("verify records the probe's verdict, and a probe crash reads as a failure",
   const passed = await verifySubagentCandidates(["deepseek/deepseek-v4-flash"], {
     probe: async (slug) => ({ ok: true, checks: [{ name: "tool calling", ok: true, slug }] }),
   });
-  assert.equal(passed[0].status, "experimental");
-  assert.equal(subagentProofSnapshot()["deepseek/deepseek-v4-flash"].status, "experimental");
+  assert.equal(passed[0].status, "candidate");
+  assert.equal(subagentProofSnapshot()["deepseek/deepseek-v4-flash"].status, "candidate");
   clearSubagentProof("deepseek/deepseek-v4-flash");
 
   // A probe that never reached the provider proved nothing: it defers and
@@ -262,24 +257,20 @@ test("a plan-entitlement refusal defers every model it gated, condemning none", 
   assert.equal(subagentProofSnapshot()[slug], undefined);
 });
 
-// Issue #257: an operator watched "subagent proven: <slug> completed a live
-// child turn" and read it as the child finishing the work it was delegated.
-// The observer sees one HTTP turn — a child makes one per tool-call round trip
-// and the loop stringing them together is Codex's — so the promotion cannot
-// mean that, and the line it prints has to scope its own claim. Guarded at the
-// source because the wording *is* the fix: nothing else in the process states
-// what `proven` promises to the person reading the router log.
-test("the subagent promotion log line claims the wire role, not a finished task", () => {
+// Historical child traffic remains useful application evidence, but the log
+// must say it is diagnostic rather than implying a local v2 promotion or a
+// finished delegated task.
+test("the legacy child-observation log does not claim local v2 authority", () => {
   const source = readFileSync(new URL("../src/router.mjs", import.meta.url), "utf8");
   const start = source.indexOf("function observeSubagentOutcome");
-  assert.ok(start > 0, "observeSubagentOutcome moved; re-point this guard at the promotion path");
+  assert.ok(start > 0, "observeSubagentOutcome moved; re-point this guard at the observation path");
   // Scoped to the one function, so an unrelated router line cannot satisfy it.
   const body = source.slice(start).split(/\r?\n\}/)[0];
-  assert.match(body, /child role verified/);
-  assert.match(body, /not a claim the child finished its task/);
+  assert.match(body, /legacy subagent evidence observed/);
+  assert.match(body, /remains diagnostic and is not a repository v2 certificate/);
   assert.doesNotMatch(
     body,
-    /subagent proven/,
-    "the promotion line claims more than one observed turn proves",
+    /subagent (?:proven|promoted)/,
+    "the observation line must not claim local registry authority",
   );
 });

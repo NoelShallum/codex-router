@@ -17,12 +17,12 @@
           "description": "Deep reasoning"
         }
       ],
-      "contextWindow": 131072,
-      "autoCompact": 110000,
+      "contextWindow": 1000000,
+      "autoCompact": 850000,
       "inputModalities": [
         "text"
       ],
-      "compHash": "opencode-go-mimo-v2-5-v1"
+      "compHash": "opencode-go-mimo-v2-5-v2"
     }
   ]
 }

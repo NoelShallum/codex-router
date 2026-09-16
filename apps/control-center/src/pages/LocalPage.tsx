@@ -17,6 +17,7 @@ import {
   EmptyState,
   InlineNotice,
   PageHeader,
+  PanelSkeleton,
   SearchField,
   SectionHeading,
   StatStrip,
@@ -24,7 +25,7 @@ import {
 } from "../components";
 import { compactNumber, formatBytesGb } from "../lib";
 import { BrandLogo, brandForLocalModel } from "../provider-branding";
-import type { LocalModel, LocalModelsSnapshot, OperationEvent, RouterControlApi, RouterTarget, VisionEngine } from "../types";
+import type { LocalModel, LocalModelsSnapshot, OperationEvent, RouterControlApi, RouterDataReady, RouterTarget, VisionEngine } from "../types";
 import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 import "./local-harness-context.css";
 
@@ -32,12 +33,13 @@ interface LocalPageProps {
   target?: RouterTarget;
   api?: RouterControlApi;
   refreshing: boolean;
+  dataReady: RouterDataReady;
   operation?: OperationEvent | null;
   onRefresh: () => void;
   runAction: RunAction;
 }
 
-export function LocalPage({ target, api, refreshing, operation, onRefresh, runAction }: LocalPageProps) {
+export function LocalPage({ target, api, refreshing, dataReady, operation, onRefresh, runAction }: LocalPageProps) {
   const [installRef, setInstallRef] = useState("");
   const [forceInstall, setForceInstall] = useState(false);
   const [pendingRemoval, setPendingRemoval] = useState<string | null>(null);
@@ -117,7 +119,24 @@ export function LocalPage({ target, api, refreshing, operation, onRefresh, runAc
   }
 
   if (!target) {
-    return <EmptyState icon={<SearchX size={22} />} title="Local runtime unavailable" body="Start the router or refresh after setup completes." />;
+    return (
+      <div className="local-page">
+        <PageHeader
+          eyebrow="On-device inference"
+          title="Local"
+          description="Run, install, measure, and expose Ollama and curated MLX models without leaving the control center."
+          onRefresh={onRefresh}
+          refreshing={refreshing}
+        />
+        {!dataReady.snapshot ? (
+          <section className="panel-section" aria-label="Loading local models" aria-busy="true">
+            <PanelSkeleton label="Loading local model runtime" count={5} />
+          </section>
+        ) : (
+          <EmptyState icon={<SearchX size={22} />} title="Local runtime unavailable" body="Start the router or refresh after setup completes." />
+        )}
+      </div>
+    );
   }
 
   return (
@@ -290,7 +309,7 @@ export function LocalPage({ target, api, refreshing, operation, onRefresh, runAc
                       {family.researchNote ? <p className="lhc-catalog-note">{family.researchNote}</p> : null}
                       <div className="lhc-catalog-model-list">
                         {family.models.map((model) => (
-                          <CatalogModelRow key={model.tag} model={model} onSelect={() => setInstallRef(model.tag)} />
+                          <CatalogModelRow key={model.tag} model={model} allowOversized={forceInstall} onSelect={() => setInstallRef(model.tag)} />
                         ))}
                       </div>
                     </div>
@@ -472,7 +491,7 @@ function familySummary(models: LocalModel[]): string {
   return "no local variant fits";
 }
 
-function CatalogModelRow({ model, onSelect }: { model: LocalModel; onSelect: () => void }) {
+function CatalogModelRow({ model, allowOversized, onSelect }: { model: LocalModel; allowOversized: boolean; onSelect: () => void }) {
   const downloadable = model.downloadable !== false;
   const tooLarge = model.fit === "too-large" || model.diskFit === "too-large";
   const fitLabel = model.downloadable === false
@@ -491,7 +510,7 @@ function CatalogModelRow({ model, onSelect }: { model: LocalModel; onSelect: () 
         <small>{model.tag}{model.sizeGb !== undefined ? ` · ${formatBytesGb(model.sizeGb)}` : ""}{model.context ? ` · ${compactNumber(model.context)} context` : ""}</small>
       </div>
       <Badge tone={tone}>{fitLabel}</Badge>
-      <Button variant="ghost" disabled={!downloadable || tooLarge} onClick={onSelect}>
+      <Button variant="ghost" disabled={!downloadable || (tooLarge && !allowOversized)} onClick={onSelect}>
         <Download aria-hidden size={13} strokeWidth={1.7} /> Select
       </Button>
     </article>

@@ -15,4 +15,8 @@ for (const directory of directories) {
   }
 }
 
+execFileSync(process.execPath, [path.join(root, "scripts", "check-v2-agent-applications.mjs")], {
+  stdio: "inherit",
+});
+
 console.log("syntax checks passed");

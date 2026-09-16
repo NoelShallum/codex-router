@@ -21,6 +21,45 @@ If a recognized older Kimi router is reported:
 
 Neither command prints credential values. Repair refuses unknown router owners.
 
+## New native models (GPT-6 Astra, GPT-7, etc.)
+
+**Uninstall is never required** to see new OpenAI/Codex native models. While its merged catalog is installed, the router conditionally refreshes the signed-in account catalog itself, watches the resulting model fingerprint plus a lightweight fingerprint of the resolved Codex executable, and republishes when either source changes. A failed or unavailable account request leaves the prior cache untouched and falls back to that cache plus the bundled catalog. Discovery-disabled installs make no account request. Drift is checked on startup and periodically while the router stays running.
+
+**Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
+
+Expected flow:
+1. OpenAI releases new native (e.g., GPT-7)
+2. Router observes a changed account catalog, or Codex replaces its bundled/runtime executable
+3. Router detects drift on startup or a periodic check → republishes automatically
+4. Fully quit and reopen Codex → new native appears in picker
+
+No uninstall needed. The router stays installed while merging ALL natives + routed models.
+
+### A new native still does not appear
+
+The account model endpoint gates its list on the Codex **client version**: an
+older client is simply not offered a newly released model. The router asks with
+the version of the Codex CLI it resolves, so a stale `codex` earlier on `PATH`
+than the Codex you actually run will fetch the shorter list.
+
+The router refuses to overwrite Codex's cache with that shorter list and logs:
+
+```
+[codex-router] The resolved Codex CLI is older than the client that wrote the account model cache
+```
+
+Fix it by updating that Codex, or by pointing the router at the right one:
+
+```sh
+CODEX_BIN=/path/to/the/codex/you/run ./bin/refresh-catalog
+```
+
+Check which binary and version the router resolves:
+
+```sh
+./bin/model-router codex doctor
+```
+
 ## State directory belongs to another checkout
 
 If `doctor` reports a state ownership failure, you are running from a clone
@@ -138,6 +177,27 @@ official CLI build that Windows allows, use the API-key provider instead:
 An OAuth session created while the executable was allowed is not a durable
 workaround. The router invokes the official CLI again near token expiry, so the
 session eventually stops refreshing if Windows blocks the executable later.
+
+## Windows reports that process containment is unavailable
+
+Commands that can mutate router state run inside a kill-on-close Windows Job
+Object. The owner is compiled in-memory by Windows PowerShell before the target
+command starts. If the error names `ConstrainedLanguage`, `Add-Type`, AppLocker,
+or WDAC, the local application-control policy does not permit that safety
+boundary. The router fails before launching the mutation; `-ExecutionPolicy
+Bypass` does not and must not override system application control.
+
+Check the effective language mode without exposing credentials:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ExecutionContext.SessionState.LanguageMode'
+```
+
+`FullLanguage` is required. Keep the policy enabled and ask the machine
+administrator to allow the reviewed checkout/helper through the organization's
+normal trusted-script policy, or run the router on a supported host where the
+boundary is permitted. Do not work around the failure by disabling AppLocker,
+WDAC, or antivirus protection.
 
 ## An API key is missing or invalid
 
@@ -308,7 +368,16 @@ emits a status sentence, and never calls a tool. On turns following a user
 message, attempt 1 still streams live; when the client offered tools and the
 short-text/token trigger fires, the forwarder retries once and appends a
 retry tool call onto the same stream. On turns following a tool result, the
-stricter certified-repair path below stages the response before sending it.
+stricter certified-repair path opens the response as soon as xAI returns its
+headers and relays reasoning, but stages the short visible answer until the
+terminal event proves it is safe.
+After a conversation has exhibited that shape once, later user-message turns
+buffer only a short visible prefix up to the same text threshold. Headers and
+preceding reasoning remain live, and a tool call or longer answer releases the
+prefix; if the upstream stream aborts instead, Codex receives the terminal
+stream error without first recording another partial progress sentence. Unaffected
+conversation IDs retain the fully live path, and the evidence set is bounded
+in memory.
 
 The trigger is a shape, not a diagnosis, and it is worth knowing which turns
 pay for it. After a tool result, every no-tool prose response is held and
@@ -324,11 +393,38 @@ is correct." is not talked into a call the client would then run. Raise
 `CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` to fire less often on that
 user-message path; those settings do not weaken the post-tool invariant.
 
+For a quiet worker, run `bin/control activity <thread-id>` from the installed
+checkout (on Windows, `codex-router.ps1 activity <thread-id>` from
+`%LOCALAPPDATA%\codex-router`). The command reads the capability-protected `/v1/activity` endpoint;
+unauthenticated `/health` keeps its existing compact contract. Active requests
+remain visible until their handlers release resources, independently of tray
+record retention. The snapshot includes router-upstream attempt count, raw byte
+timestamps, normalized Responses event timestamps, observed phase, and recent
+outcomes (128 entries, ten minutes, in memory). These observations do not identify raw provider timing or retries inside
+LiteLLM/xAI. Metrics cover the main Responses dispatch/stream; uninstrumented
+subpaths such as compaction/embeddings show `unobserved` and omit attempt count.
+An HTTP 200 envelope with a failed/incomplete response event is still `failed`.
+Untyped Grok gateway error envelopes become a safe terminal `error` event;
+later empty message closes or success markers are discarded.
+No prompt, answer, tool arguments, or credentials are retained.
+An unavailable probe reports `unknown`, not an empty/completed worker. A changed
+instance ID means the router restarted and lost its recent history. A cancellation
+records a client disconnect or an execution deadline; a disconnect cannot identify
+whether the user or a parent agent initiated it. Wait timeouts and quiet streams
+are not authorization to replace a worker. Consult its native task state and
+confirm that the old writer has stopped before starting another.
+
 Both attempts are billed. The usage returned to Codex reports only the
 selected attempt's context size, while the local ledger retains the aggregate
 as billed input/output tokens. The response sets
 `progress_only_retried: true`, and the log line `progress-only-retried=true`
-is never gated on `MODEL_ROUTER_QUIET`. To disable the invariant and see the
+is never gated on `MODEL_ROUTER_QUIET`. That line includes `attempt_*` and
+`repair_*` header, first-event, and total durations plus each request's
+`x-grok-req-id`. A failure while reading either stream emits
+`upstream-phase-failed=true` with the same safe fields. `headers_ms` shows how
+long xAI took to accept the request; `first_event_ms` separates an upstream
+that emitted nothing from output the forwarder deliberately withheld. Prompt
+and response content are never logged. To disable the invariant and see the
 raw first attempt, set `CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY=0`; this kill
 switch is intentionally unsafe for unattended tool loops.
 
@@ -338,17 +434,69 @@ once, so the client sees only one response head, response ID, and sequence space
 A retry that produces content streams normally. A retry that is empty again
 returns an explicit 502 `empty_completion` error, and one that fails upstream
 returns `empty_completion_retry_failed` — a stated failure either way, never a
-silent success. The hold has byte and time limits; if either is reached, the
-router safely relays the original attempt without retrying rather than buffering
-without bound.
+silent success. The hold has byte and time limits. Crossing the byte limit while
+no output has appeared aborts the still-hidden attempt and uses the same single
+retry; crossing it again returns an explicit 502 `precontent_limit` error. The
+time limit releases the prologue so a healthy slow stream stays visible and
+cancellable, but the guard keeps parsing it with the same bounded stall and
+partial-event limits. A headers-only response has nothing safe to release, so
+it reaches the single retry after 30 seconds instead of hanging indefinitely.
+If a released stream then completes without output, the router withholds its
+terminal frames and emits an explicit `precontent_limit` SSE error first,
+instead of accepting an empty success. These stated mid-stream failures retain
+the already-committed HTTP 200 on the wire but are metered internally as 502.
+
+Grok OAuth uses a separate ten-minute stall bound after the prologue has been
+released, including while reasoning is in progress. A pause longer than the
+initial 30-second prologue budget is not by itself an empty completion.
+`CODEX_ROUTER_GROK_STREAM_STALL_MS` accepts a positive millisecond value to
+adjust this bound; invalid values, and values too large for a Node timer, retain
+the ten-minute default. The headers-only budget, parser byte limits,
+cancellation, and prohibition on replaying a visible stream still apply. Other
+provider routes retain their existing stall bound.
+
+Every hop on the Grok path is sized from that bound plus one minute, and never
+below what the hop allowed before: the router's pool to the gateway, the
+gateway's `stream_timeout` for Grok deployments, and the forwarder's pool to
+xAI. Each of them used to end a silent stream first -- the two Undici pools
+after five minutes, with `UND_ERR_BODY_TIMEOUT`. Codex itself abandons a stream
+after five minutes without a data event (`stream_idle_timeout_ms`) and sends the
+turn again, which bills a second attempt; SSE comment keep-alives do not reset
+that timer. While a Grok stream is silent after its `response.created`, the
+router therefore relays a `response.in_progress` event that carries only the
+response's own id, model, and creation time. It is sent only between complete
+events and never after a terminal event. `CODEX_ROUTER_GROK_HEARTBEAT_MS` sets
+the interval (default 60000, at most 240000). Other routes receive no heartbeat.
+The gateway's Grok `stream_timeout` is written into the LiteLLM configuration
+from the environment of whichever process renders it, including a model
+curation run. After changing `CODEX_ROUTER_GROK_STREAM_STALL_MS`, restart the
+service so the router and gateway use the same bound.
+
+A failure the upstream states before any content (`error`, `response.failed`,
+or `response.incomplete`) is released to the client at once and is never
+retried as an empty completion. On the WebSocket edge, if the gateway keeps its
+stream open for more than five seconds after such a failure, the router stops
+waiting so the client's next request is not queued behind it; that turn is then
+recorded as canceled (status 0) rather than with the provider's failure status.
+When the forwarder rejects a failed Grok
+attempt, its `upstream-terminal-failed=true` log line carries any
+provider-reported `input_tokens` and `output_tokens`; the router's usage row for
+that attempt has no token counts.
+
+Operators diagnosing an unusually slow upstream can temporarily change the
+30-second bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS` and the 1 MiB
+parser bound with `CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES`. These are
+safety limits, not performance knobs: raising them also lengthens how long a
+broken provider can occupy a turn and how much pre-content data it may retain.
 
 Retried turns are marked in the state directory's `usage-events.jsonl`:
 `emptyCompletionRetried: true` on every retried turn, plus `emptyCompletion:
-true` when the turn produced nothing in the end. The token counts on those rows
-combine provider-reported usage from both complete, bounded attempts, including
-an incompatible retry body the router rejects. A bodyless, oversized, stalled,
-transport-failed, or usage-free attempt stays unknown rather than becoming an
-invented zero. Count retried turns:
+true` when the turn produced nothing in the end. A limit-triggered retry also
+records `emptyCompletionPreludeLimit` as `bytes` or `time`. The token counts on
+those rows combine provider-reported usage from both complete, bounded attempts,
+including an incompatible retry body the router rejects. A bodyless, oversized,
+stalled, transport-failed, or usage-free attempt stays unknown rather than
+becoming an invented zero. Count retried turns:
 
 ```sh
 grep -c emptyCompletionRetried "$CODEX_HOME/codex-router/usage-events.jsonl"
@@ -451,23 +599,27 @@ Legacy migration rollback is separate:
 
 The generated mode-`600` JSON includes versions, doctor checks, service state,
 provider presence, config ownership, and file metadata. It excludes credential
-values, prompts, responses, and log contents.
+values, prompts, responses, and log contents on every invocation. The legacy
+`--include-logs` option remains accepted for script compatibility, but is a
+deprecated no-op: an old log may contain a credential that was later rotated
+or deleted, so discovering only current values cannot prove a historical tail
+safe. The tool never uploads a bundle automatically.
 
-Only when log context is necessary:
+## Responses WebSocket does not connect
 
-```sh
-./bin/support-bundle --include-logs
-```
+Current Codex Router releases accept the Responses WebSocket v2 upgrade on the
+managed caller-capability URL. A 401 means Codex is using a stale managed URL;
+run `./bin/doctor --fix`, then fully quit and reopen Codex. A 426 carrying the
+supported `OpenAI-Beta: responses_websockets=2026-02-06` hint means Codex will
+fall back to HTTP because the attempted WebSocket contract did not match. The
+WebSocket adapter re-enters the ordinary HTTP Responses route, so provider and
+model failures are reported as normal Responses error events rather than by a
+separate provider path.
 
-The log tail is mechanically redacted but may still contain private prompt or
-response text. Inspect it before uploading or attaching it anywhere. The tool
-never uploads a bundle automatically.
-
-## WebSocket warning followed by HTTP fallback
-
-This is expected. Codex Router declines the optional Responses WebSocket
-upgrade, and current Codex falls back to compressed HTTP. A warning alone is not
-a failed model request.
+`X-Reasoning-Included` is a WebSocket-upgrade response flag in Codex. The
+adapter cannot truthfully add a value learned from its later internal HTTP
+response to an already-completed upgrade, so that one accounting hint is not
+projected as a per-request WebSocket event.
 
 ## Voice Mode reports an unsupported `/v1/live` route
 

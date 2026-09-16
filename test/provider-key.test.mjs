@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -107,6 +107,8 @@ test(
   },
   () => {
     const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-posix-prompt-"));
+    const stateDir = path.join(testRoot, "router state");
+    const cachePath = path.join(stateDir, "provider-catalog-cache.json");
     const secret = "test-value";
     const helper = String.raw`
 import errno
@@ -161,6 +163,26 @@ sys.stdout.buffer.write(output)
 raise SystemExit(os.waitstatus_to_exitcode(status))
 `;
     try {
+      mkdirSync(stateDir, { recursive: true });
+      const identityFingerprint = "a".repeat(64);
+      const catalogEntry = (providerId, discovered) => ({
+        discovered,
+        fetchedAt: new Date().toISOString(),
+        identityFingerprint,
+        provenance: {
+          schema: "codex-router/provider-catalog/v1",
+          providerId,
+          endpoint: `https://${providerId}.example.test/models`,
+          identityFingerprint,
+        },
+      });
+      writeFileSync(cachePath, JSON.stringify({
+        version: 2,
+        providers: {
+          deepseek: catalogEntry("deepseek", ["old-account-model"]),
+          unrelated: catalogEntry("unrelated", ["keep-me"]),
+        },
+      }));
       const result = spawnSync(
         "python3",
         [
@@ -169,7 +191,7 @@ raise SystemExit(os.waitstatus_to_exitcode(status))
           process.execPath,
           path.join(root, "src", "provider-key.mjs"),
           testRoot,
-          path.join(testRoot, "router state"),
+          stateDir,
           secret,
         ],
         {
@@ -185,6 +207,9 @@ raise SystemExit(os.waitstatus_to_exitcode(status))
       assert.match(result.stdout, /Received \d+ characters\./);
       assert.match(result.stdout, /DeepSeek API key saved to protected local storage/);
       assert.doesNotMatch(result.stdout, new RegExp(secret));
+      const cached = JSON.parse(readFileSync(cachePath, "utf8")).providers;
+      assert.equal(cached.deepseek, undefined);
+      assert.deepEqual(cached.unrelated.discovered, ["keep-me"]);
     } finally {
       rmSync(testRoot, { recursive: true, force: true });
     }
@@ -205,4 +230,17 @@ test("a curated model silences the curation hint", () => {
   // repeating the instruction would just be noise.
   const models = [{ provider: "gemini-api", slug: "gemini-api/curated" }];
   assert.equal(providerNeedsCuration("gemini-api", models), false);
+});
+
+test("the OpenCode Free Responses sibling does not widen paid curation sets", () => {
+  const models = [
+    { provider: "opencode-free-responses", slug: "opencode-free-responses/muse" },
+    { provider: "opencode-go", slug: "opencode-go/kimi-k3" },
+  ];
+  assert.equal(providerNeedsCuration("opencode-free", models), false);
+  assert.equal(providerNeedsCuration("opencode-free-responses", models), false);
+  assert.equal(providerNeedsCuration("opencode-zen", models), true);
+  // Checked-in Go models remain their own exact set and do not populate paid
+  // Zen curation just because those providers share a selection credential.
+  assert.equal(providerNeedsCuration("opencode-go", models), false);
 });

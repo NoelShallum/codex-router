@@ -84,8 +84,28 @@ test("tray refresh is required when the checkout dist bundle exists", () => {
   }
 });
 
-test("tray refresh is required when setup installed the home app bundle", () => {
+test("tray refresh is required when setup installed the canonical home app bundle", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-home-"));
+  try {
+    mkdirSync(path.join(root, "home", "Applications", "Codex Router.app"), {
+      recursive: true,
+    });
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: "",
+      }),
+      true,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tray refresh is required when only the legacy home app bundle exists", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-legacy-home-"));
   try {
     mkdirSync(path.join(root, "home", "Applications", "Model Router.app"), {
       recursive: true,
@@ -107,7 +127,7 @@ test("tray refresh is required when setup installed the home app bundle", () => 
 test("tray refresh is required when only a registered bundle path exists", () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-registered-"));
   try {
-    const registered = path.join(root, "Model Router.app");
+    const registered = path.join(root, "Codex Router.app");
     mkdirSync(registered, { recursive: true });
     assert.equal(
       trayRefreshRequired({
@@ -134,6 +154,38 @@ test("tray refresh is skipped when no tray bundle exists", () => {
         registeredPath: "",
       }),
       false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tray refresh preserves an explicit macOS supervision disable", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "tray-refresh-disabled-"));
+  try {
+    mkdirSync(path.join(root, "home", "Applications", "Codex Router.app"), {
+      recursive: true,
+    });
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: path.join(root, "home", "Applications", "Codex Router.app"),
+        supervisionPreference: { state: "disabled", enabled: false },
+      }),
+      false,
+    );
+    assert.equal(
+      trayRefreshRequired({
+        platform: "darwin",
+        home: path.join(root, "home"),
+        sourceRoot: path.join(root, "router"),
+        registeredPath: path.join(root, "home", "Applications", "Codex Router.app"),
+        supervisionPreference: { state: "invalid", enabled: null },
+      }),
+      false,
+      "a damaged marker must fail closed instead of resurrecting the tray",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -15,6 +15,8 @@ import { environmentProxyOptedIn } from "./proxy-environment.mjs";
 
 const MAX_CAUSE_DEPTH = 8;
 
+export const PROVIDER_TRANSPORT_ERROR_TYPE = "provider_transport_error";
+
 // `hostname` is set by Node's DNS and TLS errors but not by Undici's connect
 // errors, which name the address in their message instead. Read the field
 // first and fall back to the wordings actually observed in this router's log.
@@ -137,4 +139,26 @@ export function describeTransportFailure(
     cause: diagnosis.describe(host),
     hint: hintFor(host, diagnosis, proxyConfigured),
   };
+}
+
+// The provider forwarder is separated from the router by LiteLLM, so a thrown
+// socket error has to cross that HTTP boundary as data before the router can
+// make a pre-response failover decision. Keep the marker machine-readable and
+// omit the host and error text: custom endpoints and upstream bodies do not
+// belong in an intermediary response.
+export function providerTransportError(error) {
+  const failure = describeTransportFailure(error);
+  if (!failure) return undefined;
+  return {
+    type: PROVIDER_TRANSPORT_ERROR_TYPE,
+    code: failure.code,
+    message: "The provider connection failed before a response was available.",
+  };
+}
+
+// LiteLLM may wrap the forwarder's JSON inside its own error envelope. The
+// stable type string survives either representation, whereas parsing only the
+// outer object would miss the wrapped form.
+export function hasProviderTransportError(bodyText) {
+  return typeof bodyText === "string" && bodyText.includes(PROVIDER_TRANSPORT_ERROR_TYPE);
 }

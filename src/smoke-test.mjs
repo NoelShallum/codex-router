@@ -7,6 +7,7 @@ import {
   callerBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
+import { EXACT_ROUTE_PROBE_HEADER } from "./exact-route-probe.mjs";
 import { selectedListedModels } from "./provider-selection.mjs";
 import { CALLER_SECRET_PATH, PORTS } from "./paths.mjs";
 
@@ -41,6 +42,7 @@ export async function smokeTestModel(model, options = {}) {
     headers: {
       Authorization: "Bearer codex-router-local-smoke-test",
       "Content-Type": "application/json",
+      [EXACT_ROUTE_PROBE_HEADER]: "1",
     },
     body: JSON.stringify({
       model,

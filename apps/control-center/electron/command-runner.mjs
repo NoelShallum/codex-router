@@ -3,8 +3,11 @@ import {
   accessSync,
   constants as fsConstants,
   existsSync,
+  mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import os from "node:os";
@@ -13,19 +16,226 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_TIMEOUT_MS = 30_000;
-const MAX_TIMEOUT_MS = 11 * 60_000;
+// A restart-bearing overlay transaction owns two 640-second publication
+// epochs plus nested process-tree cleanup. Keep a finite ceiling beyond the
+// 1,320-second catalog UI owner instead of truncating it to the old 11 minutes.
+const MAX_TIMEOUT_MS = 22 * 60_000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const SECRET_WORD = /(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|secret|credential)/i;
 const APP_CONTRACT_LIMIT = 1024 * 1024;
 const WINDOWS_EXECUTABLE_EXTENSIONS = [".exe", ".com", ".cmd", ".bat"];
+const TREE_EXIT_WAIT_MS = 5_000;
+const OWNER_SIGNAL_CLEANUP_MS = 10_000;
+const OWNER_SIGNAL_LEVEL_RESERVE_MS = 500;
+const OWNER_SIGNAL_GROUP_EXIT_WAIT_MS = 250;
+const OWNER_SIGNAL_CLOSE_WAIT_MS = 200;
+const OWNER_SIGNAL_BUDGET_ENV = "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS";
+const OWNER_SIGNAL_BARRIER_DIR_ENV = "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR";
+const OWNER_SIGNAL_BARRIER_PREFIX = "barrier-";
+const MAX_OWNER_SIGNAL_BARRIER_MS = 11 * 60_000;
+const MAX_OWNER_SIGNAL_BARRIER_FILE_BYTES = 1_024;
+const OWNER_SIGNALS = ["SIGINT", "SIGTERM"];
 
-function pathEntries(environment, platform = process.platform) {
+const ownedCommandTrees = new Map();
+const ownerSignalHandlers = new Map();
+let ownerSignalInProgress;
+
+function ownerSignalError(signal) {
+  return Object.assign(new Error(`The Control Center command owner received ${signal}.`), {
+    code: "router_operation_interrupted",
+    signal,
+  });
+}
+
+function signalExitCode(signal) {
+  return signal === "SIGINT" ? 130 : 143;
+}
+
+function removeOwnerSignalHandlers() {
+  for (const [signal, handler] of ownerSignalHandlers) process.removeListener(signal, handler);
+  ownerSignalHandlers.clear();
+}
+
+function ownerSignalBudget(environment = process.env) {
+  const configured = Number(environment?.[OWNER_SIGNAL_BUDGET_ENV]);
+  return Number.isSafeInteger(configured)
+    && configured >= OWNER_SIGNAL_LEVEL_RESERVE_MS
+    && configured <= OWNER_SIGNAL_CLEANUP_MS
+    ? configured
+    : undefined;
+}
+
+function contractedOwnerSignalBudget(environment = process.env) {
+  const inherited = ownerSignalBudget(environment);
+  if (environment?.[OWNER_SIGNAL_BUDGET_ENV] !== undefined && inherited === undefined) {
+    const error = new Error("The inherited owner-signal cleanup budget is invalid.");
+    error.code = "router_operation_signal_budget_invalid";
+    throw error;
+  }
+  const contracted = (inherited ?? OWNER_SIGNAL_CLEANUP_MS) - OWNER_SIGNAL_LEVEL_RESERVE_MS;
+  if (contracted < OWNER_SIGNAL_LEVEL_RESERVE_MS) {
+    const error = new Error("The nested command tree exhausted its owner-signal cleanup reserve.");
+    error.code = "router_operation_signal_depth_exceeded";
+    throw error;
+  }
+  return contracted;
+}
+
+function processAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    return true;
+  }
+}
+
+function conservativeOwnerSignalBarrier() {
+  return {
+    pid: undefined,
+    timeoutMs: MAX_OWNER_SIGNAL_BARRIER_MS,
+    ownerSignalBudgetMs: OWNER_SIGNAL_LEVEL_RESERVE_MS,
+  };
+}
+
+function activeOwnerSignalBarriers(directory, { ignorePid = process.pid } = {}) {
+  if (!directory) return [];
+  let names;
+  try {
+    names = readdirSync(directory).filter((name) => (
+      name.startsWith(OWNER_SIGNAL_BARRIER_PREFIX) && name.endsWith(".json")
+    ));
+  } catch (error) {
+    return error?.code === "ENOENT" ? [] : [conservativeOwnerSignalBarrier()];
+  }
+  const active = [];
+  for (const name of names) {
+    const file = path.join(directory, name);
+    let lease;
+    try {
+      if (statSync(file).size > MAX_OWNER_SIGNAL_BARRIER_FILE_BYTES) {
+        active.push(conservativeOwnerSignalBarrier());
+        continue;
+      }
+      lease = JSON.parse(readFileSync(file, "utf8"));
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      active.push(conservativeOwnerSignalBarrier());
+      continue;
+    }
+    if (
+      lease?.version !== 1
+      || !Number.isSafeInteger(lease.pid)
+      || lease.pid <= 0
+      || !Number.isSafeInteger(lease.timeoutMs)
+      || lease.timeoutMs <= 0
+      || lease.timeoutMs > MAX_OWNER_SIGNAL_BARRIER_MS
+      || !Number.isSafeInteger(lease.ownerSignalBudgetMs)
+      || lease.ownerSignalBudgetMs < OWNER_SIGNAL_LEVEL_RESERVE_MS
+      || lease.ownerSignalBudgetMs > OWNER_SIGNAL_CLEANUP_MS
+    ) {
+      active.push(conservativeOwnerSignalBarrier());
+      continue;
+    }
+    if (lease.pid === ignorePid || !processAlive(lease.pid)) continue;
+    active.push(lease);
+  }
+  return active;
+}
+
+function ownerSignalBarrierWaits(
+  directory,
+  {
+    ignorePid = process.pid,
+    ownBudgetMs = ownerSignalBudget(process.env) ?? OWNER_SIGNAL_CLEANUP_MS,
+  } = {},
+) {
+  let graceMs = 0;
+  let shutdownMs = 0;
+  for (const barrier of activeOwnerSignalBarriers(directory, { ignorePid })) {
+    const ancestorReserveMs = Math.max(0, ownBudgetMs - barrier.ownerSignalBudgetMs);
+    graceMs = Math.max(
+      graceMs,
+      barrier.timeoutMs + ancestorReserveMs,
+    );
+    shutdownMs = Math.max(
+      shutdownMs,
+      barrier.timeoutMs + ancestorReserveMs + OWNER_SIGNAL_LEVEL_RESERVE_MS,
+    );
+  }
+  return { graceMs, shutdownMs };
+}
+
+function createOwnerSignalCoordinator() {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-owner-signal-"));
+  let released = false;
+  return {
+    directory,
+    release: () => {
+      if (released) return;
+      released = true;
+      try {
+        rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Completion is already proven by the process-tree boundary. Do not
+        // hang the IPC promise on best-effort temporary-directory cleanup.
+      }
+    },
+  };
+}
+
+async function forwardOwnerSignal(signal) {
+  if (ownerSignalInProgress) return;
+  ownerSignalInProgress = signal;
+  const exitCode = signalExitCode(signal);
+  const trees = [...ownedCommandTrees.values()];
+  const remoteBarrierBudget = trees.reduce((maximum, tree) => Math.max(
+    maximum,
+    ownerSignalBarrierWaits(tree.barrierDirectory).shutdownMs,
+  ), 0);
+  const forcedExit = setTimeout(
+    () => process.exit(exitCode),
+    Math.max(
+      ownerSignalBudget(process.env) ?? OWNER_SIGNAL_CLEANUP_MS,
+      remoteBarrierBudget,
+    ),
+  );
+  await Promise.allSettled(trees.map((tree) => tree.cleanup(signal)));
+  clearTimeout(forcedExit);
+  removeOwnerSignalHandlers();
+  process.exit(exitCode);
+}
+
+function registerOwnedCommandTree(cleanup, { barrierDirectory } = {}) {
+  const token = Symbol("owned-command-tree");
+  ownedCommandTrees.set(token, { cleanup, barrierDirectory });
+  if (ownerSignalHandlers.size === 0) {
+    for (const signal of OWNER_SIGNALS) {
+      const handler = () => { void forwardOwnerSignal(signal); };
+      ownerSignalHandlers.set(signal, handler);
+      process.on(signal, handler);
+    }
+  }
+  return () => {
+    ownedCommandTrees.delete(token);
+    if (ownedCommandTrees.size === 0 && !ownerSignalInProgress) removeOwnerSignalHandlers();
+  };
+}
+
+function pathEntries(
+  environment,
+  platform = process.platform,
+  hostExecPath = process.execPath,
+) {
   const home = os.homedir();
   const configuredNode = environment.CODEX_ROUTER_NODE_BIN;
   const candidates = [
     ...(configuredNode && path.isAbsolute(configuredNode) ? [path.dirname(configuredNode)] : []),
     ...String(environment.PATH || "").split(path.delimiter),
-    ...(path.isAbsolute(process.execPath) ? [path.dirname(process.execPath)] : []),
+    ...(path.isAbsolute(hostExecPath) ? [path.dirname(hostExecPath)] : []),
     // GUI applications on macOS and Linux are commonly launched without the
     // login-shell PATH. Keep these explicit locations in the same search set
     // the Control Center uses when reporting an installed runtime.
@@ -69,7 +279,12 @@ function runnableExecutable(candidate, platform = process.platform) {
   }
 }
 
-function discoverExecutable(environment, executable, platform = process.platform) {
+function discoverExecutable(
+  environment,
+  executable,
+  platform = process.platform,
+  hostExecPath = process.execPath,
+) {
   const configured = executable === "node"
     ? runnableExecutable(environment.CODEX_ROUTER_NODE_BIN, platform)
     : undefined;
@@ -77,7 +292,7 @@ function discoverExecutable(environment, executable, platform = process.platform
   const names = platform === "win32" && !path.extname(executable)
     ? WINDOWS_EXECUTABLE_EXTENSIONS.map((extension) => `${executable}${extension}`)
     : [executable];
-  for (const directory of pathEntries(environment, platform)) {
+  for (const directory of pathEntries(environment, platform, hostExecPath)) {
     for (const name of names) {
       const found = runnableExecutable(path.join(directory, name), platform);
       if (found) return found;
@@ -95,9 +310,12 @@ function discoverExecutable(environment, executable, platform = process.platform
  */
 export function runtimeEnvironment(
   environment = process.env,
-  { platform = process.platform } = {},
+  {
+    platform = process.platform,
+    hostExecPath = process.execPath,
+  } = {},
 ) {
-  const node = discoverExecutable(environment, "node", platform);
+  const node = discoverExecutable(environment, "node", platform, hostExecPath);
   if (!node) {
     // Do not hand an invalid explicit path to the installer. It would look
     // deliberate in the generated service definition and fail on every boot.
@@ -105,7 +323,7 @@ export function runtimeEnvironment(
     delete cleaned.CODEX_ROUTER_NODE_BIN;
     return cleaned;
   }
-  const npm = discoverExecutable(environment, "npm", platform);
+  const npm = discoverExecutable(environment, "npm", platform, hostExecPath);
   const runtimeDirectories = [
     path.dirname(node),
     ...(npm ? [path.dirname(npm)] : []),
@@ -126,6 +344,49 @@ export function runtimeEnvironment(
     // is the value the installer trusts before any PATH lookup.
     CODEX_ROUTER_NODE_BIN: node,
   };
+}
+
+function pathIsInside(candidate, directory, platform = process.platform) {
+  const pathApi = platform === "win32" ? path.win32 : path;
+  const relative = pathApi.relative(pathApi.resolve(directory), pathApi.resolve(candidate));
+  return relative === "" || (!relative.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(relative));
+}
+
+// Detached tray maintenance outlives the packaged UI and may replace its
+// directory. On
+// POSIX the mapped Electron executable can be unlinked safely; Windows locks
+// it until every process exits, so running `control tray refresh` through that
+// same executable makes the updater wait on its own package forever. The
+// installer already requires and records a real Node runtime: use that exact
+// external node.exe on Windows, and refuse rather than falling back to the
+// packaged Electron binary.
+export function detachedControlRuntime(
+  environment = process.env,
+  {
+    platform = process.platform,
+    execPath = process.execPath,
+    electron = Boolean(process.versions.electron),
+  } = {},
+) {
+  const childEnvironment = runtimeEnvironment(environment, {
+    platform,
+    hostExecPath: execPath,
+  });
+  if (platform === "win32" && electron) {
+    const executable = discoverExecutable(childEnvironment, "node", platform, execPath);
+    const packageDirectory = path.win32.dirname(execPath);
+    if (
+      !executable
+      || path.win32.basename(executable).toLowerCase() !== "node.exe"
+      || pathIsInside(executable, packageDirectory, platform)
+    ) {
+      throw new Error("A trusted external node.exe is required to refresh the Windows Control Center.");
+    }
+    delete childEnvironment.ELECTRON_RUN_AS_NODE;
+    return { executable, environment: childEnvironment };
+  }
+  if (electron) childEnvironment.ELECTRON_RUN_AS_NODE = "1";
+  return { executable: execPath, environment: childEnvironment };
 }
 
 function validSourceRoot(candidate) {
@@ -213,7 +474,17 @@ function recordedInstallManifest() {
       : typeof rawPackageManager === "string" && /^[a-z0-9][a-z0-9._-]{0,80}$/i.test(rawPackageManager)
         ? rawPackageManager
         : undefined;
-    return { sourceRoot, packageManager };
+    // Only the proxy opt-in is read back, never the addresses: restoring an
+    // address the environment does not name is `inheritedProxyEnvironment`'s
+    // decision to defer, and AGENTS.md says not to widen that trigger here.
+    const recordedProxy = manifest.current?.proxyEnvironment;
+    const proxyOptIn = recordedProxy
+      && typeof recordedProxy === "object"
+      && !Array.isArray(recordedProxy)
+      && recordedProxy.NODE_USE_ENV_PROXY === "1"
+      ? "1"
+      : undefined;
+    return { sourceRoot, packageManager, proxyOptIn };
   } catch {
     return undefined;
   }
@@ -230,6 +501,7 @@ function companionSourceRoots() {
   }
   if (process.platform === "darwin") {
     candidates.push(
+      path.join(os.homedir(), "Applications", "Codex Router.app", "Contents", "Resources", "router-root"),
       path.join(os.homedir(), "Applications", "Model Router.app", "Contents", "Resources", "router-root"),
     );
   }
@@ -327,7 +599,7 @@ export function assertMutationCompatibility(sourceRoot = discoverSourceRoot()) {
   );
 }
 
-function safeFailure(message) {
+export function safeFailure(message) {
   const text = String(message || "Router command failed.")
     .split("\n")
     .filter((line) => !SECRET_WORD.test(line))
@@ -340,13 +612,135 @@ function killChildFallback(child) {
   try { child.kill("SIGKILL"); } catch { /* the process already exited */ }
 }
 
+function windowsPowerShell(environment = process.env) {
+  const systemRoot = environment.SystemRoot || environment.WINDIR;
+  const systemPowerShell = systemRoot
+    ? path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    : undefined;
+  return systemPowerShell && existsSync(systemPowerShell) ? systemPowerShell : "powershell.exe";
+}
+
+export function windowsJobProcessInvocation(
+  command,
+  args,
+  {
+    sourceRoot,
+    environment = process.env,
+    ownerPid = process.pid,
+    windowsHide = true,
+    windowsVerbatimArguments = false,
+  },
+) {
+  const payload = Buffer.from(JSON.stringify({
+    command,
+    arguments: [...args],
+    ownerProcessId: ownerPid,
+    windowsHide: Boolean(windowsHide),
+    windowsVerbatimArguments: Boolean(windowsVerbatimArguments),
+  }), "utf8").toString("base64");
+  return {
+    command: windowsPowerShell(environment),
+    args: [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy", "Bypass",
+      "-File", path.join(sourceRoot, "src", "windows-process-tree.ps1"),
+      payload,
+    ],
+  };
+}
+
+function processGroupAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessGroupExit(pid, timeoutMs) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (processGroupAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
+async function waitForProcessGroupExitWithOwnerSignalBarriers(
+  pid,
+  graceMs,
+  {
+    barrierDirectory,
+    barrierOwnerPid = process.pid,
+    barrierOwnBudgetMs = ownerSignalBudget(process.env) ?? OWNER_SIGNAL_CLEANUP_MS,
+  } = {},
+) {
+  const startedAt = Date.now();
+  const ordinaryDeadline = startedAt + Math.max(0, graceMs);
+  while (processGroupAlive(pid)) {
+    const barrierGraceMs = ownerSignalBarrierWaits(barrierDirectory, {
+      ignorePid: barrierOwnerPid,
+      ownBudgetMs: barrierOwnBudgetMs,
+    }).graceMs;
+    const deadline = Math.max(ordinaryDeadline, startedAt + barrierGraceMs);
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
+function treeCleanupError(pid) {
+  return Object.assign(
+    new Error(`The Control Center could not prove process group ${pid} terminated.`),
+    { code: "router_process_tree_cleanup_failed" },
+  );
+}
+
+async function waitForChildClose(child, timeoutMs = TREE_EXIT_WAIT_MS) {
+  if (
+    child?.exitCode !== null && child?.exitCode !== undefined
+    || child?.signalCode !== null && child?.signalCode !== undefined
+  ) return true;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (closed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener("close", onClose);
+      child.removeListener("error", onClose);
+      resolve(closed);
+    };
+    const onClose = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("close", onClose);
+    child.once("error", onClose);
+  });
+}
+
 /**
  * A control command can spawn installers, service helpers, and other children.
  * Killing only the direct Node process on timeout leaves those descendants
  * mutating the installation after the UI reports failure. Keep the command in
- * its own POSIX process group, and use Windows' supported tree-kill primitive.
+ * its own POSIX process group or a kill-on-close Windows Job Object.
  */
-async function terminateProcessTree(child) {
+export async function terminateProcessTree(
+  child,
+  {
+    initialSignal = "SIGTERM",
+    graceMs = 250,
+    exitWaitMs = TREE_EXIT_WAIT_MS,
+    barrierDirectory,
+    barrierOwnerPid = process.pid,
+    barrierOwnBudgetMs = ownerSignalBudget(process.env) ?? OWNER_SIGNAL_CLEANUP_MS,
+  } = {},
+) {
   if (!child?.pid) {
     killChildFallback(child);
     return;
@@ -382,86 +776,232 @@ async function terminateProcessTree(child) {
         finish(false);
       }
     });
+    if (!(await waitForChildClose(child))) throw treeCleanupError(child.pid);
     return;
   }
 
-  try { process.kill(-child.pid, "SIGTERM"); }
-  catch {
-    try { child.kill("SIGTERM"); } catch { /* the process already exited */ }
+  if (!processGroupAlive(child.pid)) return;
+  try { process.kill(-child.pid, initialSignal); }
+  catch (error) {
+    if (error?.code === "ESRCH") return;
+    throw treeCleanupError(child.pid);
   }
   // Even if the group leader exits promptly, a descendant may ignore TERM.
   // Hold the mutation open through the escalation so app quit cannot cancel it.
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  if (barrierDirectory) {
+    if (await waitForProcessGroupExitWithOwnerSignalBarriers(child.pid, graceMs, {
+      barrierDirectory,
+      barrierOwnerPid,
+      barrierOwnBudgetMs,
+    })) return;
+  } else if (await waitForProcessGroupExit(child.pid, graceMs)) return;
   try { process.kill(-child.pid, "SIGKILL"); }
-  catch { killChildFallback(child); }
+  catch (error) {
+    if (error?.code === "ESRCH") return;
+    throw treeCleanupError(child.pid);
+  }
+  if (!(await waitForProcessGroupExit(child.pid, exitWaitMs))) {
+    throw treeCleanupError(child.pid);
+  }
 }
 
 /**
  * Run one of the fixed router commands. `args` are always an argv array and
  * never pass through a shell. `stdin` is used solely for API credentials.
  */
-function runEntrypoint(entry, args = [], { stdin, timeoutMs = DEFAULT_TIMEOUT_MS, maxOutputBytes = MAX_OUTPUT_BYTES, allowNonZero = false } = {}) {
+function runEntrypoint(entry, args = [], {
+  stdin,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  maxOutputBytes = MAX_OUTPUT_BYTES,
+  allowNonZero = false,
+  environmentOverrides = {},
+} = {}) {
+  if (ownerSignalInProgress) throw ownerSignalError(ownerSignalInProgress);
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
     throw new TypeError("Router command arguments must be strings.");
   }
+  if (
+    !environmentOverrides
+    || typeof environmentOverrides !== "object"
+    || Array.isArray(environmentOverrides)
+    || Object.entries(environmentOverrides).some(([key, value]) => (
+      !/^[A-Z][A-Z0-9_]*$/.test(key)
+      || typeof value !== "string"
+      || value.includes("\0")
+    ))
+  ) throw new TypeError("Router command environment overrides must be string values.");
   const sourceRoot = discoverSourceRoot();
+  const runtimeBaseline = runtimeEnvironment(process.env);
+  // A desktop app starts a fresh ordinary operation epoch. It may have been
+  // launched by a previous repair/update command, so never let that deadline
+  // poison every later click. The owner-signal budget is read separately from
+  // process.env and contracted below when this app really is a nested owner.
+  delete runtimeBaseline.CODEX_ROUTER_OPERATION_DEADLINE_MS;
+  delete runtimeBaseline.CODEX_ROUTER_OPERATION_TIMEOUT_MS;
+  delete runtimeBaseline.CODEX_ROUTER_OPERATION_CHILD;
+  delete runtimeBaseline[OWNER_SIGNAL_BUDGET_ENV];
+  delete runtimeBaseline[OWNER_SIGNAL_BARRIER_DIR_ENV];
   const childEnvironment = {
-    ...runtimeEnvironment(process.env),
+    ...runtimeBaseline,
     MODEL_ROUTER_SOURCE_ROOT: sourceRoot,
     MODEL_ROUTER_TARGET: "codex",
     ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+    ...environmentOverrides,
   };
   const recordedInstall = recordedInstallManifest();
+  // The address and the permission to use it are separate answers, and this
+  // app is launched by the desktop session rather than by the service: it
+  // inherits HTTP_PROXY from the login environment but nothing that says Node
+  // may use it. A router child then dials a proxied host directly and reports
+  // the connect timeout as the provider failing -- which is how a reachable
+  // Venice catalog came back as "fetch failed". The service definition already
+  // resolves this the same way; see serviceProxyEnvironment().
+  if (
+    recordedInstall?.sourceRoot === sourceRoot
+    && recordedInstall.proxyOptIn === "1"
+    && childEnvironment.NODE_USE_ENV_PROXY === undefined
+    && (
+      childEnvironment.HTTP_PROXY ?? childEnvironment.http_proxy
+      ?? childEnvironment.HTTPS_PROXY ?? childEnvironment.https_proxy
+    )
+  ) {
+    childEnvironment.NODE_USE_ENV_PROXY = "1";
+  }
   if (recordedInstall?.sourceRoot === sourceRoot && recordedInstall.packageManager !== undefined) {
     if (recordedInstall.packageManager === null) delete childEnvironment.CODEX_ROUTER_PACKAGE_MANAGER;
     else childEnvironment.CODEX_ROUTER_PACKAGE_MANAGER = recordedInstall.packageManager;
   }
+  const boundedTimeoutMs = Math.max(250, Math.min(timeoutMs, MAX_TIMEOUT_MS));
+  const cleanupMarginMs = Math.min(10_000, Math.max(1, boundedTimeoutMs - 1));
+  const maximumInnerMs = Math.max(1, boundedTimeoutMs - cleanupMarginMs);
+  const requestedInnerMs = Number(childEnvironment.CODEX_ROUTER_OPERATION_TIMEOUT_MS);
+  const innerTimeoutMs = Number.isSafeInteger(requestedInnerMs) && requestedInnerMs > 0
+    ? Math.min(requestedInnerMs, maximumInnerMs)
+    : maximumInnerMs;
+  const requestedDeadline = Number(childEnvironment.CODEX_ROUTER_OPERATION_DEADLINE_MS);
+  const innerDeadline = Number.isSafeInteger(requestedDeadline) && requestedDeadline > 0
+    ? Math.min(requestedDeadline, Date.now() + innerTimeoutMs)
+    : Date.now() + innerTimeoutMs;
+  childEnvironment.CODEX_ROUTER_OPERATION_TIMEOUT_MS = String(innerTimeoutMs);
+  childEnvironment.CODEX_ROUTER_OPERATION_DEADLINE_MS = String(innerDeadline);
+  // This Electron runner already owns and terminates the complete process
+  // group. Mark control as the bounded child so it does not add a redundant
+  // nested owner whose cleanup reserve would consume short 20s read budgets.
+  childEnvironment.CODEX_ROUTER_OPERATION_CHILD = "1";
+  const childSignalBudget = contractedOwnerSignalBudget(process.env);
+  childEnvironment[OWNER_SIGNAL_BUDGET_ENV] = String(childSignalBudget);
+  const coordinator = createOwnerSignalCoordinator();
+  childEnvironment[OWNER_SIGNAL_BARRIER_DIR_ENV] = coordinator.directory;
   return new Promise((resolve, reject) => {
     // A packaged Electron binary can run trusted Node entrypoints without a
     // separately installed runtime. In CLI/tests process.execPath is already
     // Node; in the desktop host ELECTRON_RUN_AS_NODE switches that same signed
     // executable into its Node mode.
-    const child = spawn(process.execPath, [entry, ...args], {
-      cwd: sourceRoot,
-      detached: process.platform !== "win32",
-      env: childEnvironment,
-      shell: false,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const invocation = process.platform === "win32"
+      ? windowsJobProcessInvocation(process.execPath, [entry, ...args], {
+          sourceRoot,
+          environment: childEnvironment,
+        })
+      : { command: process.execPath, args: [entry, ...args] };
+    let child;
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        cwd: sourceRoot,
+        detached: process.platform !== "win32",
+        env: childEnvironment,
+        shell: false,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      coordinator.release();
+      reject(error);
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let bytes = 0;
     let settled = false;
     let aborting = false;
+    let discardOutput = false;
+    let terminalError;
+    let terminationPromise;
     let timer;
+    let unregisterOwner = () => {};
+    let childCloseResolve;
+    let childClosed = false;
+    const childClose = new Promise((resolveClose) => { childCloseResolve = resolveClose; });
+    const waitForCapturedClose = async (timeoutMs = TREE_EXIT_WAIT_MS) => {
+      if (childClosed) return true;
+      let timeout;
+      const closed = await Promise.race([
+        childClose.then(() => true),
+        new Promise((resolveClose) => {
+          timeout = setTimeout(() => resolveClose(false), timeoutMs);
+        }),
+      ]);
+      clearTimeout(timeout);
+      return closed;
+    };
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      unregisterOwner();
+      coordinator.release();
       fn(value);
     };
-    const abortCommand = async (error) => {
-      if (settled || aborting) return;
+    const abortCommand = (error, { initialSignal = "SIGTERM", ownerSignal = false } = {}) => {
+      if (settled) return Promise.resolve();
+      if (terminationPromise) return terminationPromise;
       aborting = true;
+      discardOutput = true;
       clearTimeout(timer);
-      await terminateProcessTree(child);
-      finish(reject, error);
+      terminationPromise = (async () => {
+        try {
+          const ownBudget = ownerSignalBudget(process.env) ?? OWNER_SIGNAL_CLEANUP_MS;
+          await terminateProcessTree(child, {
+            initialSignal,
+            graceMs: ownerSignal ? childSignalBudget : 250,
+            exitWaitMs: ownerSignal ? OWNER_SIGNAL_GROUP_EXIT_WAIT_MS : TREE_EXIT_WAIT_MS,
+            barrierDirectory: coordinator.directory,
+            barrierOwnerPid: process.pid,
+            barrierOwnBudgetMs: ownBudget,
+          });
+          if (!(await waitForCapturedClose(
+            ownerSignal ? OWNER_SIGNAL_CLOSE_WAIT_MS : TREE_EXIT_WAIT_MS,
+          ))) throw treeCleanupError(child.pid);
+          finish(reject, error);
+        } catch (cleanupError) {
+          finish(reject, new AggregateError(
+            [error, cleanupError],
+            "The Control Center command failed and its process tree could not be fully terminated.",
+            { cause: error },
+          ));
+        }
+      })();
+      return terminationPromise;
     };
     timer = setTimeout(() => {
       void abortCommand(new Error("Router command timed out."));
-    }, Math.max(250, Math.min(timeoutMs, MAX_TIMEOUT_MS)));
+    }, boundedTimeoutMs);
     child.stdout.on("data", (chunk) => {
-      if (settled || aborting) return;
+      if (settled || discardOutput) return;
       bytes += chunk.length;
       if (bytes > maxOutputBytes) {
-        void abortCommand(new Error("Router command output exceeded its limit."));
+        const error = new Error("Router command output exceeded its limit.");
+        if (aborting) {
+          terminalError = error;
+          discardOutput = true;
+        } else {
+          void abortCommand(error);
+        }
         return;
       }
       stdout += chunk.toString("utf8");
     });
     child.stderr.on("data", (chunk) => {
-      if (settled || aborting) return;
+      if (settled || discardOutput) return;
       // Keep stderr in memory only; never write it to a log or console.
       if (stderr.length < 16_384) {
         stderr += chunk.toString("utf8").slice(0, 16_384 - stderr.length);
@@ -471,11 +1011,47 @@ function runEntrypoint(entry, args = [], { stdin, timeoutMs = DEFAULT_TIMEOUT_MS
     child.on("error", (error) => {
       if (!aborting) finish(reject, new Error(safeFailure(error.message)));
     });
-    child.on("close", (code, signal) => {
-      if (aborting) return;
-      if (code === 0 || allowNonZero) finish(resolve, { stdout, stderr, code, signal });
-      else finish(reject, new Error(safeFailure(stderr) || `Router command failed (${code ?? signal}).`));
+    const settleLeaderExit = (code, signal) => {
+      if (aborting || settled) return;
+      aborting = true;
+      clearTimeout(timer);
+      terminationPromise = (async () => {
+        try {
+          // The Windows Job Object owner closes only after every member is
+          // gone. POSIX requires this explicit residual-group retirement when
+          // the direct child exits before a grandchild.
+          if (process.platform !== "win32") {
+            await terminateProcessTree(child, {
+              barrierDirectory: coordinator.directory,
+              barrierOwnerPid: process.pid,
+            });
+            if (!(await waitForCapturedClose())) throw treeCleanupError(child.pid);
+          }
+          if (terminalError) {
+            finish(reject, terminalError);
+            return;
+          }
+          if (code === 0 || allowNonZero) finish(resolve, { stdout, stderr, code, signal });
+          else finish(reject, new Error(safeFailure(stderr) || `Router command failed (${code ?? signal}).`));
+        } catch (error) {
+          finish(reject, error);
+        }
+      })();
+    };
+    child.on("exit", (code, signal) => {
+      if (process.platform !== "win32") settleLeaderExit(code, signal);
     });
+    child.on("close", (code, signal) => {
+      childClosed = true;
+      childCloseResolve();
+      if (process.platform === "win32") settleLeaderExit(code, signal);
+    });
+    unregisterOwner = registerOwnedCommandTree((ownerSignal) => (
+      abortCommand(ownerSignalError(ownerSignal), {
+        initialSignal: ownerSignal,
+        ownerSignal: true,
+      })
+    ), { barrierDirectory: coordinator.directory });
     if (stdin === undefined) child.stdin.end();
     else {
       if (typeof stdin !== "string" && !Buffer.isBuffer(stdin)) {
@@ -484,6 +1060,64 @@ function runEntrypoint(entry, args = [], { stdin, timeoutMs = DEFAULT_TIMEOUT_MS
         child.stdin.end(stdin);
       }
     }
+  });
+}
+
+export function runControlDetached(
+  args = [],
+  {
+    sourceRoot = discoverSourceRoot(),
+    runtime = detachedControlRuntime(),
+    spawnImpl = spawn,
+  } = {},
+) {
+  if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) {
+    throw new TypeError("Router command arguments must be strings.");
+  }
+  const childEnvironment = {
+    ...runtime.environment,
+    MODEL_ROUTER_SOURCE_ROOT: sourceRoot,
+    MODEL_ROUTER_TARGET: "codex",
+  };
+  // These detached commands deliberately outlive this UI request (maintenance
+  // may replace the packaged app). They start a fresh bounded operation rather
+  // than inheriting an almost-expired deadline from their launcher.
+  delete childEnvironment.CODEX_ROUTER_OPERATION_DEADLINE_MS;
+  delete childEnvironment.CODEX_ROUTER_OPERATION_TIMEOUT_MS;
+  delete childEnvironment.CODEX_ROUTER_OPERATION_CHILD;
+  delete childEnvironment[OWNER_SIGNAL_BUDGET_ENV];
+  delete childEnvironment[OWNER_SIGNAL_BARRIER_DIR_ENV];
+  return new Promise((resolve, reject) => {
+    const child = spawnImpl(
+      runtime.executable,
+      [path.join(sourceRoot, "src", "control.mjs"), ...args],
+      {
+        cwd: sourceRoot,
+        detached: true,
+        env: childEnvironment,
+        shell: false,
+        windowsHide: true,
+        stdio: "ignore",
+      },
+    );
+    let settled = false;
+    // `spawn()` returning a ChildProcess is not proof that the OS accepted the
+    // executable. Resolve only at Node's spawn event; a missing or denied
+    // runtime emits error first and must reach the UI as a failed action.
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(safeFailure(error?.message || "Detached router command could not start.")));
+    });
+    child.once("spawn", () => {
+      if (settled) return;
+      settled = true;
+      // Tray maintenance may atomically replace this very packaged app. With
+      // no pipe owned by the UI and a detached process group, it remains alive
+      // after the parent accepts the updater's graceful quit request.
+      child.unref();
+      resolve(child.pid);
+    });
   });
 }
 

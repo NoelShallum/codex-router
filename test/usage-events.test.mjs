@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("usage events persist only bounded request metadata in a private file", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
@@ -26,7 +30,11 @@ test("usage events persist only bounded request metadata in a private file", asy
       toolResultBytesBefore: 80_000,
       toolResultBytesAfter: 5_000,
       toolResultBytesSaved: 75_000,
+      searchSidecar: true,
+      searchCacheHit: false,
+      searchResults: 4,
       prompt: "never persisted",
+      credential: "never persisted",
     });
     assert.deepEqual(usage.recentUsageEvents(), [
       {
@@ -47,6 +55,9 @@ test("usage events persist only bounded request metadata in a private file", asy
         toolResultBytesBefore: 80_000,
         toolResultBytesAfter: 5_000,
         toolResultBytesSaved: 75_000,
+        searchSidecar: true,
+        searchCacheHit: false,
+        searchResults: 4,
       },
     ]);
     if (process.platform !== "win32") {
@@ -105,6 +116,7 @@ test("tool-result aging totals aggregate savings across recorded events", async 
       evaluatedRequests: 0,
       largestResultBytes: 0,
       resultsAged: 0,
+      resultsShaped: 0,
       bytesSaved: 0,
       estimatedTokensSaved: 0,
       firstAt: undefined,
@@ -271,6 +283,38 @@ test("a guard budget release persists its marker and reads back", async () => {
   }
 });
 
+test("a guard pre-content limit persists its kind and rejects unknown values", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?precontent=1&ts=${Date.now()}`);
+    usage.recordUsageEvent({
+      model: "opencode-go/deepseek-v4-flash",
+      provider: "opencode-go",
+      status: 502,
+      durationMs: 30_100,
+      emptyCompletionPreludeLimit: "time",
+    });
+    usage.recordUsageEvent({
+      model: "opencode-go/deepseek-v4-flash",
+      provider: "opencode-go",
+      status: 502,
+      durationMs: 10,
+      emptyCompletionPreludeLimit: "unknown",
+    });
+    const events = usage.recentUsageEvents().filter((event) => event.status === 502);
+    const timed = events.find((event) => event.durationMs === 30_100);
+    const unknown = events.find((event) => event.durationMs === 10);
+    assert.equal(timed.emptyCompletionPreludeLimit, "time");
+    assert.equal("emptyCompletionPreludeLimit" in unknown, false);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // An operator who enables aging on a workload of medium-sized results saw an
 // all-zero ledger and reasonably concluded the hook had never loaded. The
 // evaluated counter is what separates "ran and nothing qualified" from "never
@@ -304,6 +348,265 @@ test("totals separate a pass that ran and aged nothing from one that never ran",
     assert.equal(totals.largestResultBytes, 12_400);
     assert.equal(totals.requests, 0, "nothing was aged, so no request saved anything");
     assert.equal(totals.bytesSaved, 0);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("RTK compaction shaping contributes savings without being reported as aged", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  let usage;
+  try {
+    usage = await import(`../src/usage-events.mjs?shaped=${Date.now()}`);
+    usage.recordUsageEvent({
+      model: "deepseek/deepseek-v4-pro",
+      provider: "deepseek",
+      status: 200,
+      durationMs: 100,
+      inputTokens: 700_000,
+      toolResultsShaped: 2,
+      toolResultBytesBefore: 2_400_000,
+      toolResultBytesAfter: 4_000,
+      toolResultBytesSaved: 2_396_000,
+      toolResultShapeBytesSaved: 2_396_000,
+      toolResultsEvaluated: 0,
+      toolResultBytesLargest: 0,
+    });
+    const event = usage.recentUsageEvents().find((entry) => entry.toolResultsShaped === 2);
+    assert.equal(event.toolResultsShaped, 2);
+    assert.equal(event.toolResultsAged, undefined);
+    assert.equal(event.toolResultShapeBytesSaved, 2_396_000);
+
+    const totals = usage.toolResultAgingTotals();
+    assert.equal(totals.requests, 1);
+    assert.equal(totals.resultsAged, 0);
+    assert.equal(totals.resultsShaped, 2);
+    assert.equal(totals.bytesSaved, 2_396_000);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+    if (usage) rmSync(usage.USAGE_EVENTS_PATH, { force: true });
+  }
+});
+
+test("the aging benchmark classifies shaped-only turns as compacted", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "model-router-aging-benchmark-"));
+  const eventsPath = path.join(directory, "usage-events.jsonl");
+  const reportPath = path.join(directory, "report.json");
+  const event = {
+    meteringVersion: 1,
+    at: "2026-08-24T00:00:00.000Z",
+    model: "deepseek/deepseek-v4-pro",
+    provider: "deepseek",
+    status: 200,
+    durationMs: 10,
+    inputTokens: 700_000,
+    cachedInputTokens: 350_000,
+    toolResultsShaped: 2,
+    toolResultBytesSaved: 100_000,
+    toolResultShapeBytesSaved: 100_000,
+  };
+  writeFileSync(
+    eventsPath,
+    `${JSON.stringify(event)}\n${JSON.stringify({ ...event, at: "2026-08-24T00:01:00.000Z" })}\n`,
+    "utf8",
+  );
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "scripts", "aging-benchmark.mjs"), "--json", reportPath],
+      {
+        cwd: root,
+        env: { ...process.env, MODEL_ROUTER_USAGE_EVENTS: eventsPath },
+        encoding: "utf8",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(readFileSync(reportPath, "utf8"));
+    assert.equal(report.saved[0].resultsAged, 0);
+    assert.equal(report.saved[0].resultsShaped, 2);
+    assert.deepEqual(report.cache.map((turn) => turn.kind), ["fresh", "stable"]);
+    assert.equal(report.summary.cacheRate.unaged, null);
+    assert.equal(report.summary.cacheRate.agedTurnsMeasured, 2);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("the hourly rollup aggregates the whole window, not a capped sample", async () => {
+  const { hourlyUsageRollup } = await import("../src/usage-events.mjs");
+  const now = Date.parse("2026-09-06T17:30:37.000Z");
+  const hour = 3_600_000;
+  // 4,000 rows across the window: many more than recentUsageEvents' 1,000-row
+  // default, and the reason the chart could not be built from that sample.
+  const events = Array.from({ length: 4_000 }, (_, index) => ({
+    at: new Date(now - (index % 24) * hour - 60_000).toISOString(),
+    model: "m",
+    provider: "openai",
+    totalTokens: 100,
+  }));
+  const seen = [];
+  const buckets = hourlyUsageRollup({
+    now,
+    readEvents: (options) => { seen.push(options); return events; },
+  });
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].limit, Number.POSITIVE_INFINITY);
+  assert.equal(buckets.length, 25);
+  assert.equal(buckets.reduce((sum, bucket) => sum + bucket.requests, 0), 4_000);
+  assert.equal(buckets.reduce((sum, bucket) => sum + bucket.tokens, 0), 400_000);
+  assert.equal(buckets.filter((bucket) => bucket.requests > 0).length, 24);
+  assert.ok(seen[0].sinceMs >= 24 * hour && seen[0].sinceMs < 25 * hour);
+  assert.deepEqual(
+    buckets.map((bucket) => bucket.startedAt).slice().sort(),
+    buckets.map((bucket) => bucket.startedAt),
+  );
+});
+
+test("the hourly rollup keeps the oldest partial hour inside the rolling window", async () => {
+  const { hourlyUsageRollup } = await import("../src/usage-events.mjs");
+  const now = Date.parse("2026-09-06T17:30:37.000Z");
+  const hour = 3_600_000;
+  const buckets = hourlyUsageRollup({
+    now,
+    readEvents: () => [
+      { at: new Date(now - 24 * hour).toISOString(), model: "m", provider: "p", totalTokens: 20 },
+      { at: new Date(now - (23 * hour + 45 * 60_000)).toISOString(), model: "m", provider: "p", totalTokens: 10 },
+      { at: new Date(now - (24 * hour + 15 * 60_000)).toISOString(), model: "m", provider: "p", totalTokens: 1000 },
+      { at: new Date(now).toISOString(), model: "m", provider: "p", totalTokens: 1000 },
+    ],
+  });
+
+  assert.equal(buckets.length, 25);
+  assert.equal(buckets.reduce((sum, bucket) => sum + bucket.requests, 0), 2);
+  assert.equal(buckets.reduce((sum, bucket) => sum + bucket.tokens, 0), 30);
+  assert.equal(buckets[0].requests, 2, "the oldest partial clock hour is retained");
+});
+
+test("the hourly rollup mirrors the renderer's billed-token and cache-share math", async () => {
+  const { hourlyUsageRollup } = await import("../src/usage-events.mjs");
+  const now = Date.parse("2026-09-06T17:30:37.000Z");
+  const at = new Date(now - 1_000).toISOString();
+  const buckets = hourlyUsageRollup({
+    now,
+    readEvents: () => [
+      // Billed counts win over raw ones, and a cached share larger than the
+      // input it belongs to is clamped rather than double counted.
+      { at, model: "m", provider: "p", inputTokens: 10, billedInputTokens: 40, cachedInputTokens: 90, outputTokens: 3, billedOutputTokens: 7 },
+      // No totalTokens: the sum falls back to billed input plus billed output.
+      { at, model: "m", provider: "p", inputTokens: 5, outputTokens: 5 },
+      // A request with no token fields at all is counted but not measured.
+      { at, model: "m", provider: "p" },
+    ],
+  });
+  const last = buckets[buckets.length - 1];
+
+  assert.equal(last.requests, 3);
+  assert.equal(last.tokens, 47 + 10);
+  assert.equal(last.measuredTokens, true);
+  assert.equal(last.cachedInputTokens, 40 + 0);
+  assert.equal(last.regularInputTokens, 0 + 5);
+  assert.equal(last.outputTokens, 7 + 5);
+  assert.equal(last.measuredBreakdown, true);
+});
+
+test("an empty ledger still returns a full, honest set of hours", async () => {
+  const { hourlyUsageRollup } = await import("../src/usage-events.mjs");
+  const buckets = hourlyUsageRollup({
+    now: Date.parse("2026-09-06T17:30:37.000Z"),
+    readEvents: () => [],
+  });
+  assert.equal(buckets.length, 25);
+  assert.ok(buckets.every((bucket) => bucket.requests === 0 && bucket.tokens === 0));
+  assert.ok(buckets.every((bucket) => !bucket.measuredTokens && !bucket.measuredBreakdown));
+});
+
+test("records known actual serviceTier without echoing the requested value", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-tier-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?tier=${Date.now()}`);
+    usage.recordUsageEvent({
+      model: "grok-oauth/grok-4.6",
+      provider: "grok-oauth",
+      status: 200,
+      durationMs: 12,
+      requestedServiceTier: "priority",
+      serviceTier: "default",
+      prompt: "never persisted",
+    });
+    usage.recordUsageEvent({
+      model: "grok-oauth/grok-4.6",
+      provider: "grok-oauth",
+      status: 200,
+      durationMs: 13,
+      requestedServiceTier: "flex",
+      serviceTier: "flex",
+    });
+    usage.recordUsageEvent({
+      model: "grok-oauth/grok-4.6",
+      provider: "grok-oauth",
+      status: 200,
+      durationMs: 14,
+      retries: 1,
+      serviceTier: "priority",
+    });
+    const events = usage.recentUsageEvents();
+    assert.equal(events[0].requestedServiceTier, "priority");
+    assert.equal(events[0].serviceTier, "default");
+    assert.equal("serviceTier" in events[1], false);
+    assert.equal("requestedServiceTier" in events[1], false);
+    assert.equal("serviceTier" in events[2], false);
+    assert.equal(events[2].retries, 1);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("the reasoning-streamed marker persists both measured values and drops anything else", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?reasoning-streamed=1&ts=${Date.now()}`);
+    const record = (status, reasoningStreamed) =>
+      usage.recordUsageEvent({
+        model: "openai/reasoning-streamed-probe",
+        provider: "openai",
+        status,
+        durationMs: 4_000,
+        firstTokenMs: 1_000,
+        outputTokens: 502,
+        reasoningTokens: 98,
+        reasoningStreamed,
+      });
+    record(200, true);
+    record(201, false);
+    record(202, "yes");
+    record(203, undefined);
+    // The module caches its state path from the first import in this process,
+    // so earlier tests may have left rows in the same file: match on this
+    // test-only model slug, not on status alone.
+    const byStatus = (status) =>
+      usage
+        .recentUsageEvents()
+        .find((event) => event.model === "openai/reasoning-streamed-probe" && event.status === status);
+    assert.equal(byStatus(200).reasoningStreamed, true);
+    // False is a measurement (no reasoning delta was relayed), not an absence,
+    // so it must survive the round trip: it is what selects the subtraction.
+    assert.equal(byStatus(201).reasoningStreamed, false);
+    assert.equal("reasoningStreamed" in byStatus(202), false);
+    assert.equal("reasoningStreamed" in byStatus(203), false);
+    assert.equal(byStatus(200).reasoningTokens, 98);
   } finally {
     if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
     else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;

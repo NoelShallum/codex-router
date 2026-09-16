@@ -8,8 +8,20 @@ const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-targets-"));
 process.env.CODEX_HOME = path.join(testRoot, "codex");
 process.env.CODEX_ROUTER_STATE_DIR = path.join(testRoot, "state");
 
-const { installedTargets } = await import("../src/target-integration.mjs");
-const { CONFIG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH } = await import("../src/paths.mjs");
+const {
+  installedTargets,
+  refreshTargetPickerIfInstalled,
+  runTargetPublicationProcess,
+} = await import("../src/target-integration.mjs");
+const {
+  CONFIG_PATH,
+  CLAUDE_CATALOG_PATH,
+  CURSOR_CATALOG_PATH,
+  DSH_CATALOG_PATH,
+  NATIVE_CATALOG_PATH,
+  OPENCLAW_CATALOG_PATH,
+  ROUTED_HARNESS_CATALOG_PATHS,
+} = await import("../src/paths.mjs");
 
 function stageFile(filePath, contents) {
   mkdirSync(path.dirname(filePath), { recursive: true });
@@ -17,7 +29,10 @@ function stageFile(filePath, contents) {
 }
 
 function clearStagedFiles() {
-  for (const filePath of [CONFIG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH]) {
+  for (const filePath of [
+    CONFIG_PATH, CLAUDE_CATALOG_PATH, CURSOR_CATALOG_PATH, DSH_CATALOG_PATH, NATIVE_CATALOG_PATH,
+    OPENCLAW_CATALOG_PATH, ...Object.values(ROUTED_HARNESS_CATALOG_PATHS),
+  ]) {
     rmSync(filePath, { force: true });
   }
 }
@@ -83,6 +98,111 @@ test("the harness catalog snapshot still marks the dsh integration", () => {
   }
 });
 
+test("publication refuses an aborted shared activation before touching a client", async () => {
+  const controller = new AbortController();
+  const aborted = new Error("planned publication abort");
+  controller.abort(aborted);
+  await assert.rejects(
+    refreshTargetPickerIfInstalled({
+      signal: controller.signal,
+      deadline: Date.now() + 10_000,
+    }),
+    (error) => error === aborted,
+  );
+});
+
+test("each target publisher owns a finite tree and contracts its child deadline", async () => {
+  let invocation;
+  const deadline = Date.now() + 60_000;
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { SENTINEL: "present" },
+    deadline,
+    run: async (command, args, options) => {
+      invocation = { command, args, options };
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.equal(invocation.command, "/runtime/node");
+  assert.deepEqual(invocation.args, [path.join("/stable/router", "src", "catalog.mjs")]);
+  assert.equal(invocation.options.deadline, deadline);
+  assert.equal(invocation.options.env.SENTINEL, "present");
+  assert.equal(
+    invocation.options.env.CODEX_ROUTER_OPERATION_DEADLINE_MS,
+    String(deadline - 10_000),
+  );
+});
+
+test("target publication honors and caps an injected operation environment", async () => {
+  let invocation;
+  const now = Date.now();
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { CODEX_ROUTER_OPERATION_TIMEOUT_MS: "600000" },
+    run: async (_command, _args, options) => {
+      invocation = options;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(invocation.deadline >= now);
+  assert.ok(invocation.deadline <= Date.now() + 300_000);
+  assert.equal(
+    Number(invocation.env.CODEX_ROUTER_OPERATION_DEADLINE_MS),
+    invocation.deadline - 10_000,
+  );
+});
+
+test("the Cursor publication snapshot marks the Cursor integration", () => {
+  try {
+    stageFile(CURSOR_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["cursor"]);
+
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "cursor"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("the Claude publication snapshot marks the Claude Code integration", () => {
+  try {
+    stageFile(CLAUDE_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["claude"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "claude"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("the OpenClaw publication snapshot marks the OpenClaw integration", () => {
+  try {
+    stageFile(OPENCLAW_CATALOG_PATH, "{}");
+    assert.deepEqual(installedTargets(), ["openclaw"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "openclaw"]);
+  } finally {
+    clearStagedFiles();
+  }
+});
+
+test("target publication expands PATH for GUI-spawned client publishers", async () => {
+  let invocation;
+  await runTargetPublicationProcess("catalog.mjs", [], {
+    sourceRoot: "/stable/router",
+    executable: "/runtime/node",
+    environment: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    run: async (_command, _args, options) => {
+      invocation = options;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.match(invocation.env.PATH, /\.local[\\/]bin/);
+  assert.match(invocation.env.PATH, /(?:^|[;:])(?:\/usr\/local\/bin|[A-Za-z]:\\Users\\[^;]+\\\.local\\bin)/);
+});
+
 test.after(() => {
   rmSync(testRoot, { recursive: true, force: true });
 });
@@ -99,6 +219,24 @@ test("a config that exists but cannot be read still counts as installed", () => 
     assert.deepEqual(installedTargets(), ["codex"]);
   } finally {
     rmSync(CONFIG_PATH, { recursive: true, force: true });
+    clearStagedFiles();
+  }
+});
+
+test("a routed harness publication keeps the shared plane installed", () => {
+  try {
+    // opencode, pi, omp, Command Code, and Hermes are published *into* rather
+    // than installed *as*, so they are no `MODEL_ROUTER_TARGET`. They still
+    // hold the shared service open: `bin/disable` retires it only once this
+    // list is empty, and omitting them is how turning Codex off would stop
+    // opencode working.
+    stageFile(ROUTED_HARNESS_CATALOG_PATHS.opencode, "{}");
+    assert.deepEqual(installedTargets(), ["opencode"]);
+    stageFile(ROUTED_HARNESS_CATALOG_PATHS.hermes, "{}");
+    assert.deepEqual(installedTargets(), ["opencode", "hermes"]);
+    stageFile(CONFIG_PATH, "# BEGIN codex-router-managed\n# END codex-router-managed\n");
+    assert.deepEqual(installedTargets(), ["codex", "opencode", "hermes"]);
+  } finally {
     clearStagedFiles();
   }
 });

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const { cooldownUntil, parseRateLimitHeaders, resetAt } = await import(
+const {
+  cooldownUntil,
+  parseRateLimitHeaders,
+  requestQuotaFromRateLimitHeaders,
+  resetAt,
+  retryAfterSeconds,
+} = await import(
   "../src/rate-limit-headers.mjs"
 );
 
@@ -66,6 +72,47 @@ test("anthropic's prefixed headers parse through the same path", () => {
   assert.equal(snapshot.tokens, undefined);
 });
 
+test("only a complete request window becomes per-credential quota", () => {
+  assert.deepEqual(
+    requestQuotaFromRateLimitHeaders(
+      new Headers({
+        "x-ratelimit-limit-requests": "100",
+        "x-ratelimit-remaining-requests": "37",
+        "x-ratelimit-reset-requests": "60",
+        "x-ratelimit-limit-tokens": "9000",
+        "x-ratelimit-remaining-tokens": "1",
+      }),
+      { now: NOW },
+    ),
+    {
+      unit: "requests",
+      limit: 100,
+      remaining: 37,
+      resetAt: new Date(NOW + 60_000).toISOString(),
+      observedAt: new Date(NOW).toISOString(),
+    },
+  );
+  assert.equal(
+    requestQuotaFromRateLimitHeaders(
+      new Headers({ "x-ratelimit-limit-requests": "100" }),
+      { now: NOW },
+    ),
+    undefined,
+    "a partial window must not overwrite a complete observation",
+  );
+  assert.equal(
+    requestQuotaFromRateLimitHeaders(
+      new Headers({
+        "x-ratelimit-limit-tokens": "9000",
+        "x-ratelimit-remaining-tokens": "8000",
+      }),
+      { now: NOW },
+    ),
+    undefined,
+    "token headers are not attributed to a pooled key",
+  );
+});
+
 test("a provider that reports nothing yields no snapshot", () => {
   assert.equal(parseRateLimitHeaders(new Headers({ "content-type": "application/json" })), undefined);
   assert.equal(parseRateLimitHeaders(undefined), undefined);
@@ -92,4 +139,32 @@ test("cooldown only triggers on real exhaustion", () => {
   // An explicit retry-after is honored on its own.
   assert.equal(cooldownUntil({ retryAt: "2026-07-25T12:09:00.000Z" }), "2026-07-25T12:09:00.000Z");
   assert.equal(cooldownUntil(undefined), undefined);
+});
+
+test("retry-after reads RFC forms and the extensions providers actually send", () => {
+  const seconds = (value) =>
+    retryAfterSeconds(new Headers(value === undefined ? {} : { "retry-after": value }), {
+      now: NOW,
+    });
+  // delay-seconds, the form most OpenAI-compatible providers send.
+  assert.equal(seconds("120"), 120);
+  // HTTP-date, equally legal and what a gateway in front of the origin sends.
+  assert.equal(seconds("Sat, 25 Jul 2026 12:05:00 GMT"), 300);
+  // Zero is a non-negative integer, so it is a provider saying "now" rather
+  // than a provider saying nothing. The two must stay distinguishable here;
+  // whether "now" is worth wording belongs to the caller.
+  assert.equal(seconds("0"), 0);
+  // A window that elapsed before the response was read says the same thing.
+  assert.equal(seconds("Sat, 25 Jul 2026 11:59:00 GMT"), 0);
+  // Not RFC grammar -- delay-seconds is an integer -- but providers do send
+  // fractions, and `resetAt` has always read them. A sub-second wait keeps its
+  // second rather than rounding into the zero that means "no wait".
+  assert.equal(seconds("0.2"), 1);
+  // Nothing usable, so the caller keeps its own judgement rather than
+  // inheriting a window the provider never named.
+  assert.equal(seconds(undefined), undefined);
+  assert.equal(seconds("soon"), undefined);
+  assert.equal(seconds("-5"), undefined);
+  assert.equal(retryAfterSeconds(undefined, { now: NOW }), undefined);
+  assert.equal(retryAfterSeconds({}, { now: NOW }), undefined);
 });

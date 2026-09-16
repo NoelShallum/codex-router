@@ -505,11 +505,15 @@ test("the explore catalog groups the requested Ollama families and keeps fit vis
     "nemotron3:33b-q8",
     "muse-glimmer:30b",
     "muse-glimmer:30b-mlx-bf16-dflash",
+    "hf.co/unsloth/GLM-5.3-GGUF:UD-IQ1_S",
+    "hf.co/unsloth/GLM-5.3-GGUF:UD-Q4_K_XL",
+    "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S",
+    "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
   ]) assert.ok(tags.has(tag), tag);
   assert.equal(entries.find((entry) => entry.tag === "nemotron-3-super:120b").fit, "too-large");
   assert.equal(entries.find((entry) => entry.tag === "gemma4:12b").tools, false);
-  assert.equal(EXPLORE_LOCAL_MODELS.length, 201);
-  assert.equal(new Set(EXPLORE_LOCAL_MODELS.map((entry) => entry.tag)).size, 201);
+  assert.equal(EXPLORE_LOCAL_MODELS.length, 213);
+  assert.equal(new Set(EXPLORE_LOCAL_MODELS.map((entry) => entry.tag)).size, 213);
   // The qwen3.8 capture (2026-08-15): 12 official 27B tags, 256K context.
   assert.equal(
     entries.find((entry) => entry.tag === "qwen3.8:27b").researchStatus,
@@ -549,6 +553,34 @@ test("the explore catalog groups the requested Ollama families and keeps fit vis
   assert.deepEqual(
     entries.find((entry) => entry.tag === "nemotron-3.5-lightning:latest").researchCapabilities,
     ["tools", "thinking"],
+  );
+  const glm = entries.find((entry) => entry.tag === "hf.co/unsloth/GLM-5.3-GGUF:UD-IQ1_S");
+  assert.equal(glm.sizeGb, 217);
+  assert.equal(glm.context, 1_048_576);
+  assert.equal(glm.fit, "too-large");
+  assert.equal(glm.downloadable, true);
+  assert.equal(glm.researchStatus, "Unsloth GGUF · 5 local quants");
+  assert.deepEqual(glm.researchCapabilities, ["tools", "thinking"]);
+  const glmFlash = entries.find((entry) => entry.tag === "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S");
+  assert.equal(glmFlash.sizeGb, 93.1);
+  assert.equal(glmFlash.context, 1_048_576);
+  assert.equal(glmFlash.fit, "too-large");
+  assert.equal(glmFlash.downloadable, true);
+  assert.equal(glmFlash.researchStatus, "Unsloth GGUF · 7 local quants");
+  assert.deepEqual(glmFlash.researchCapabilities, ["vision", "tools", "thinking"]);
+  const snapshot = localModelsSnapshot({
+    inventory: [],
+    running: [],
+    selection: { version: 1, enabled: [] },
+    runtime: { installed: true, running: true },
+  });
+  assert.equal(
+    snapshot.families.find((family) => family.family === "hf.co/unsloth/GLM-5.3-GGUF")?.displayName,
+    "GLM-5.3",
+  );
+  assert.equal(
+    snapshot.families.find((family) => family.family === "hf.co/unsloth/GLM-5.3-Flash-GGUF")?.displayName,
+    "GLM-5.3-Flash",
   );
 });
 
@@ -660,4 +692,3 @@ test("the listing says how little room Codex leaves in the window", () => {
   assert.match(rendered, new RegExp(`${Math.round(CODEX_PROMPT_TOKENS / 1000)}K of the 32K window`));
   assert.match(rendered, /agent-check/);
 });
-

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { ageToolResults } from "../src/tool-result-aging.mjs";
+import {
+  ageToolResults,
+  shapeToolResult,
+} from "../src/tool-result-aging.mjs";
 
 function call(id, name = "exec_command") {
   return { type: "function_call", call_id: id, name, arguments: "{}" };
@@ -36,6 +39,29 @@ test("ages a large consumed result while preserving its call pairing and recover
     result.input[1].output,
     new RegExp(createHash("sha256").update(value).digest("hex")),
   );
+});
+
+test("ordinary aging keeps exact head and tail bytes without RTK shaping", () => {
+  const value = [
+    "progress 10%\rprogress 20%",
+    ...Array.from({ length: 5_000 }, (_, index) => `distinct line ${index}`),
+    "tail old\rtail final",
+  ].join("\n");
+  const input = [
+    call("old", "exec_command"),
+    output("old", value),
+    { type: "message", role: "assistant", content: "I used that result." },
+    ...Array.from({ length: 4 }, (_, index) => [
+      call(`new-${index}`),
+      output(`new-${index}`, "small"),
+    ]).flat(),
+  ];
+
+  const result = ageToolResults(input, { denseShaping: false });
+  assert.equal(result.stats.toolResultsAged, 1);
+  assert.equal(result.stats.toolResultsShaped, 0);
+  assert.match(result.input[1].output, /progress 10%\rprogress 20%/u);
+  assert.match(result.input[1].output, /tail old\rtail final/u);
 });
 
 test("keeps the newest four result items byte-for-byte intact", () => {
@@ -88,6 +114,70 @@ test("can be disabled without copying or changing the input", () => {
     toolResultBytesAfter: 0,
     toolResultBytesSaved: 0,
   });
+});
+
+test("dense compaction shapes a noisy newest result with a recoverable RTK receipt", () => {
+  const value = [
+    "starting build",
+    ...Array(1_000).fill("compiled unchanged dependency"),
+    "ERROR final link failed",
+  ].join("\n");
+  const input = [call("latest", "exec_command"), output("latest", value)];
+
+  const ordinary = ageToolResults(input);
+  assert.equal(ordinary.input, input, "the ordinary frontier remains byte-for-byte intact");
+
+  const compacted = ageToolResults(input, { denseShaping: true });
+  assert.notEqual(compacted.input, input);
+  assert.equal(compacted.stats.toolResultsAged, 0);
+  assert.equal(compacted.stats.toolResultsShaped, 1);
+  assert.equal(compacted.stats.toolResultShapeBytesSaved, compacted.stats.toolResultBytesSaved);
+  assert.match(compacted.input[1].output, /RTK-style compaction/u);
+  assert.match(compacted.input[1].output, /same line repeated 999 more times/u);
+  assert.match(compacted.input[1].output, /ERROR final link failed/u);
+  assert.match(compacted.input[1].output, /Repeat the preceding exec_command call/u);
+  assert.match(
+    compacted.input[1].output,
+    new RegExp(createHash("sha256").update(value).digest("hex")),
+  );
+
+  const repeated = ageToolResults(compacted.input, { denseShaping: true });
+  assert.equal(repeated.input, compacted.input, "a shaped frontier is not wrapped again");
+  assert.equal(repeated.stats.toolResultsShaped, 0);
+});
+
+test("dense compaction does not wrap a receipt written by the former pressure mode", () => {
+  const legacy = [
+    "[Tool result shaped by Codex Router token maxxing: 10000 -> 100 bytes, sha256:abc.]",
+    ...Array(1_000).fill("repeated legacy output"),
+  ].join("\n");
+  const input = [call("latest", "exec_command"), output("latest", legacy)];
+  const result = ageToolResults(input, { denseShaping: true });
+  assert.equal(result.input, input);
+  assert.equal(result.stats.toolResultsShaped, 0);
+});
+
+test("the RTK-style shaper is deterministic and keeps error-bearing evidence", () => {
+  const value = [
+    "progress 10%\rprogress 20%\rWARNING retrying\rprogress 30%",
+    "",
+    "",
+    ...Array.from({ length: 9 }, (_, index) => `        boilerplate ${index}`),
+    "        ERROR nested failure stays visible",
+    ...Array.from({ length: 9 }, (_, index) => `        more boilerplate ${index}`),
+    ...Array(20).fill("same diagnostic"),
+  ].join("\n");
+  const once = shapeToolResult(value);
+  const twice = shapeToolResult(once);
+  assert.equal(twice, once);
+  assert.doesNotMatch(once, /\r/u);
+  assert.doesNotMatch(once, /progress 10%|progress 20%/u);
+  assert.match(once, /progress 30%/u);
+  assert.match(once, /WARNING retrying/u);
+  assert.match(once, /deeply indented lines omitted/u);
+  assert.match(once, /ERROR nested failure stays visible/u);
+  assert.match(once, /same line repeated 19 more times/u);
+  assert.ok(Buffer.byteLength(once, "utf8") < Buffer.byteLength(value, "utf8"));
 });
 
 test("does not split surrogate pairs at either preview boundary", () => {

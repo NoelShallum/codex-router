@@ -13,7 +13,12 @@
 // the loopback, and the answer is converted back. The extra hop is one local
 // socket; the alternative is two copies of the only path that matters.
 
-import { formatErrorChain, readRequestBody, writeJson } from "./http-utils.mjs";
+import {
+  formatErrorChain,
+  readRequestBody,
+  writeEventStreamHead,
+  writeJson,
+} from "./http-utils.mjs";
 import {
   createGeminiStreamTranslator,
   estimateGeminiTokens,
@@ -104,7 +109,8 @@ function upstreamMessage(text) {
 // it presented it on is already the proof. Relaying it upstream would put a
 // router secret on a hop that can be substituted onto a provider; leaving the
 // header off is also what makes `callerBroughtNoUpstreamCredential` true, which
-// is how a client with no ChatGPT session of its own reaches native models.
+// is how a client with no ChatGPT session of its own reaches native models
+// after this user explicitly authorizes the shared local router plane.
 function loopbackHeaders() {
   return { "content-type": "application/json", accept: "text/event-stream" };
 }
@@ -151,8 +157,7 @@ function dispatchSseBlock(block, onEvent) {
 
 async function streamTurn({ response, upstream, model }) {
   const translator = createGeminiStreamTranslator({ model });
-  response.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
+  writeEventStreamHead(response, 200, {
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
   });
@@ -281,7 +286,7 @@ export async function handleGeminiRequest(
     geminiError(
       response,
       501,
-      "The router serves chat turns only; no routed provider exposes an embedding endpoint through it.",
+      "Gemini embedContent is not bridged; the separate OpenAI-compatible embeddings route requires an explicitly capable model.",
     );
     return;
   }

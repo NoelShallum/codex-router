@@ -32,6 +32,10 @@ function quotaBody(message) {
   return JSON.stringify({ error: { message } });
 }
 
+function quotaResetBody(stamp) {
+  return quotaBody(`Usage limit reached for 5 hour. Your limit will reset at ${stamp}.`);
+}
+
 // -- classification ----------------------------------------------------------
 
 test("classifyRoutedFailure swaps on exhausted usage across provider dialects", () => {
@@ -60,6 +64,132 @@ test("classifyRoutedFailure swaps on OpenCode FreeUsageLimitError", () => {
         message: "Rate limit exceeded",
       },
     }),
+    now: NOW,
+  });
+  assert.deepEqual(verdict, { swap: true, reason: "out_of_usage" });
+});
+
+test("classifyRoutedFailure swaps only a marked provider transport 5xx", () => {
+  assert.deepEqual(
+    classifyRoutedFailure({
+      status: 502,
+      bodyText: JSON.stringify({ error: { type: "provider_transport_error" } }),
+    }),
+    { swap: true, reason: "transport" },
+  );
+  assert.deepEqual(
+    classifyRoutedFailure({ status: 502, bodyText: "provider unavailable" }),
+    { swap: false },
+  );
+});
+
+test("classifyRoutedFailure recognizes the observed Z.ai five-hour window message", () => {
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaBody(
+      "Usage limit reached for 5 hour. Your limit will reset at 2026-08-21 04:40:42.",
+    ),
+    now: NOW,
+  });
+  // This body names a reset nearly a week out, so the window it produces is the
+  // shared six-hour cap rather than the stamp itself.
+  assert.deepEqual(verdict, {
+    swap: true,
+    reason: "out_of_usage",
+    until: new Date(NOW + MAX_COOLDOWN_MS).toISOString(),
+  });
+});
+
+test("classifyRoutedFailure recognizes the documented Z.ai weekly and monthly window message", () => {
+  // zai 1310: "Weekly/Monthly Limit Exhausted. Your limit will reset at ..." --
+  // a quota window that names neither "usage" nor "quota", so the rest of the
+  // vocabulary does not catch it and the turn keeps its 429 instead of
+  // failing over.
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaBody("Weekly Limit Exhausted. Your limit will reset at 2026-08-15 13:00:00."),
+    now: NOW,
+  });
+  assert.equal(verdict.swap, true);
+  assert.equal(verdict.reason, "out_of_usage");
+  assert.ok(verdict.until, "the named reset becomes the cooldown window");
+});
+
+test("classifyRoutedFailure swaps on a lapsed Z.ai coding or enterprise package", () => {
+  // zai 1309/1314: renewal restores access -- time does not, and neither does a
+  // fresh key. Still an exhausted plan every other provider can answer.
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaBody(
+      "Your GLM Coding Plan package has expired and is temporarily unavailable. You can resume using it after renewing the subscription.",
+    ),
+    now: NOW,
+  });
+  assert.deepEqual(verdict, { swap: true, reason: "out_of_usage" });
+});
+
+test("classifyRoutedFailure honours a reset time the provider named in the body", () => {
+  // Z.ai sends no `Retry-After`; the window is a sentence. Without this the
+  // exhausted plan was re-attempted on every turn for the whole window.
+  // NOW is 12:00Z, so the earliest zone in which "13:00" is still ahead is
+  // UTC+0 itself.
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaResetBody("2026-08-15 13:00:00"),
+    now: NOW,
+  });
+  assert.deepEqual(verdict, {
+    swap: true,
+    reason: "out_of_usage",
+    until: "2026-08-15T13:00:00.000Z",
+  });
+});
+
+test("classifyRoutedFailure never waits longer than the earliest zone the stamp allows", () => {
+  // The stamp names no zone. Read as this host's local time it could sit most
+  // of a day out and withhold a model that is already available again -- the
+  // one error worth engineering against, since waking early only costs a
+  // second refusal. "20:00" against a 12:00Z now is soonest in UTC+7, an hour
+  // away, and that is the window recorded no matter where the host runs.
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaResetBody("2026-08-15 20:00:00"),
+    now: NOW,
+  });
+  assert.equal(verdict.until, "2026-08-15T13:00:00.000Z");
+  assert.ok(
+    Date.parse(verdict.until) - NOW <= 8 * 60 * 60_000,
+    "a zoneless stamp must never strand a model for the full offset spread",
+  );
+});
+
+test("classifyRoutedFailure prefers Retry-After over a reset named in the body", () => {
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaResetBody("2026-08-15 13:00:00"),
+    retryAfterSeconds: 300,
+    now: NOW,
+  });
+  assert.equal(verdict.until, new Date(NOW + 300_000).toISOString());
+});
+
+test("classifyRoutedFailure ignores a named reset no zone can place ahead", () => {
+  // Two days behind `now` is past in every offset, so there is no window to
+  // record and the model stays reachable.
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaResetBody("2026-08-13 00:00:00"),
+    now: NOW,
+  });
+  assert.deepEqual(verdict, { swap: true, reason: "out_of_usage" });
+});
+
+test("classifyRoutedFailure reads no window from prose that never names a time", () => {
+  const verdict = classifyRoutedFailure({
+    status: 429,
+    bodyText: quotaBody(
+      "usage limit reached for your GLM Coding Plan. Your limit will reset at the top of the hour.",
+    ),
     now: NOW,
   });
   assert.deepEqual(verdict, { swap: true, reason: "out_of_usage" });
@@ -179,6 +309,32 @@ test("a cooldown is recorded against the whole variant family", (t) => {
   assert.ok(providerCooldown("opencode-go", { now: NOW }));
 });
 
+test("a separately billed variant keeps its own window", (t) => {
+  t.after(() => clearAllProviderCooldowns());
+  // opencode Zen shares Go's credential and selection toggle but is billed at
+  // its own endpoint, so neither one being empty says anything about the
+  // other. Keying both under the canonical parent withdrew a paid route for a
+  // window its provider never named.
+  recordProviderCooldown("opencode-go", {
+    until: new Date(NOW + 1_800_000).toISOString(),
+    reason: "out_of_usage",
+    now: NOW,
+  });
+  assert.ok(providerCooldown("opencode-go-messages", { now: NOW }));
+  assert.equal(providerCooldown("opencode-zen", { now: NOW }), undefined);
+
+  recordProviderCooldown("opencode-zen", {
+    until: new Date(NOW + 1_800_000).toISOString(),
+    reason: "out_of_usage",
+    now: NOW,
+  });
+  assert.ok(providerCooldown("opencode-zen", { now: NOW }));
+  // Clearing one leaves the other exactly as it was.
+  clearProviderCooldown("opencode-zen");
+  assert.equal(providerCooldown("opencode-zen", { now: NOW }), undefined);
+  assert.ok(providerCooldown("opencode-go", { now: NOW }));
+});
+
 test("a later hop may sharpen the reason but never invent the window", (t) => {
   t.after(() => clearAllProviderCooldowns());
   // api-forwarder sees the provider's Retry-After but not its body, so it can
@@ -292,6 +448,28 @@ test("rankFailoverCandidates skips a provider that is already cooled down", (t) 
   );
 });
 
+test("rankFailoverCandidates still offers a separately billed variant", (t) => {
+  t.after(() => clearAllProviderCooldowns());
+  // The Go plan is empty. Its protocol variants are empty with it; Zen is a
+  // different bill at a different endpoint and remains a candidate.
+  recordProviderCooldown("opencode-go", {
+    until: new Date(NOW + 600_000).toISOString(),
+    now: NOW,
+  });
+  const ranked = rankFailoverCandidates(
+    [
+      model("opencode-go/glm-5.3", "opencode-go"),
+      model("opencode-go-responses/glm-5.3", "opencode-go-responses"),
+      model("opencode-zen/glm-5.3", "opencode-zen"),
+    ],
+    { from: FROM, now: NOW },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["opencode-zen/glm-5.3"],
+  );
+});
+
 test("rankFailoverCandidates keeps a collaboration turn on a v2 model", () => {
   const ranked = rankFailoverCandidates(
     [
@@ -304,6 +482,76 @@ test("rankFailoverCandidates keeps a collaboration turn on a v2 model", () => {
     ranked.map((entry) => entry.model.slug),
     ["deepseek/v4"],
   );
+});
+
+test("rankFailoverCandidates preserves the selected search execution mode", () => {
+  const from = model("source/hosted", "source", {
+    searchTool: { mode: "hosted" },
+  });
+  const ranked = rankFailoverCandidates(
+    [
+      model("hosted/compatible", "hosted", { searchTool: { mode: "hosted" } }),
+      model("standalone/incompatible", "standalone", {
+        searchTool: { mode: "standalone" },
+      }),
+      model("plain/incompatible", "plain"),
+    ],
+    { from, needsSearch: true },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["hosted/compatible"]);
+});
+
+test("rankFailoverCandidates leaves a search-capable model's ordinary turn unrestricted", () => {
+  const ranked = rankFailoverCandidates(
+    [model("plain/candidate", "plain")],
+    {
+      from: model("source/hosted", "source", { searchTool: { mode: "hosted" } }),
+    },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["plain/candidate"]);
+});
+
+test("rankFailoverCandidates ignores ambient search intent without source capability", () => {
+  const ranked = rankFailoverCandidates(
+    [model("plain/candidate", "plain")],
+    {
+      from: model("source/plain", "source"),
+      needsSearch: true,
+    },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["plain/candidate"]);
+});
+
+test("rankFailoverCandidates does not guess after search capability disappears", () => {
+  const ranked = rankFailoverCandidates(
+    [model("hosted/candidate", "hosted", { searchTool: { mode: "hosted" } })],
+    { from: model("source/plain", "source"), hasSearchHistory: true },
+  );
+  assert.deepEqual(ranked, []);
+});
+
+test("rankFailoverCandidates admits only verified search-history replay routes", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("verified/candidate", "verified", { supportsSearchHistory: true }),
+      model("plain/incompatible", "plain"),
+    ],
+    { from: model("source/plain", "source"), hasSearchHistory: true },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["verified/candidate"]);
+});
+
+test("rankFailoverCandidates preserves an explicitly snapshotted absent mode", () => {
+  const ranked = rankFailoverCandidates(
+    [model("hosted/candidate", "hosted", { searchTool: { mode: "hosted" } })],
+    {
+      from: model("source/hosted", "source", { searchTool: { mode: "hosted" } }),
+      needsSearch: true,
+      hasSearchHistory: true,
+      requiredSearchMode: undefined,
+    },
+  );
+  assert.deepEqual(ranked, []);
 });
 
 test("rankFailoverCandidates refuses a model the registry bars from the vision bridge", () => {

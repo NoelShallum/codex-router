@@ -11,7 +11,8 @@ import { existsSync, readFileSync } from "node:fs";
 
 import { NATIVE_CATALOG_PATH } from "./paths.mjs";
 import { nativeSessionAvailable } from "./codex-native-session.mjs";
-import { modelPickerSnapshot } from "./model-picker-state.mjs";
+import { MODEL_SLUG_ALIASES } from "./model-registry.mjs";
+import { migrateModelVisibility } from "./model-picker-state.mjs";
 import { readMultiAgentSettings } from "./multi-agent-state.mjs";
 import { selectedConfiguredListedModels } from "./provider-selection.mjs";
 import { applySubagentProofs, subagentProofSnapshot } from "./subagent-proofs.mjs";
@@ -55,6 +56,9 @@ export function nativeClientModels(nativeCatalogModels) {
             .filter((level) => level?.effort)
             .map((level) => ({ effort: level.effort }))
         : [],
+      ...(typeof model.default_reasoning_level === "string"
+        ? { defaultEffort: model.default_reasoning_level }
+        : {}),
       priority: Number.isFinite(model.priority) ? -model.priority : undefined,
       native: true,
     }));
@@ -62,27 +66,32 @@ export function nativeClientModels(nativeCatalogModels) {
 
 /** The routed models a published client should be offered, vision bridge included. */
 export function routedClientModels() {
-  const picker = modelPickerSnapshot();
+  // Catalog publication normally carries picker decisions across renamed
+  // slugs. DSH- or Gemini-only installs deliberately never run catalog.mjs,
+  // though, so their shared publisher must apply the same registry aliases
+  // before it evaluates the exact visibility allowlist.
+  const picker = migrateModelVisibility(
+    [...MODEL_SLUG_ALIASES].map(([from, to]) => ({ from, to })),
+  );
   const hidden = new Set(picker.hidden);
   const visible = new Set(picker.visible);
-  // The same machine-local capability proofs the Codex catalog honors: a model
-  // this machine verified as a subagent is one everywhere the proven set is
-  // consumed, or a client's tool-subagent preset silently disagrees with the
-  // picker about which children exist.
+  // Keep every client on the same registry-certified capabilities. Local
+  // stream/tool probe records are passed through for compatibility with the
+  // proof overlay API, but applySubagentProofs deliberately treats them as
+  // diagnostic application evidence and never promotes a route to v2.
   const selected = applySubagentProofs(
     selectedConfiguredListedModels().filter((model) => {
       const slug = String(model.slug);
-      return !hidden.has(slug) && (!picker.hasExplicitVisibility || visible.has(slug));
+      return !hidden.has(slug) &&
+        (!picker.hasExplicitVisibility || visible.has(slug));
     }),
     subagentProofSnapshot(),
     { hidden, disabled: readMultiAgentSettings().disabled },
   );
   // Native GPT models are authorized by a ChatGPT session rather than an API
-  // key. A published client carries none of its own -- but this machine is
-  // signed in to Codex, and the router relays that session for a caller that
-  // brought nothing (see `codex-native-session.mjs`). So they are publishable
-  // exactly while that fallback can supply one, and withheld the moment it
-  // cannot.
+  // key. A published client carries none of its own, so they are publishable
+  // only after this user authorizes the shared local router plane and while the
+  // signed-in Codex session remains usable (see `codex-native-session.mjs`).
   const native = nativeSessionAvailable() ? nativeClientModels(readNativeCatalogModels()) : [];
   // The vision engine still resolves over routed candidates only. A native
   // engine is spent per-caller, and `vision-engines` wants each call site to

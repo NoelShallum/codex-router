@@ -4,7 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { findCodexBinary, preferSpawnablePath, spawnableCommand } from "../src/codex-binary.mjs";
+import {
+  codexBinaryFingerprint,
+  codexCandidatePaths,
+  findCodexBinary,
+  linuxDesktopAppBundledCodex,
+  preferSpawnablePath,
+  spawnableCommand,
+} from "../src/codex-binary.mjs";
 
 // Reported in #46: `where.exe codex` on an npm global install lists the
 // extensionless POSIX shim before the batch shim. Node cannot spawn the former
@@ -52,6 +59,49 @@ test("ignores blank lines in finder output", () => {
 test("returns undefined for empty finder output", () => {
   assert.equal(preferSpawnablePath([], "win32"), undefined);
   assert.equal(preferSpawnablePath(["", "   "], "darwin"), undefined);
+});
+
+test("prefers the Linux desktop app's bundled CLI over a standalone CLI", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-linux-desktop-cli-"));
+  const bundled = path.join(testRoot, "resources", "codex");
+  mkdirSync(path.dirname(bundled), { recursive: true });
+  writeFileSync(bundled, "");
+
+  try {
+    assert.equal(
+      linuxDesktopAppBundledCodex({ platform: "linux", roots: [testRoot] }),
+      bundled,
+    );
+    const candidates = codexCandidatePaths({ platform: "linux", linuxDesktopRoots: [testRoot] });
+    assert.ok(candidates.indexOf(bundled) < candidates.indexOf("/usr/local/bin/codex"));
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Codex binary fingerprint changes when the executable identity changes", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-binary-fingerprint-"));
+  const firstPath = path.join(testRoot, "first", "codex.exe");
+  const secondPath = path.join(testRoot, "second", "codex.exe");
+  mkdirSync(path.dirname(firstPath), { recursive: true });
+  mkdirSync(path.dirname(secondPath), { recursive: true });
+  writeFileSync(firstPath, "same bytes");
+  writeFileSync(secondPath, "same bytes");
+
+  try {
+    const first = codexBinaryFingerprint(firstPath);
+    const second = codexBinaryFingerprint(secondPath);
+    assert.match(first, /^[a-f0-9]{64}$/);
+    assert.match(second, /^[a-f0-9]{64}$/);
+    assert.notEqual(first, second, "version-hashed install path contributes to identity");
+
+    const beforeMutation = codexBinaryFingerprint(firstPath);
+    writeFileSync(firstPath, "different bytes");
+    const afterMutation = codexBinaryFingerprint(firstPath);
+    assert.notEqual(beforeMutation, afterMutation, "replaced binary invalidates identity");
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
 });
 
 test("a Windows batch shim runs through cmd.exe with its path escaped", () => {

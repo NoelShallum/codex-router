@@ -87,9 +87,10 @@ async function closeServer(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
-function curatedModels() {
+function curatedModels(genericBaseUrl = "https://generic-google.example.test/v1") {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gemini-trailing-turns-"));
   const file = path.join(dir, "user-models.json");
+  const providersFile = path.join(dir, "generic-providers.json");
   const model = ({ provider, id, gatewayModel, upstreamModel, requiresTrailingUserTurn }) => ({
     slug: `${provider}/${id}`,
     gatewayModel,
@@ -138,21 +139,48 @@ function curatedModels() {
     gatewayModel: "openrouter-plain",
     upstreamModel: "reseller/plain-model",
   });
+  // Generic provider identity is operator-owned. A valid id that happens to
+  // match a built-in provider's `ownedBy` value must not inherit that
+  // provider's destructive compatibility behavior.
+  const genericGoogle = model({
+    provider: "google",
+    id: "ordinary-generic",
+    gatewayModel: "google-ordinary-generic",
+    upstreamModel: "vendor/ordinary-generic",
+  });
   writeFileSync(
     file,
     JSON.stringify({
       version: 1,
-      models: [official, optedIn, namedReseller, other],
+      models: [official, optedIn, namedReseller, other, genericGoogle],
+    }),
+    "utf8",
+  );
+  writeFileSync(
+    providersFile,
+    JSON.stringify({
+      version: 1,
+      providers: [{
+        id: "google",
+        displayName: "Operator Google Alias",
+        baseUrl: genericBaseUrl,
+        adapter: "openai-chat",
+        headers: {},
+        allowPrivate: genericBaseUrl.startsWith("http://127.0.0.1:"),
+        enabled: true,
+      }],
     }),
     "utf8",
   );
   return {
     dir,
     file,
+    providersFile,
     official: { gateway: official.gatewayModel, slug: official.slug },
     optedIn: { gateway: optedIn.gatewayModel, slug: optedIn.slug },
     namedReseller: { gateway: namedReseller.gatewayModel, slug: namedReseller.slug },
     other: { gateway: other.gatewayModel, slug: other.slug },
+    genericGoogle: { gateway: genericGoogle.gatewayModel, slug: genericGoogle.slug },
   };
 }
 
@@ -162,12 +190,13 @@ test("API forwarder trims only official and explicitly opted-in trailing model t
     upstreamRequests.push(await bodyJson(request));
     json(response, 200, { choices: [] });
   });
-  const models = curatedModels();
+  const models = curatedModels(`http://127.0.0.1:${upstream.port}/v1`);
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "gemini-forwarder-state-"));
   const forwarderPort = await openPort();
   const forwarder = run("api-forwarder.mjs", {
     CODEX_ROUTER_API_PORT: String(forwarderPort),
     MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: models.providersFile,
     MODEL_ROUTER_USER_MODELS: models.file,
     OPENROUTER_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
     OPENROUTER_API_KEY: "TEST_OPENROUTER_API_KEY",
@@ -215,6 +244,12 @@ test("API forwarder trims only official and explicitly opted-in trailing model t
       { role: "user", content: "hello" },
       { role: "assistant", content: "interrupted answer" },
     ]);
+
+    await forward(models.genericGoogle.gateway);
+    assert.deepEqual(upstreamRequests.at(-1).messages, [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "interrupted answer" },
+    ]);
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
@@ -225,18 +260,32 @@ test("API forwarder trims only official and explicitly opted-in trailing model t
 
 test("router trims only official and explicitly opted-in trailing Responses model turns", async () => {
   const gatewayRequests = [];
+  const healthRequests = [];
   const gateway = await mockServer(async (request, response) => {
+    if (request.method === "GET" && request.url?.endsWith("-health")) {
+      healthRequests.push(request.url);
+      json(response, 200, { ok: true });
+      return;
+    }
     gatewayRequests.push(await bodyJson(request));
     json(response, 200, { id: "resp_test", object: "response", output: [] });
   });
   const models = curatedModels();
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "gemini-router-state-"));
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: [] })}\n`,
+  );
   const routerPort = await openPort();
   const router = run("router.mjs", {
     CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_SHOW_ALL_MODELS: "0",
     MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: models.providersFile,
     MODEL_ROUTER_USER_MODELS: models.file,
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/api-health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/gateway-health`,
     CODEX_ROUTER_QUIET: "1",
   });
 
@@ -265,6 +314,16 @@ test("router trims only official and explicitly opted-in trailing Responses mode
 
   try {
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const health = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/health`);
+    const healthPayload = await health.json();
+    assert.equal(health.status, 200, JSON.stringify(healthPayload));
+    assert.equal(healthPayload.api.reachable, true);
+    assert.ok(healthRequests.includes("/api-health"));
+    writeFileSync(
+      path.join(stateDir, "enabled-providers.json"),
+      `${JSON.stringify({ version: 1, providers: ["gemini-api", "openrouter"] })}\n`,
+    );
+
     await route(models.official.slug);
     assert.deepEqual(gatewayRequests.at(-1).input, [
       {
@@ -288,6 +347,10 @@ test("router trims only official and explicitly opted-in trailing Responses mode
     assert.equal(gatewayRequests.at(-1).input.at(-1).role, "assistant");
 
     await route(models.other.slug);
+    assert.equal(gatewayRequests.at(-1).input.length, 2);
+    assert.equal(gatewayRequests.at(-1).input.at(-1).role, "assistant");
+
+    await route(models.genericGoogle.slug);
     assert.equal(gatewayRequests.at(-1).input.length, 2);
     assert.equal(gatewayRequests.at(-1).input.at(-1).role, "assistant");
   } finally {

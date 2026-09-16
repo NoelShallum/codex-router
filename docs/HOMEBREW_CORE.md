@@ -1,17 +1,36 @@
 # Homebrew core submission
 
-Codex Router can be proposed to `Homebrew/homebrew-core` after the upstream
-project and its formula meet Homebrew's acceptance requirements. There is no
-application form: the submission is a pull request adding
-`Formula/c/codex-router.rb` to `homebrew-core`.
+Codex Router is eligible to be proposed to `Homebrew/homebrew-core`. There is
+no application form: the submission is a pull request adding
+`Formula/c/codex-router.rb` to `homebrew-core`. It has **not** been accepted
+yet, so the public install remains the explicit tap until that pull request is
+merged.
+
+As checked on August 28, 2026, the repository is more than 30 days old and its
+stars and forks exceed Homebrew's self-submission notability threshold. v0.5.0
+is stable but predates the Homebrew desktop-build guard; submit v0.5.1 or newer.
+Recheck those facts immediately before opening the pull request instead of
+treating this note as permanent approval.
+
+The formula is intentionally CLI-first. It installs the router, provider
+setup, background service, and browser panel; it does not build or download the
+Electron Control Center, native tray/menu-bar app, or macOS desktop widget.
+Those remain part of the recommended source installer. Keeping desktop builds
+out of Homebrew setup avoids mutating the keg or downloading application code
+at runtime, and keeps the formula aligned with `homebrew/core` rather than a
+native-app cask.
+
+Do not submit the formula while its source URL still points at v0.5.0. Publish
+v0.5.1 from the commit containing this change, then let the release workflow
+regenerate the formula URL and checksum before copying it into `homebrew-core`.
 
 ## Before submitting
 
-- Wait until the upstream repository is at least 30 days old. The repository
-  was created on July 19, 2026, so submit no earlier than August 19, 2026.
-- Publish a release that upstream explicitly identifies as stable. A beta or
-  release candidate is not eligible. The tag, `package.json` version, source
-  archive name, formula version, and release URL must agree.
+- Confirm the upstream repository is still at least 30 days old.
+- Publish the next release containing the Homebrew desktop-build guard and
+  identify it explicitly as stable. A beta or release candidate is not
+  eligible. The tag, `package.json` version, source archive name, formula
+  version, and release URL must agree.
 - Confirm the repository still meets Homebrew's self-submission notability
   threshold: 90 forks, 90 watchers, or 225 stars.
 - Confirm the release archive is immutable and that the formula contains its

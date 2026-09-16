@@ -13,11 +13,25 @@ const ANTHROPIC_PROVIDER = { id: "commandcode-messages", ownedBy: "commandcode",
 
 function fakeResponse() {
   const captured = { status: undefined, headers: undefined, body: "", ended: false };
+  // `setHeader`/`getHeader` are part of the surface the relay uses: the SSE
+  // head seats its content type through them so a terminal error frame can
+  // later tell this is an event stream (see writeEventStreamHead).
+  const seated = new Map();
   return {
     captured,
+    setHeader(name, value) {
+      seated.set(name, value);
+    },
+    getHeader(name) {
+      const wanted = String(name).toLowerCase();
+      for (const [key, value] of seated) {
+        if (key.toLowerCase() === wanted) return value;
+      }
+      return undefined;
+    },
     writeHead(status, headers) {
       captured.status = status;
-      captured.headers = headers;
+      captured.headers = { ...Object.fromEntries(seated), ...headers };
     },
     write(chunk) {
       captured.body += chunk;
@@ -89,7 +103,7 @@ test("a streaming turn is translated to openai chunks", async () => {
   assert.equal(seen.init.headers.Authorization, "Bearer user_key");
   // The upstream model id travels, not the gateway id the caller used.
   assert.equal(JSON.parse(seen.init.body).params.model, "deepseek/deepseek-v4-flash");
-  assert.equal(response.captured.headers["Content-Type"], "text/event-stream");
+  assert.match(response.captured.headers["Content-Type"], /^text\/event-stream\b/);
   assert.match(response.captured.body, /"content":"OK"/);
   assert.ok(response.captured.body.endsWith("data: [DONE]\n\n"));
   assert.equal(response.captured.ended, true);
@@ -156,6 +170,35 @@ test("an upstream refusal is relayed with its own status and message", async () 
   assert.equal(status.headers.get("retry-after"), "60");
   assert.equal(response.captured.status, 402);
   assert.equal(JSON.parse(response.captured.body).error.message, "insufficient credits");
+});
+
+test("a pooled refusal can be returned without committing the caller response", async () => {
+  const response = fakeResponse();
+  const outcome = await relayCommandCodeGenerate({
+    payload: { model: "x", stream: true, messages: [] },
+    model: MODEL,
+    provider: OPENAI_PROVIDER,
+    apiKey: "revoked_key",
+    baseUrl: "https://api.commandcode.ai/provider/v1",
+    response,
+    deferErrors: true,
+    at: AT,
+    fetchImpl: async () => ({
+      ok: false,
+      status: 401,
+      headers: new Headers({ "retry-after": "90" }),
+      text: async () => JSON.stringify({ success: false, message: "credential revoked" }),
+    }),
+  });
+  assert.equal(outcome.status, 401);
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.committed, false);
+  assert.equal(outcome.headers.get("retry-after"), "90");
+  assert.equal(JSON.parse(outcome.bodyText).error.message, "credential revoked");
+  assert.equal(outcome.responseHeaders["Content-Type"], "application/json");
+  assert.equal(response.captured.status, undefined);
+  assert.equal(response.captured.body, "");
+  assert.equal(response.captured.ended, false);
 });
 
 test("a mid-stream failure is reported inside the stream and still terminates", async () => {

@@ -201,3 +201,28 @@ export function serviceProxyEnvironment(
   }
   return values;
 }
+
+// The proxy environment a router process should adopt when its own is silent.
+//
+// `serviceProxyEnvironment` keeps the proxy alive across restarts by writing it
+// into the service definition, which covers every launchd/systemd/Task
+// Scheduler start. Nothing covers a router started any other way: `bin/start`
+// run from a terminal, a debugging foreground run, or -- the case that cost a
+// real installation -- a `stop; start` pair issued from a shell that a desktop
+// app spawned with no proxy variables at all. Such a process inherits the
+// caller's environment, finds no opt-in, dials every upstream directly, and
+// times out on a network that requires the proxy. The 502 surfaces far from
+// the cause and names an opt-in the operator can prove is already set, because
+// it is set -- in the service definition, not in this process.
+//
+// Silence is the only trigger. `proxyEnvironmentDeclared` treats a named proxy
+// or any `NODE_USE_ENV_PROXY`, including `0`, as the operator speaking, so a
+// deliberate unproxied run stays unproxied.
+export function inheritedProxyEnvironment(
+  environment = process.env,
+  { recorded, manifestPath, execArgv } = {},
+) {
+  if (proxyEnvironmentDeclared(environment, execArgv ?? process.execArgv)) return {};
+  const preserved = recorded !== undefined ? recorded : recordedProxyEnvironment(manifestPath);
+  return preserved ? { ...preserved } : {};
+}

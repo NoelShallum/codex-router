@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,13 +10,27 @@ import { commandOnPath, preferSpawnablePath, spawnableCommand } from "./spawnabl
 
 export { preferSpawnablePath, spawnableCommand };
 
+const LINUX_DESKTOP_APP_ROOTS = ["/opt/codex-desktop"];
+
+export function linuxDesktopAppBundledCodex({
+  platform = process.platform,
+  roots = LINUX_DESKTOP_APP_ROOTS,
+} = {}) {
+  if (platform !== "linux") return undefined;
+  return roots
+    .map((root) => path.join(root, "resources", "codex"))
+    .find((candidate) => existsSync(candidate) && !isShimFile(candidate));
+}
+
 // The ChatGPT/Codex desktop app bundles its CLI under a version-hashed
 // directory, e.g. %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe. That hash
 // changes on every app update, so scan for the newest installed version
 // instead of pinning a single path.
-function desktopAppBundledCodex() {
-  if (process.platform !== "win32") return undefined;
-  const localAppData = process.env.LOCALAPPDATA;
+function desktopAppBundledCodex({
+  platform = process.platform,
+  localAppData = process.env.LOCALAPPDATA,
+} = {}) {
+  if (platform !== "win32") return undefined;
   if (!localAppData) return undefined;
   const binDir = path.join(localAppData, "OpenAI", "Codex", "bin");
   if (!existsSync(binDir)) return undefined;
@@ -30,25 +45,34 @@ function desktopAppBundledCodex() {
   }
 }
 
-function candidates() {
-  const localAppData = process.env.LOCALAPPDATA;
+export function codexCandidatePaths({
+  platform = process.platform,
+  localAppData = process.env.LOCALAPPDATA,
+  home = os.homedir(),
+  linuxDesktopRoots,
+} = {}) {
   return [
     process.env.CODEX_BIN,
     process.env.CODEX_INSTALL_DIR &&
       path.join(
         process.env.CODEX_INSTALL_DIR,
-        process.platform === "win32" ? "codex.exe" : "codex",
+        platform === "win32" ? "codex.exe" : "codex",
       ),
     "/Applications/ChatGPT.app/Contents/Resources/codex",
     "/Applications/Codex.app/Contents/Resources/codex",
     "/opt/homebrew/bin/codex",
+    linuxDesktopAppBundledCodex({ platform, roots: linuxDesktopRoots }),
     "/usr/local/bin/codex",
     localAppData && path.join(localAppData, "Programs", "OpenAI", "Codex", "bin", "codex.exe"),
     localAppData && path.join(localAppData, "Programs", "Codex", "resources", "codex.exe"),
     localAppData && path.join(localAppData, "Programs", "Codex", "resources", "app", "bin", "codex.exe"),
-    desktopAppBundledCodex(),
-    path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "codex.exe" : "codex"),
+    desktopAppBundledCodex({ platform, localAppData }),
+    path.join(home, ".local", "bin", platform === "win32" ? "codex.exe" : "codex"),
   ].filter(Boolean);
+}
+
+function candidates() {
+  return codexCandidatePaths();
 }
 
 // The router must never resolve `codex` to the shim it installs in front of it.
@@ -77,6 +101,23 @@ export function findCodexBinary() {
   return resolveRealCodex()?.file;
 }
 
+export function codexBinaryFingerprint(binary = findCodexBinary()) {
+  if (!binary) return undefined;
+  try {
+    const stats = statSync(binary);
+    return createHash("sha256")
+      .update(JSON.stringify({
+        path: path.resolve(binary),
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        ctimeMs: stats.ctimeMs,
+      }))
+      .digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
 export function requireCodexBinary() {
   const binary = findCodexBinary();
   if (!binary) {
@@ -96,9 +137,11 @@ export function runCodex(args, options = {}) {
   });
 }
 
-// The version tells catalog code whether a cached native capture came from
-// the currently installed build. Undefined means "could not ask", which
-// callers must treat as unknown rather than as a mismatch.
+// The version is one compatibility signal for native catalog reuse, but
+// Desktop can replace its version-hashed runtime binary without changing this
+// string. codexBinaryFingerprint() supplies the complementary build identity.
+// Undefined means "could not ask", which callers treat as unknown rather than
+// as a mismatch.
 export function codexVersion() {
   try {
     const output = runCodex(["--version"], {

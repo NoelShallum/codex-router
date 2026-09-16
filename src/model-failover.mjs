@@ -5,7 +5,13 @@ import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { upstreamFailureKind } from "./error-translation.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
+import { cooldownScope } from "./provider-cooldown.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
+import { hasProviderTransportError } from "./transport-failure.mjs";
+import {
+  routedModelPreservesSearchContract,
+  routedModelSearchMode,
+} from "./search-capability.mjs";
 
 // Keeping a turn alive when the provider it was routed to has no usage left.
 //
@@ -76,12 +82,21 @@ function isoOrUndefined(value) {
 // request all produce the same answer from every other provider too, so a swap
 // would spend two more round trips to reprint the same failure with a different
 // model's name on it -- and for a credential in particular it would hide the one
-// fact the operator needs. A 5xx is excluded because upstream-retry.mjs already
-// absorbs the transient shapes and because masking a provider outage costs the
-// operator an incident they would want to see.
+// fact the operator needs. A generic 5xx is excluded because the routed turn
+// path retries only the forwarder's reserved pre-response transport marker;
+// masking any other provider outage costs the operator an incident they would
+// want to see.
 export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now } = {}) {
   const code = Number(status);
-  if (!Number.isFinite(code) || code < 400 || code >= 500) return { swap: false };
+  if (!Number.isFinite(code) || code < 400) return { swap: false };
+  // The local provider forwarder writes this reserved marker only before it
+  // has committed a response. A generic provider 5xx remains an application
+  // failure and is never switched away silently.
+  if (code >= 500) {
+    return hasProviderTransportError(bodyText)
+      ? { swap: true, reason: "transport" }
+      : { swap: false };
+  }
   const at = nowMs(now);
   const retryAfter = Number(retryAfterSeconds);
   const kind = upstreamFailureKind({ status: code, bodyText });
@@ -96,13 +111,17 @@ export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now
     // is not a reason to invent a window: the turn still fails over, and the
     // next turn tries the operator's chosen model again, which is the honest
     // behaviour when nothing is known.
-    return {
-      swap: true,
-      reason: "out_of_usage",
-      ...(Number.isFinite(retryAfter) && retryAfter > 0
-        ? { until: cappedUntil(at, retryAfter * 1_000) }
-        : {}),
-    };
+    //
+    // Some do say, in the body rather than a header, and that sentence is the
+    // provider naming its own window exactly as `Retry-After` would. Reading it
+    // is what stops an exhausted plan from being re-attempted once per turn for
+    // the whole window -- observed as 225 quota refusals against one Z.ai
+    // Coding Plan window, each one a full round trip before the failover.
+    const until =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? cappedUntil(at, retryAfter * 1_000)
+        : providerNamedResetUntil(bodyText, at);
+    return { swap: true, reason: "out_of_usage", ...(until ? { until } : {}) };
   }
 
   if (code === 429 && Number.isFinite(retryAfter) && retryAfter > MIN_RATE_LIMIT_COOLDOWN_SECONDS) {
@@ -116,7 +135,67 @@ function cappedUntil(at, durationMs) {
   return new Date(at + Math.min(durationMs, MAX_COOLDOWN_MS)).toISOString();
 }
 
+// Z.ai's Coding Plan refuses an exhausted window with code 1308 and the
+// sentence "Usage limit reached for 5 hour. Your limit will reset at
+// 2026-09-01 21:32:15", carrying no `Retry-After` at all. Narrow on purpose:
+// only a wall-clock stamp immediately after "reset at" counts, so prose that
+// merely mentions a reset never becomes a window.
+const PROVIDER_NAMED_RESET = /\breset(?:s)?\s+at\s+(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/i;
+
+// Every real UTC offset, in minutes, including the quarter-hour ones. The
+// provider's stamp carries no zone, so this is the set of instants it could
+// possibly denote.
+const UTC_OFFSET_MINUTES = Object.freeze([
+  -720, -660, -600, -570, -540, -480, -420, -360, -300, -240, -210, -180, -120, -60, 0, 60, 120,
+  180, 210, 240, 270, 300, 330, 345, 360, 390, 420, 480, 525, 540, 570, 600, 630, 660, 720, 765,
+  780, 840,
+]);
+
+// Which instant a zoneless stamp names depends on a zone neither side states.
+// Reading it as this host's local time is right only when the operator's clock
+// happens to match the plan's, and wrong by up to a day for everyone else --
+// in the direction that stops the router dispatching to a model that is in fact
+// available again.
+//
+// The two errors are not symmetric. Waking early costs one extra refusal and
+// re-records the window. Waking late withholds a model the operator chose and
+// is paying for, for as long as the misreading runs. So take the *earliest*
+// instant the stamp could denote that has not already passed: the true reset is
+// always one of these candidates, so the window can never outlast it.
+//
+// This also makes the reading independent of the host's own timezone, which is
+// why these assertions hold wherever `TZ` is set.
+//
+// A stamp with no future candidate at all records nothing rather than a window
+// in the past. `cappedUntil` keeps the far side bounded by the same six hours
+// every other source is held to.
+function providerNamedResetUntil(bodyText, at) {
+  if (typeof bodyText !== "string") return undefined;
+  const match = PROVIDER_NAMED_RESET.exec(bodyText);
+  if (!match) return undefined;
+  const wallMs = Date.parse(`${match[1]}T${match[2]}Z`);
+  if (!Number.isFinite(wallMs)) return undefined;
+  let earliest;
+  for (const offsetMinutes of UTC_OFFSET_MINUTES) {
+    const instant = wallMs - offsetMinutes * 60_000;
+    if (instant <= at) continue;
+    if (earliest === undefined || instant < earliest) earliest = instant;
+  }
+  return earliest === undefined ? undefined : cappedUntil(at, earliest - at);
+}
+
 // -- how long an empty provider is believed ----------------------------------
+//
+// Windows are keyed by `cooldownScope`, not by the canonical provider id.
+// Protocol variants of one subscription do share an allowance -- opencode's
+// Messages and Responses variants are the same plan behind a different wire
+// format, so one being empty means all of them are. opencode Zen is not:
+// it shares a credential and a selection toggle with Go, and is billed
+// separately at its own endpoint. Keying its window under the canonical parent
+// made a closed Go plan withdraw a Zen route the operator can still pay for,
+// and an exhausted Zen balance withdraw the whole Go subscription -- in both
+// directions a paid route silently swapped away for a window the provider
+// never named for it.
 
 function readCooldownDocument() {
   if (!existsSync(PROVIDER_COOLDOWNS_PATH)) return {};
@@ -157,7 +236,7 @@ export function readProviderCooldowns({ now } = {}) {
 // `undefined` once the window the provider named has passed, so expiry needs no
 // sweeper and a provider comes back by itself.
 export function providerCooldown(providerId, { now } = {}) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   return id ? readProviderCooldowns({ now })[id] : undefined;
 }
 
@@ -174,7 +253,7 @@ export function providerCooldown(providerId, { now } = {}) {
 // window of its own may sharpen the reason on a window that already exists.
 // It may never create one.
 export function recordProviderCooldown(providerId, { until, reason, now } = {}) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   if (!id) return undefined;
   const at = nowMs(now);
   const document = readCooldownDocument();
@@ -203,7 +282,7 @@ export function recordProviderCooldown(providerId, { until, reason, now } = {}) 
 // end the same way, with a real answer, and that answer is better evidence than
 // anything this file recorded.
 export function clearProviderCooldown(providerId) {
-  const id = canonicalProviderId(String(providerId || "").trim());
+  const id = cooldownScope(String(providerId || "").trim());
   if (!id) return false;
   const document = readCooldownDocument();
   if (!(id in document)) return false;
@@ -313,10 +392,21 @@ function supportsImageInput(model) {
 // (estimateInputTokens), which errs high by design -- the safe direction here,
 // because trading a quota failure for a context-window rejection is a strictly
 // worse turn than the one it replaced.
-function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled }) {
+function eligible(
+  model,
+  {
+    fromProvider,
+    estimatedTokens,
+    needsImage,
+    needsMultiAgentV2,
+    requiredSearchMode,
+    hasSearchHistory,
+    cooled,
+  },
+) {
   if (!model?.slug) return false;
   if (canonicalProviderId(model.provider) === fromProvider) return false;
-  if (cooled.has(canonicalProviderId(model.provider))) return false;
+  if (cooled.has(cooldownScope(model.provider))) return false;
   if (Number.isFinite(estimatedTokens) && Number(model.contextWindow) < estimatedTokens) {
     return false;
   }
@@ -325,6 +415,15 @@ function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMulti
   // is the registry saying this model must never be handed transcribed images.
   if (needsImage && !supportsImageInput(model) && model.visionBridge === false) return false;
   if (needsMultiAgentV2 && (model.multiAgentVersion || "v1") !== "v2") return false;
+  // Search is an execution contract, not just another tool label. Crossing
+  // from hosted to standalone search (or to no search) can strand an active
+  // call or replay history a destination never proved it accepts. If the
+  // original capability has disappeared while history still uses it, no
+  // candidate is safer than guessing.
+  if (!routedModelPreservesSearchContract(model, {
+    requiredMode: requiredSearchMode,
+    hasSearchHistory,
+  })) return false;
   return true;
 }
 
@@ -339,14 +438,41 @@ function eligible(model, { fromProvider, estimatedTokens, needsImage, needsMulti
 // caller, which is the only place that knows whether a session exists.
 export function rankFailoverCandidates(
   models,
-  { from, estimatedTokens, needsImage = false, needsMultiAgentV2 = false, chain = [], now } = {},
+  options = {},
 ) {
+  const {
+    from,
+    estimatedTokens,
+    needsImage = false,
+    needsMultiAgentV2 = false,
+    needsSearch = false,
+    hasSearchHistory = false,
+    requiredSearchMode: requiredSearchModeOverride,
+    chain = [],
+    now,
+  } = options;
   const fromProvider = canonicalProviderId(from?.provider || "");
+  // An explicitly captured absence is part of the request contract. `??`
+  // would mistake it for an omitted override and re-read mutable sidecar
+  // state after the source snapshot.
+  const requiredSearchMode = Object.hasOwn(options, "requiredSearchMode")
+    ? requiredSearchModeOverride
+    : needsSearch || hasSearchHistory
+      ? routedModelSearchMode(from)
+      : undefined;
   const cooled = new Set(Object.keys(readProviderCooldowns({ now })));
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
       model.slug !== from?.slug &&
-      eligible(model, { fromProvider, estimatedTokens, needsImage, needsMultiAgentV2, cooled }),
+      eligible(model, {
+        fromProvider,
+        estimatedTokens,
+        needsImage,
+        needsMultiAgentV2,
+        requiredSearchMode,
+        hasSearchHistory,
+        cooled,
+      }),
   );
 
   if (chain.length) {

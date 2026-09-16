@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  inheritedProxyEnvironment,
   proxyEnvironmentDeclared,
   recordedProxyEnvironment,
   redactProxyCredentials,
@@ -323,5 +324,74 @@ test("a login session's bypass list does not wipe the recorded proxy", () => {
     );
   } finally {
     cleanup();
+  }
+});
+
+test("a router started with a silent environment adopts the recorded proxy", () => {
+  const manifest = manifestWith({ proxyEnvironment: PROXIED });
+  try {
+    // The case that cost a live installation: a shell a desktop app spawned
+    // carries no proxy variables at all, so the router it starts would dial
+    // every upstream directly.
+    assert.deepEqual(
+      inheritedProxyEnvironment({ PATH: "/usr/bin" }, { manifestPath: manifest.file, execArgv: [] }),
+      PROXIED,
+    );
+    // A bypass list on its own is still silence -- it names no proxy and gives
+    // no permission to use one.
+    assert.deepEqual(
+      inheritedProxyEnvironment(
+        { no_proxy: "localhost" },
+        { manifestPath: manifest.file, execArgv: [] },
+      ),
+      PROXIED,
+    );
+  } finally {
+    manifest.cleanup();
+  }
+});
+
+test("an environment that speaks about the proxy is never overridden", () => {
+  const manifest = manifestWith({ proxyEnvironment: PROXIED });
+  try {
+    // Turning the proxy off is a decision, and the recorded values must not
+    // reinstate it behind the operator's back.
+    assert.deepEqual(
+      inheritedProxyEnvironment(
+        { NODE_USE_ENV_PROXY: "0" },
+        { manifestPath: manifest.file, execArgv: [] },
+      ),
+      {},
+    );
+    // So is naming a different proxy.
+    assert.deepEqual(
+      inheritedProxyEnvironment(
+        { HTTP_PROXY: "http://other:8080" },
+        { manifestPath: manifest.file, execArgv: [] },
+      ),
+      {},
+    );
+    // And so is the command-line form of the opt-in.
+    assert.deepEqual(
+      inheritedProxyEnvironment(
+        { PATH: "/usr/bin" },
+        { manifestPath: manifest.file, execArgv: ["--use-env-proxy"] },
+      ),
+      {},
+    );
+  } finally {
+    manifest.cleanup();
+  }
+});
+
+test("an install that recorded no proxy leaves a silent environment alone", () => {
+  const manifest = manifestWith({});
+  try {
+    assert.deepEqual(
+      inheritedProxyEnvironment({ PATH: "/usr/bin" }, { manifestPath: manifest.file, execArgv: [] }),
+      {},
+    );
+  } finally {
+    manifest.cleanup();
   }
 });

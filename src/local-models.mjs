@@ -524,7 +524,7 @@ export function localModelsSnapshot({
     }
     const current = families.get(identity.family) || {
       family: identity.family,
-      displayName: localModelDisplayName(tag),
+      displayName: LOCAL_FAMILY_RESEARCH[identity.family]?.displayName || localModelDisplayName(tag),
       variants: [],
     };
     if (!current.variants.includes(identity.variant)) current.variants.push(identity.variant);

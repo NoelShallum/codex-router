@@ -20,6 +20,9 @@ Required software:
 - `uv`, or Python 3.10+ with `venv`
 - Git for managed one-command installation and rollback
 - At least one Kimi OAuth, Kimi API, or DeepSeek API credential
+- On Windows, Windows PowerShell in `FullLanguage` mode with application-control
+  policy that permits `Add-Type`. The bounded process-tree owner fails before
+  launching a mutation command when that host capability is unavailable.
 
 The installer does not silently install a system package manager or runtime.
 When a prerequisite is missing, install it from its official source and rerun
@@ -45,7 +48,8 @@ definition stores the checkout's absolute path.
 macOS or Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/duolahypercho/codex-router/main/install.sh | sh -s -- --guided
+curl -fsSL https://raw.githubusercontent.com/duolahypercho/codex-router/main/install.sh \
+  | sh -s -- --target codex --guided --with-tray
 ```
 
 Windows PowerShell:
@@ -53,7 +57,7 @@ Windows PowerShell:
 ```powershell
 $installer = Join-Path $env:TEMP "codex-router-install.ps1"
 Invoke-WebRequest https://raw.githubusercontent.com/duolahypercho/codex-router/main/install.ps1 -OutFile $installer
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Guided
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -Target codex -Guided -WithTray
 ```
 
 Clone-and-review installation is also supported:
@@ -61,26 +65,38 @@ Clone-and-review installation is also supported:
 ```sh
 git clone https://github.com/duolahypercho/codex-router.git
 cd codex-router
-./install.sh --guided
+./install.sh --target codex --guided --with-tray
 ```
 
 ```powershell
 git clone https://github.com/duolahypercho/codex-router.git
 Set-Location codex-router
-./install.ps1 -Guided
+./install.ps1 -Target codex -Guided -WithTray
 ```
 
-Guided setup also offers to build and launch the desktop companion (the macOS
-menu bar app, or the Windows/Linux tray). `--with-tray` installs it without
-asking, `--no-tray` never offers it, and automatic mode skips it. On Windows
-the same choice is `-WithTray` / `-NoTray`.
+The recommended commands install the complete desktop experience without an
+extra question: the macOS menu-bar app with its Electron Control Center and
+desktop widget, or the Windows/Linux Electron Control Center and tray.
+`--no-tray` omits it; leaving out both tray flags makes guided setup ask. On
+Windows the matching options are `-WithTray` and `-NoTray`.
 
-On macOS the app bundle is placed in `~/Applications` and needs the Swift
-toolchain; a missing toolchain skips the step with guidance instead of failing
-setup. On Windows the Tauri companion is built with Rust and registered as a
-`Codex Router Tray` logon task so it returns after a reboot; a missing Rust
-toolchain skips the step the same way. You can still build it by hand with
-`scripts/build-desktop-tray.ps1`.
+On macOS one `Codex Router.app` bundle is placed in `~/Applications`. It keeps
+the Swift-native menu-bar tray and embeds the Electron Control Center, so the
+build needs the full Xcode app plus the Node runtime the router already
+requires. The standalone Command Line Tools are insufficient for the SwiftUI
+macro plug-ins used by recent macOS SDKs and do not provide the `xcodebuild`
+needed by the WidgetKit extension. The build honors `DEVELOPER_DIR` and the
+Xcode selected under **Xcode → Settings → Locations → Command Line Tools**. If
+that selection names the standalone tools, a standard
+`/Applications/Xcode.app` or `/Applications/Xcode-beta.app` is used for this
+build only; nonstandard installations can be selected with `DEVELOPER_DIR`.
+A missing full Xcode installation skips the companion with guidance instead of
+failing the already-installed router. Opening the app shows the Control Center,
+while a supervised login start keeps only the native tray visible. On Windows
+the packaged Electron Control Center owns both the native tray and the full
+window and is registered as the single `Codex Router Tray` logon task. Linux
+uses the same packaged Control Center and native Electron tray. Neither
+platform requires Rust.
 Guided setup walks through numbered steps: a provider list you toggle by
 number (`a` selects all, `n` clears, Enter continues) with a live
 ready/needs-key/needs-sign-in status per provider, credential onboarding for
@@ -134,6 +150,72 @@ grok login --oauth
 The OAuth token remains in `~/.grok/auth.json` and is sent only to xAI's Grok
 CLI inference proxy. The separate `grok-api` provider continues to use a
 separately billed xAI API key.
+
+Antigravity OAuth uses a router-managed browser sign-in; it does not require a
+Gemini API key or a separate CLI. **The Google Cloud project behind your OAuth
+client must be allowlisted for `cloudcode-pa.googleapis.com`, a private Google
+API.** Most projects are not allowlisted, and you cannot enable this API
+yourself: it requires the producer-side `servicemanagement.services.bind`
+permission, so `gcloud services enable` fails even for the project owner.
+Sign-in will succeed, but the live probe will fail with `SERVICE_DISABLED` if
+your project is not allowlisted. If your project is not allowlisted, this
+provider cannot currently be used. Sign in, run the explicit live compatibility
+probe, then enable the provider; these commands do not replace or disable any
+other provider already selected.
+
+macOS/Linux:
+
+Create a Google OAuth **Desktop app** client in a Google Cloud project you own.
+In Google Cloud Console, configure **APIs & Services > OAuth consent screen**
+for your account with a truthful name such as **Codex Router**, not Antigravity
+(including a test user when applicable), then choose **APIs & Services >
+Credentials > Create credentials > OAuth client ID > Desktop app**.
+Keep the resulting pair in that private browser tab. The login command binds
+`127.0.0.1` on an OS-assigned port, then opens a local page where you enter the
+matching pair. Only a loopback URL reaches the OS browser command; neither
+client value enters argv or terminal output. Do not reuse the official `agy`
+or Antigravity credential store.
+
+An older incompatible router record is preserved until you explicitly run
+`providers disconnect antigravity-oauth`; sign-in never overwrites or reuses
+it automatically.
+
+```sh
+./bin/model-router codex providers login antigravity-oauth
+./bin/model-router codex providers probe antigravity-oauth --live --yes
+./bin/model-router codex providers enable antigravity-oauth
+```
+
+Windows PowerShell:
+
+```powershell
+.\model-router.ps1 codex providers login antigravity-oauth
+.\model-router.ps1 codex providers probe antigravity-oauth --live --yes
+.\model-router.ps1 codex providers enable antigravity-oauth
+```
+
+The client pair and tokens are stored together in the router's owner-only state
+directory and can be removed from the desktop connection panel or with
+`providers disconnect antigravity-oauth`. They are not copied into the service
+definition. The live probe sends a small prompt and uses provider quota; add
+`--provision-project` only if you explicitly authorize project creation. It
+creates nothing unless a successful, schema-valid bootstrap response explicitly
+advertises the tier to provision; auth errors, server errors, malformed
+responses, and missing tiers fail closed. It identifies itself as Codex Router,
+and the provider remains disabled unless
+Google accepts that truthful identity. This is an unofficial compatibility
+path over Google's internal Antigravity service, so model availability and wire
+behavior may change independently of the public Gemini API.
+
+A successful probe records a nonpublishable pending generation and restarts an
+installed router service. Startup may boot that exact proof, then promotes it
+only after the complete local stack is healthy; restart failure or process
+death leaves it disabled. Earlier v2 proof records without activation metadata
+are unverified and must pass this explicit live probe again. The Antigravity
+forwarder is intentionally absent
+before proof exists, so an unrelated process occupying its unused port cannot
+break the rest of the router. A foreground development router must be restarted
+by its operator; the command reports this instead of claiming the route is live.
 
 Windows:
 
@@ -309,7 +391,7 @@ The full lifecycle works in this state:
 ./bin/model-router codex status
 ./bin/model-router codex doctor    # exits 0; idle state reports as warnings
 ./bin/model-router codex stop
-./bin/model-router codex start     # foreground; the service restarts it otherwise
+./bin/model-router codex start     # starts the background service again
 ./bin/model-router codex uninstall
 ```
 
@@ -463,7 +545,11 @@ value — the update is kept, because none of those say anything about the code
 that was just fetched, and discarding it means the next attempt repeats the
 same failure with the same code. Rolling back there is what made a setup-path
 bug impossible to fix by updating: the fix was fetched and then thrown away.
-Any other non-zero exit still restores the previous revision. Re-run setup to
+Any other non-zero exit still restores the previous revision, leaving HEAD
+detached at that commit so the running service keeps the last known-good
+tree. The next `install.sh` / `install.ps1` run, or `./bin/update`, switches
+back to `main` before fetching; a named non-`main` branch is still refused.
+Re-run setup to
 continue, or `./bin/rollback` (`./codex-router.ps1 rollback` on Windows) to
 return to the retained revision deliberately.
 
@@ -476,6 +562,12 @@ Windows). Homebrew owns the dependency tree in its formula prefix: its normal
 doctor repair regenerates config and services without mutating that tree, and a
 missing or broken package file must be repaired with `brew reinstall
 codex-router`.
+
+Homebrew packages only the router and CLI. Guided setup does not offer the
+Electron Control Center, tray/menu-bar app, or macOS desktop widget, and an
+explicit `--with-tray` is refused with guidance back to the complete source
+installer. This keeps setup from downloading or compiling desktop application
+code inside a Homebrew-managed installation.
 
 When upgrading from a release without caller capabilities, the installer
 generates one, replaces only the marked managed URL, tightens config permissions,

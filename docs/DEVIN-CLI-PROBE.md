@@ -48,24 +48,11 @@ You also need Node.js 22.19 or newer (`node --version`).
 ```sh
 git clone https://github.com/duolahypercho/codex-router
 cd codex-router
-git fetch origin feat/devin-cli-provider feat/issue-270-devin-probe-hardening
-git checkout feat/devin-cli-provider
-git merge --no-edit origin/feat/issue-270-devin-probe-hardening
 npm install
 
 ./bin/devin-probe                  # free
 ./bin/devin-probe --live --tools   # one short turn of ACU credit
 ```
-
-If the merge reports a conflict in `src/devin-cli-probe.mjs`, take this
-branch's version and continue — it is the newer probe:
-
-```sh
-git checkout --theirs src/devin-cli-probe.mjs && git add src/devin-cli-probe.mjs && git commit --no-edit
-```
-
-Once both branches have landed on `main`, the two `git fetch`/`git merge` lines
-above are unnecessary; a plain checkout of `main` is enough.
 
 Add `--model <uid>` to test a specific model from the list the free run printed.
 `--json` prints the same checklist as machine-readable JSON.

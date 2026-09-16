@@ -16,17 +16,35 @@ electronFuses:
   enableEmbeddedAsarIntegrityValidation: true
   onlyLoadAppFromAsar: true
 extraResources:
-  - from: ../desktop/src-tauri/icons/icon.png
+  - from: assets/icon.png
     to: icon.png
+  - from: ../../src/spawnable-command.mjs
+    to: src/spawnable-command.mjs
+  - from: ../../src/chatgpt-login-lease.mjs
+    to: src/chatgpt-login-lease.mjs
+  - from: ../../src/file-security.mjs
+    to: src/file-security.mjs
+  - from: ../../src/path-security.mjs
+    to: src/path-security.mjs
+  - from: ../../src/process-identity.mjs
+    to: src/process-identity.mjs
+  # Read-only helpers used by the desktop UI must match the UI version even
+  # when the shared router service is still owned by an older stable checkout.
+  # They remain behind fixed IPC operations and are covered by the app's outer
+  # signature; no renderer-controlled module path is accepted.
+  - from: ../../src
+    to: router-src
+    filter:
+      - "**/*"
 mac:
   category: public.app-category.developer-tools
-  icon: ../desktop/src-tauri/icons/icon.png
+  icon: assets/icon.png
   target: [dmg, zip]
 linux:
-  icon: ../desktop/src-tauri/icons/icon.png
+  icon: assets/icon.png
   category: Development
   executableName: codex-router-control-center
   target: [AppImage]
 win:
-  icon: ../desktop/src-tauri/icons/icon.ico
+  icon: assets/icon.ico
   target: [nsis]

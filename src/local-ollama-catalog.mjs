@@ -1,9 +1,12 @@
-// Official Ollama tag-page capture for the model families surfaced in
-// the local-model tray. Cloud aliases stay discoverable but are explicitly
-// non-downloadable: they route through Ollama cloud and have no local weights.
-// Refresh this manifest when the upstream tag pages change; arbitrary tags
-// and model-page URLs remain supported by the install field.
-// Captured from the official pages on 2026-08-11; qwen3.8 captured 2026-08-15.
+// Ollama-compatible model capture for the families surfaced in the local-model
+// tray. Most entries come from official Ollama tag pages. The namespaced GLM
+// entries come from Unsloth's Hugging Face GGUF repositories, whose model cards
+// publish exact `ollama run hf.co/...` commands. Cloud aliases stay discoverable
+// but are explicitly non-downloadable: they route through Ollama cloud and have
+// no local weights. Refresh this manifest when those upstream pages change;
+// arbitrary tags and model-page URLs remain supported by the install field.
+// Official pages captured 2026-08-11; qwen3.8 captured 2026-08-15; GLM GGUFs
+// captured 2026-08-29.
 
 // The tag list is intentionally exhaustive, but the tray should not make a
 // first-time user choose between every quantization and accelerator build.
@@ -54,6 +57,18 @@ export const LOCAL_FAMILY_RESEARCH = Object.freeze({
     status: "Official Ollama · 15 tags",
     capabilities: Object.freeze(["vision", "tools", "thinking"]),
     note: "Meta's 30B open model for long-running local agents and tool use.",
+  }),
+  "hf.co/unsloth/GLM-5.3-GGUF": Object.freeze({
+    displayName: "GLM-5.3",
+    status: "Unsloth GGUF · 5 local quants",
+    capabilities: Object.freeze(["tools", "thinking"]),
+    note: "Community quantizations of Z.ai's 754B model. Even the smallest build is about 217 GB; capability and Codex checks run after pull.",
+  }),
+  "hf.co/unsloth/GLM-5.3-Flash-GGUF": Object.freeze({
+    displayName: "GLM-5.3-Flash",
+    status: "Unsloth GGUF · 7 local quants",
+    capabilities: Object.freeze(["vision", "tools", "thinking"]),
+    note: "Community quantizations of Z.ai's 321B multimodal model. The smallest build is about 93.1 GB; capability and Codex checks run after pull.",
   }),
 });
 
@@ -260,6 +275,17 @@ export const EXPLORE_LOCAL_MODELS = Object.freeze(
     {"tag": "muse-glimmer:30b-q4_K_M", "sizeGb": 18, "tools": false, "context": 131072, "codex": "unverified", "displayName": "Muse Glimmer · 30b q4_K_M", "note": "Official Ollama tag; capabilities are checked after pull.", "downloadable": true},
     {"tag": "muse-glimmer:30b-q8_0", "sizeGb": 31, "tools": false, "context": 131072, "codex": "unverified", "displayName": "Muse Glimmer · 30b q8_0", "note": "Official Ollama tag; capabilities are checked after pull.", "downloadable": true},
     {"tag": "muse-glimmer:30b-bf16", "sizeGb": 57, "tools": false, "context": 131072, "codex": "unverified", "displayName": "Muse Glimmer · 30b bf16", "note": "Official Ollama tag; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-GGUF:UD-IQ1_S", "sizeGb": 217, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3 · UD-IQ1_S", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-GGUF:UD-IQ1_M", "sizeGb": 228, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3 · UD-IQ1_M", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-GGUF:UD-Q2_K_XL", "sizeGb": 254, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3 · UD-Q2_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-GGUF:UD-Q3_K_XL", "sizeGb": 343, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3 · UD-Q3_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-GGUF:UD-Q4_K_XL", "sizeGb": 467, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3 · UD-Q4_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S", "sizeGb": 93.1, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-IQ1_S", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_M", "sizeGb": 97.6, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-IQ1_M", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-Q2_K_XL", "sizeGb": 109, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-Q2_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ3_XXS", "sizeGb": 120, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-IQ3_XXS", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-Q3_K_XL", "sizeGb": 148, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-Q3_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ4_XS", "sizeGb": 157, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-IQ4_XS", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
+    {"tag": "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL", "sizeGb": 200, "tools": false, "context": 1048576, "codex": "unverified", "displayName": "GLM-5.3-Flash · UD-Q4_K_XL", "note": "Unsloth community GGUF for local Ollama; capabilities are checked after pull.", "downloadable": true},
   ].map((entry) => Object.freeze(entry)),
 );
-

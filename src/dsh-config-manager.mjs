@@ -23,8 +23,10 @@ import {
   DSH_SETTINGS_PATH,
   CALLER_SECRET_PATH,
   PORTS,
+  LEGACY_PORTS,
 } from "./paths.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
+import { refreshDshCallerCapabilityDocuments } from "./caller-key-client-refresh.mjs";
 import {
   DSH_CREDENTIAL_REF,
   DSH_ROUTE_ID,
@@ -137,38 +139,148 @@ export function removeRouteFromSettings(contents) {
   return joinLines(normalizeTrailing(lines));
 }
 
+// The harness's credentials document comes in two shapes. Current builds wrap
+// the reference map in a small envelope; the builds this integration was first
+// written against kept the map at the document root:
+//
+//   version: 1          DEEPSEEK_API_KEY: sk-…
+//   refs:               OPENAI_API_KEY: sk-…
+//     DEEPSEEK_API_KEY: sk-…
+//
+const CREDENTIAL_REFS_KEY = "refs";
+const CREDENTIAL_VERSION_KEY = "version";
+
+/**
+ * Decides which of the two shapes a credentials document is written in.
+ *
+ * `refs` present settles it. Absent, `version` settles it the other way: that
+ * is a current harness whose reference map has not been written yet, which is
+ * exactly the state a first install meets and the one where guessing wrong is
+ * silent — the harness resolves `apiKeyEnv` under `refs`, finds nothing, and
+ * the route 401s with the key sitting one level too high. An empty document is
+ * the same state with the envelope not yet written, so it adopts the current
+ * shape too. Only a document already holding references at its root is read as
+ * the legacy one, because there the evidence is in the file.
+ */
+function credentialEnvelope(document) {
+  const refs = document.root.children.get(CREDENTIAL_REFS_KEY);
+  if (refs) {
+    if (refs.inline) {
+      throw new Error(
+        `Refusing to edit the harness credentials document: "${CREDENTIAL_REFS_KEY}" is written ` +
+          "as an inline value rather than a block.",
+      );
+    }
+    return { refs, wrapped: true };
+  }
+  return {
+    refs: undefined,
+    wrapped:
+      document.root.children.has(CREDENTIAL_VERSION_KEY) || document.root.children.size === 0,
+  };
+}
+
+/** The key path this document keeps `reference` at, in whichever shape it is. */
+function credentialPath(document, reference) {
+  return credentialEnvelope(document).wrapped ? [CREDENTIAL_REFS_KEY, reference] : [reference];
+}
+
+// A multi-line value is legal in both shapes (the harness round-trips those), a
+// nested mapping is not: that is a different document wearing this file's name,
+// and rewriting it would be a guess. The envelope adds one legal level of
+// nesting and not one byte more, so its own entries are held to the same rule —
+// a `refs:` holding `server:\n  host: …` is somebody's configuration file, not
+// a reference map, however much the top of it matches.
+function assertCredentialDocument(document, refs) {
+  const nested = (owner) => {
+    throw new Error(
+      `Refusing to edit the harness credentials document: "${owner}" holds a nested mapping, ` +
+        "so this file is not a credential reference document.",
+    );
+  };
+  for (const node of document.root.children.values()) {
+    if (node === refs) {
+      for (const entry of refs.children.values()) {
+        if (entry.children.size) nested(`${CREDENTIAL_REFS_KEY}.${entry.key}`);
+      }
+      continue;
+    }
+    if (node.children.size) nested(node.key);
+  }
+}
+
+function withoutNode(document, node) {
+  const lines = [...document.lines];
+  lines.splice(node.index, node.endIndex - node.index + 1);
+  return lines;
+}
+
 /**
  * Sets one credential reference in the harness's credentials document.
  *
- * The document is a flat mapping of reference to value and nothing else, so a
- * nested or sequence root is somebody else's file under the harness's name and
- * is refused rather than replaced.
+ * Both shapes are written in place; neither is converted into the other, since
+ * the shape belongs to the harness build that reads the file. Anything that is
+ * not a reference map in either shape — a nested mapping at the root, a nested
+ * mapping inside `refs`, an inline `refs` — is refused with the file untouched.
  */
 export function applyCredential(contents, reference, value) {
-  const document = scanYamlDocument(contents);
-  for (const node of document.root.children.values()) {
-    // A multi-line value is legal here (the harness round-trips those), a
-    // nested mapping is not: that is a different document wearing this file's
-    // name, and rewriting it would be a guess.
-    if (node.children.size) {
-      throw new Error(
-        `Refusing to edit the harness credentials document: "${node.key}" holds a nested mapping, ` +
-          "so this file is not a flat credential reference document.",
-      );
-    }
-  }
-  const rendered = [`${reference}: ${yamlScalar(value)}`];
-  return joinLines(normalizeTrailing(spliceYamlBlock(document, [reference], rendered)));
+  const initial = scanYamlDocument(contents);
+  const { wrapped } = credentialEnvelope(initial);
+  assertCredentialDocument(initial, initial.root.children.get(CREDENTIAL_REFS_KEY));
+
+  // A build of this router from before the envelope was understood wrote our
+  // own reference at the root of a document the harness reads through `refs`.
+  // That copy is ours, it sits where the harness never looks, and leaving it
+  // would put a second copy of the caller key on disk — one no uninstall of
+  // that era would find again. Take it out; nothing else is touched.
+  const misplaced = wrapped ? yamlNode(initial, [reference]) : undefined;
+  const document = misplaced
+    ? scanYamlDocument(withoutNode(initial, misplaced).join("\n"))
+    : initial;
+
+  const refs = wrapped ? document.root.children.get(CREDENTIAL_REFS_KEY) : undefined;
+  // Follow whatever indentation the envelope already uses for a sibling
+  // reference rather than assuming two spaces, for the same reason
+  // `applyRouteToSettings` does — except that here it is not merely untidy:
+  // `refs.indent + 2` is the column of the `refs:` key itself, so a document
+  // whose entries are indented four spaces would be handed a two-space sibling,
+  // and that mixed-indent block is not YAML any parser will read back. The
+  // whole file is the harness's credential store, so the loss would be every
+  // adapter's key, not ours.
+  const sibling = refs && [...refs.children.values()][0];
+  const indent = wrapped
+    ? " ".repeat(sibling ? sibling.indent : (refs ? refs.indent : 0) + 2)
+    : "";
+  const rendered = [`${indent}${reference}: ${yamlScalar(value)}`];
+  const path = wrapped ? [CREDENTIAL_REFS_KEY, reference] : [reference];
+  return joinLines(normalizeTrailing(spliceYamlBlock(document, path, rendered)));
 }
 
-/** Removes one credential reference, leaving every other entry in place. */
+/**
+ * Removes one credential reference, leaving every other entry in place.
+ *
+ * Every place this router may have written its own reference goes: the
+ * envelope entry, and — on a document a pre-envelope build wrote into — the
+ * stray root-level one beside it. A `refs:` key left holding nothing goes with
+ * it, exactly as `removeRouteFromSettings` prunes an emptied `providers:`. An
+ * empty mapping there is not the same as an absent one, since the harness reads
+ * a valueless key as null rather than as "no references".
+ */
 export function removeCredential(contents, reference) {
-  const document = scanYamlDocument(contents);
-  const node = yamlNode(document, [reference]);
-  if (!node) return joinLines(normalizeTrailing(document.lines));
-  const lines = [...document.lines];
-  lines.splice(node.index, node.endIndex - node.index + 1);
-  return joinLines(normalizeTrailing(lines));
+  let text = String(contents ?? "");
+  for (;;) {
+    const document = scanYamlDocument(text);
+    const node =
+      yamlNode(document, [CREDENTIAL_REFS_KEY, reference]) || yamlNode(document, [reference]);
+    if (!node) return joinLines(normalizeTrailing(document.lines));
+    let removal = node;
+    if (node.path.length > 1) {
+      const parent = yamlNode(document, [CREDENTIAL_REFS_KEY]);
+      if (parent && parent.children.size === 1) removal = parent;
+    }
+    // Each pass removes at least one line, so this terminates.
+    text = withoutNode(document, removal).join("\n");
+  }
 }
 
 /** Replaces the `agent-default-model` section with one naming a routed model. */
@@ -249,10 +361,11 @@ function restoreDefaultModel(contents) {
  * The routed models the harness should be offered, vision bridge included.
  *
  * The rule is not the harness's own -- what may be published to a client that
- * carries no ChatGPT session of its own is the same question for every such
- * client -- so it lives in `routed-client-models.mjs` and both integrations
- * read it. Two copies would drift, and the way that shows is one picker
- * offering a model the other just lost.
+ * carries no ChatGPT session of its own, after the user's one-time router-plane
+ * authorization, is the same question for every such client -- so it lives in
+ * `routed-client-models.mjs` and both integrations read it. Two copies would
+ * drift, and the way that shows is one picker offering a model the other just
+ * lost.
  */
 export function dshRoutedModels() {
   return routedClientModels();
@@ -360,9 +473,10 @@ function routerCallerKey() {
  */
 export function subagentPreset() {
   const { models } = dshRoutedModels();
-  // The same proven set Codex's native spawn overrides draw from: a model
-  // marked `multiAgentVersion: "v2"` has been through the collaboration probe,
-  // and the user has not switched it off.
+  // The same repository-certified set Codex's native spawn overrides draw
+  // from: a v2 route has an accepted native-collaboration application (or an
+  // exact pre-workflow grandfathered identity), and the user has not switched
+  // it off. Machine-local compatibility probes never enter this set.
   const eligible = subagentEligibleModels(models, readMultiAgentSettings());
   const chosen = dshDefaultModel(eligible.length ? eligible : models);
   return {
@@ -384,6 +498,14 @@ export function subagentPreset() {
   };
 }
 
+export function refreshCallerCapability() {
+  assertStateOwnership("refresh the DeepSeek Harness caller capability");
+  const refreshed = refreshDshCallerCapabilityDocuments({ settings: readDocument(DSH_SETTINGS_PATH), credentials: readDocument(DSH_CREDENTIALS_PATH), baseUrl: callerBase(), secret: routerCallerKey(), port: PORTS.router, legacyPort: LEGACY_PORTS.router });
+  writeDocument(DSH_CREDENTIALS_PATH, refreshed.credentials);
+  writeDocument(DSH_SETTINGS_PATH, refreshed.settings);
+  return { refreshed: true, settings: DSH_SETTINGS_PATH, credentials: DSH_CREDENTIALS_PATH };
+}
+
 export function status() {
   const settings = readDocument(DSH_SETTINGS_PATH);
   let route;
@@ -396,7 +518,13 @@ export function status() {
   const credentials = readDocument(DSH_CREDENTIALS_PATH);
   let credentialPresent = false;
   try {
-    credentialPresent = Boolean(yamlNode(scanYamlDocument(credentials), [DSH_CREDENTIAL_REF]));
+    // Resolved through the same shape decision the writer makes, so this can
+    // never report a credential the harness cannot read: a key at the root of
+    // an enveloped document is present on disk and absent to the harness, and
+    // reporting that as installed turns a missing credential into a 401 with
+    // no diagnostic anywhere.
+    const document = scanYamlDocument(credentials);
+    credentialPresent = Boolean(yamlNode(document, credentialPath(document, DSH_CREDENTIAL_REF)));
   } catch {
     credentialPresent = false;
   }
@@ -431,6 +559,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const command = process.argv[2] || "status";
   const handlers = {
     status: () => status(),
+    "caller-capability-refresh": () => refreshCallerCapability(),
     install: () => install({ setDefaultModel: process.argv.includes("--set-default-model") }),
     uninstall: () => uninstall(),
     "subagent-preset": () => subagentPreset(),

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
+import { upstreamFailureKind } from "./error-translation.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
+import { cooldownUntil, parseRateLimitHeaders } from "./rate-limit-headers.mjs";
 
 // A text-only model cannot read a pasted screenshot, so the router reads it on
 // the model's behalf: every image part is sent to a vision-capable model the
@@ -189,7 +191,7 @@ export function supportsImageInput(model) {
 }
 
 export function visionCapableModels(models) {
-  return (Array.isArray(models) ? models : []).filter(supportsImageInput);
+  return (Array.isArray(models) ? models : []).filter((model) => supportsImageInput(model));
 }
 
 function engineCostRank(model) {
@@ -964,7 +966,23 @@ function isTransientError(error) {
   return !["TimeoutError", "AbortError"].includes(error?.name);
 }
 
-class TransientVisionError extends Error {}
+export class VisionUpstreamError extends Error {
+  constructor(message, { status, failureKind, cooldownUntil: until, retryable = false } = {}) {
+    super(message);
+    this.name = "VisionUpstreamError";
+    this.status = Number.isFinite(Number(status)) ? Number(status) : undefined;
+    this.failureKind = failureKind;
+    this.cooldownUntil = until;
+    this.retryable = retryable;
+  }
+}
+
+class TransientVisionError extends VisionUpstreamError {
+  constructor(message, metadata = {}) {
+    super(message, { ...metadata, retryable: true });
+    this.name = "TransientVisionError";
+  }
+}
 
 export async function describeImage({
   engine,
@@ -1000,11 +1018,12 @@ export async function describeImage({
         timeoutMs,
       });
     } catch (error) {
-      if (!(error instanceof TransientVisionError)) throw error;
+      if (error?.retryable !== true) throw error;
       lastTransient = error;
     }
   }
-  throw new Error(lastTransient?.message || `${engine.displayName || engine.slug} could not be reached`);
+  if (lastTransient) throw lastTransient;
+  throw new Error(`${engine.displayName || engine.slug} could not be reached`);
 }
 
 async function attemptDescribe({
@@ -1047,10 +1066,25 @@ async function attemptDescribe({
   }
   if (!upstream.ok) {
     // Never echo the gateway body: it can carry provider error text that names
-    // credential state.
+    // credential state. It is still safe to classify that text locally so an
+    // exhausted account is not mistaken for a one-second burst limit.
     const message = `${engine.displayName || engine.slug} answered HTTP ${upstream.status}`;
-    if (isTransientStatus(upstream.status)) throw new TransientVisionError(message);
-    throw new Error(message);
+    const bodyText = bytes.toString("utf8");
+    const failureKind = upstreamFailureKind({ status: upstream.status, bodyText });
+    const rateLimit = upstream.status === 429 ? parseRateLimitHeaders(upstream.headers) : undefined;
+    const until = cooldownUntil(rateLimit);
+    const metadata = {
+      status: upstream.status,
+      failureKind,
+      ...(until ? { cooldownUntil: until } : {}),
+    };
+    const retryable =
+      isTransientStatus(upstream.status) &&
+      failureKind !== "out_of_usage" &&
+      failureKind !== "entitlement" &&
+      !until;
+    if (retryable) throw new TransientVisionError(message, metadata);
+    throw new VisionUpstreamError(message, metadata);
   }
   let text;
   try {

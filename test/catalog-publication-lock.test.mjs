@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   utimesSync,
 } from "node:fs";
 import os from "node:os";
@@ -44,6 +45,28 @@ async function waitForLocked(child, stderr) {
   }
 }
 
+// The exclusivity probe is only meaningful while the holder's heartbeat is
+// demonstrably alive. proper-lockfile judges a lock stale -- and stealable --
+// the moment its directory mtime goes quiet past staleMs, so a probe that
+// lands after two slipped beats steals a *live* lock and the overlap check
+// reports the wrong failure. Watch one refresh land first: from a freshly
+// observed beat the lock cannot look stale again for another staleMs, which
+// is longer than the next beat's deadline, so the probe that follows runs in
+// a provably fresh window rather than betting on wall-clock margins.
+async function waitForHeartbeat(lockDirectory) {
+  let previous = statSync(lockDirectory).mtimeMs;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 800) {
+    await delay(200);
+    const current = statSync(lockDirectory).mtimeMs;
+    if (current > previous) return;
+  }
+  assert.fail(
+    "lock heartbeat never refreshed while the holder was live; " +
+      "exclusivity past the stale horizon cannot be probed",
+  );
+}
+
 test(
   "catalog publication lock heartbeats across processes, bounds overlap, and releases",
   { timeout: 10_000 },
@@ -78,6 +101,10 @@ test(
       // Wait beyond the stale horizon. A live holder remains exclusive only
       // if proper-lockfile's heartbeat has refreshed its directory mtime.
       await delay(2_300);
+      const lockDirectory = `${catalogPublicationLockTarget(stateDir)}.lock`;
+      // Inside the child's 3.5s hold, so the probe below still races a live
+      // holder rather than an already-released lock.
+      await waitForHeartbeat(lockDirectory);
       const started = Date.now();
       await assert.rejects(
         withCatalogPublicationLock(
@@ -176,14 +203,15 @@ test("catalog publication lock releases after failure without losing rollback sa
   }
 });
 
-test("catalog CLI entrypoint wraps main in the publication lock", () => {
+test("catalog CLI entrypoint wraps publication in the publication lock", () => {
   const source = readFileSync(path.join(root, "src", "catalog.mjs"), "utf8");
   assert.match(
     source,
     /import \{ withCatalogPublicationLock \} from "\.\/catalog-publication-lock\.mjs";/,
   );
+  assert.match(source, /export function publishCatalog\(/);
   assert.match(
     source,
-    /if \(process\.argv\[1\][\s\S]*?await withCatalogPublicationLock\(main\);/,
+    /if \(process\.argv\[1\][\s\S]*?await withCatalogPublicationLock\(\(\) => publishCatalog\(\)\);/,
   );
 });

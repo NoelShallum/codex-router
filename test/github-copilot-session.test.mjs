@@ -57,6 +57,24 @@ test("Copilot account routing is single-flight", async () => {
   assert.equal(first, second);
 });
 
+test("Copilot account routing cache is scoped to the exact source token", async () => {
+  resetGitHubCopilotSessionForTests();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ endpoints: {} }));
+  };
+  await ensureFreshGitHubCopilotSession("github_pat_TEST_SOURCE_A", {
+    fetchImpl,
+    now: 1_000,
+  });
+  await ensureFreshGitHubCopilotSession("github_pat_TEST_SOURCE_B", {
+    fetchImpl,
+    now: 2_000,
+  });
+  assert.equal(calls, 2);
+});
+
 test("Copilot account metadata cannot redirect credentials off GitHub", () => {
   assert.equal(
     copilotApiBaseUrl({ endpoints: { api: "https://githubcopilot.com/" } }),
@@ -84,6 +102,7 @@ test("Copilot authentication failures never echo the source token", async () => 
     }),
     (error) => {
       assert.equal(error.status, 503);
+      assert.equal(error.providerStatus, 401);
       assert.doesNotMatch(error.message, /TEST_SECRET_SOURCE_TOKEN/);
       return true;
     },

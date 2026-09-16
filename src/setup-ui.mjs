@@ -9,6 +9,7 @@ const ACTION_LABELS = Object.freeze({
   install: "needs CLI install",
   blocked: "CLI blocked by Windows",
   anonymous: "no API key",
+  configure: "needs local configuration",
 });
 
 const COLOR_CODES = Object.freeze({
@@ -51,6 +52,16 @@ export function renderProviderChoices(snapshots, selected, colorEnabled = false)
         colorEnabled,
       );
       return `  ${mark} ${position}. ${snapshot.displayName} — ${colored}`;
+    })
+    .join("\n");
+}
+
+export function renderModelChoices(models, selected) {
+  return models
+    .map((model, index) => {
+      const position = index + 1;
+      const mark = selected.has(position) ? "[x]" : "[ ]";
+      return `  ${mark} ${position}. ${model.displayName}`;
     })
     .join("\n");
 }

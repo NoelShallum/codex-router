@@ -714,6 +714,16 @@ test("install accepts --yes and --force together, in either order", () => {
   }
 });
 
+test("cataloged Hugging Face GGUFs require the oversized-model override", () => {
+  const tag = "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S";
+  const refused = runLocalModels("install", tag, "--yes");
+  assert.notEqual(refused.status, 0);
+  const state = JSON.parse(readFileSync(path.join(refused.childState, "download.json"), "utf8"));
+  assert.equal(state.status, "error");
+  assert.match(state.error, /Pass --force to download it anyway/);
+  assert.match(state.error, /needs about 112 GB to run/);
+});
+
 test("a missing Ollama is named as installable rather than reported as absent", () => {
   // Without --yes the command must say what to do next, not just that Ollama is
   // missing: one flag installs the runtime headlessly and then the model.

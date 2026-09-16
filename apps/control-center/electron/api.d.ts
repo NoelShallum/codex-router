@@ -3,13 +3,37 @@ export type SubagentMode = "all" | "selected" | "proven";
 export type VisionEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "default";
 export type ServiceAction = "status" | "start";
 export type TrayAction = "enable" | "disable" | "status" | "restart";
-export type HarnessId = "codex" | "deepcode";
+export type HarnessId =
+  | "codex"
+  | "dsh"
+  | "gemini"
+  | "cursor"
+  | "claude"
+  | "openclaw"
+  // Document-configured harnesses: published into rather than installed as.
+  // See `src/routed-harness-catalog.mjs`.
+  | "opencode"
+  | "pi"
+  | "omp"
+  | "commandcode"
+  | "hermes";
 export type HarnessSurface = "app" | "terminal";
 
 export interface HarnessDescriptor {
   id: HarnessId;
   displayName: string;
-  ownership: "openai" | "third-party";
+  ownership:
+    | "openai"
+    | "deepseek"
+    | "google"
+    | "cursor"
+    | "anthropic"
+    | "openclaw"
+    | "opencode"
+    | "pi"
+    | "omp"
+    | "commandcode"
+    | "nousresearch";
   description: string;
   cliInstalled: boolean;
   cliVersion?: string;
@@ -17,6 +41,21 @@ export interface HarnessDescriptor {
   configured: boolean;
   canInstall: boolean;
   installRequirement?: string;
+  /** Whether this client is installed and has an updater this router can run. */
+  canUpdate?: boolean;
+  /** The command an update would run, e.g. `opencode upgrade`. */
+  updateCommand?: string;
+  publicOrigin?: string;
+  agentConfigured?: boolean;
+  appConfigured?: boolean;
+  tunnel?: {
+    provider: "cloudflare";
+    binaryInstalled: boolean;
+    loggedIn: boolean;
+    configured: boolean;
+    hostname?: string;
+    nextAction: "install-cloudflared" | "login" | "choose-hostname" | "ready";
+  };
   docsUrl: string;
 }
 
@@ -25,6 +64,17 @@ export interface HarnessSnapshot {
   terminalAvailable: boolean;
   harnesses: HarnessDescriptor[];
 }
+
+export type AgentBridgeId = "anthropic" | "cursor" | "gemini";
+export interface AgentBridgeDescriptor {
+  id: AgentBridgeId;
+  displayName: string;
+  protocol: "claude-code" | "acp" | string;
+  installed: boolean;
+  sessions: number;
+  authentication: "client-owned" | "unavailable" | string;
+}
+export interface AgentBridgeSnapshot { version: 1; bridges: AgentBridgeDescriptor[]; }
 
 export interface HarnessSession {
   id: string;
@@ -53,7 +103,61 @@ export interface HarnessSession {
 export interface ContextSessionsSnapshot {
   fetchedAt: string;
   sessions: HarnessSession[];
-  counts: { total: number; codex: number; deepcode: number; archived: number };
+  counts: { total: number; codex: number; dsh: number; cursor: number; claude: number; gemini: number; openclaw: number; opencode: number; pi: number; omp: number; commandcode: number; hermes: number; archived: number };
+}
+
+export interface ChatGptSessionStatus {
+  sharing: "enabled" | "disabled";
+  session: "usable" | "expired" | "unavailable";
+  present: boolean;
+  expiresInHours?: number;
+  email?: string;
+}
+
+export interface ChatGptSubscriptionAccount {
+  id: string;
+  state: "active" | "paused" | "revoked" | string;
+  paused: boolean;
+  priority: number;
+  label?: string;
+  createdAt?: string;
+  subscription?: {
+    status?: "pending" | "usable" | "expired" | "invalid" | string;
+    authenticated?: boolean;
+    usable?: boolean;
+    expired?: boolean;
+    hasAccountId?: boolean;
+    expiresInHours?: number;
+    email?: string;
+    usage?: { period: "weekly" | "monthly" | "current"; remainingPercent: number; resetsAt?: number | null };
+  };
+  health?: { state?: string; lastStatus?: number; lastError?: string };
+  turns: number;
+  requests: number;
+}
+
+export interface ChatGptAccountPool {
+  version: number;
+  policy: {
+    enabled: boolean;
+    mode: "switch";
+    selectedAccountId?: string;
+  };
+  accounts: Record<string, ChatGptSubscriptionAccount>;
+  loginAttempts?: Record<string, {
+    status: "pending" | "failed";
+    error?: string;
+    retryable?: boolean;
+  }>;
+  sessions: { count: number };
+  profile?: ChatGptProfileSwitch;
+}
+
+export interface ChatGptProfileSwitch {
+  desired?: string;
+  active?: string;
+  pending: boolean;
+  running?: boolean;
 }
 
 export interface RouterControl {
@@ -62,6 +166,8 @@ export interface RouterControl {
   toggleMaximizeWindow(): Promise<unknown>;
   closeWindow(): Promise<unknown>;
   getSnapshot(): Promise<unknown>;
+  getChatGptSession(): Promise<ChatGptSessionStatus>;
+  getChatGptAccountPool(): Promise<ChatGptAccountPool>;
   getHealth(): Promise<unknown>;
   getProviders(): Promise<unknown>;
   discoverProviderModels(provider: string, options?: { refresh?: boolean }): Promise<unknown>;
@@ -73,6 +179,7 @@ export interface RouterControl {
   getDoctor(): Promise<unknown>;
   getPresence(): Promise<unknown>;
   getHarnesses(): Promise<HarnessSnapshot>;
+  getAgentBridges(): Promise<AgentBridgeSnapshot>;
   getContextSessions(): Promise<ContextSessionsSnapshot>;
   refreshAll(): Promise<unknown>;
   setProviderEnabled(provider: string, enabled: boolean): Promise<unknown>;
@@ -106,12 +213,29 @@ export interface RouterControl {
   setRouterDefault(model: string): Promise<unknown>;
   clearRouterDefault(): Promise<unknown>;
   setSignedRouting(enabled: boolean): Promise<unknown>;
+  setChatGptSessionSharing(enabled: boolean): Promise<ChatGptSessionStatus>;
+  addChatGptSubscriptionAccount(label?: string): Promise<unknown>;
+  loginChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  removeChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  setChatGptAccountSelection(selection: string): Promise<unknown>;
   setPresence(mode: PresenceMode): Promise<unknown>;
   controlService(action: ServiceAction): Promise<unknown>;
   controlTray(action: TrayAction): Promise<unknown>;
   launchHarness(harnessId: HarnessId, surface: HarnessSurface): Promise<unknown>;
-  installHarness(harnessId: "deepcode"): Promise<unknown>;
+  probeAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  loginAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  setupHarness(harnessId: HarnessId, hostname?: string): Promise<unknown>;
+  /** Move one routed client, or every installed one ("all"), to its latest release. */
+  updateHarness(harnessId: HarnessId | "all"): Promise<unknown>;
+  prepareCursorTunnel(): Promise<unknown>;
+  connectCursor(hostname?: string): Promise<unknown>;
+  disconnectCursor(): Promise<unknown>;
+  disconnectHarness(harnessId: HarnessId): Promise<unknown>;
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
+  onNavigation?(listener: (request: {
+    destination: "usage" | "usage-resets";
+    sourceId?: string;
+  }) => void): () => void;
   onOperation(listener: (event: { id?: string; name?: string; action?: string; status: string; message?: string; error?: string }) => void): () => void;
 }

@@ -2,16 +2,30 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
-import { validCallerSecret } from "./caller-auth.mjs";
-import { codexAuthStatus, findCodexBinary, runCodex } from "./codex-binary.mjs";
+import { redactCallerUrl, validCallerSecret } from "./caller-auth.mjs";
+import { codexAuthStatus, codexVersion, findCodexBinary, runCodex } from "./codex-binary.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
 import { privateFileIsProtected } from "./file-security.mjs";
 import { grokCliPreflight } from "./grok-cli.mjs";
 import { detectLegacyInstallations } from "./legacy-migration.mjs";
 import { routedCatalogConfigured } from "./catalog.mjs";
-import { MODEL_BY_SLUG, PROVIDERS } from "./model-registry.mjs";
+import { nativeCatalogVersionDrift } from "./native-catalog-freshness.mjs";
+import { readNativeCatalogSource } from "./native-catalog-source.mjs";
+import {
+  MODEL_BY_SLUG,
+  MODELS,
+  PROVIDERS,
+  providerNeedsNoKey,
+  RUNTIME_PROVIDERS,
+  RUNTIME_PROVIDER_WARNINGS,
+  USER_MODELS_SKIPPED,
+} from "./model-registry.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import {
+  antigravityOAuthHealth,
+  repairAntigravityOAuthPermissions,
+} from "./antigravity-oauth-status.mjs";
 import { kimiOAuthHealth } from "./oauth-status.mjs";
 import {
   applyMultiAgentCapabilities,
@@ -23,9 +37,15 @@ import { serviceFollowsHostApps } from "./presence-state.mjs";
 import { waitForRouterHealth } from "./router-health.mjs";
 import {
   CALLER_SECRET_PATH,
+  CLAUDE_CATALOG_PATH,
+  CLAUDE_LAUNCHER_PATH,
   CODEX_AGENTS_DIR,
   CODEX_HOME,
   CONFIG_PATH,
+  CURSOR_CATALOG_PATH,
+  CURSOR_LAUNCHER_PATH,
+  CURSOR_PUBLIC_SECRET_PATH,
+  CURSOR_STATE_DB_PATH,
   DSH_CATALOG_PATH,
   DSH_SETTINGS_PATH,
   GEMINI_CATALOG_PATH,
@@ -33,7 +53,10 @@ import {
   INTERNAL_SECRET_PATH,
   LITELLM_CONFIG_PATH,
   MERGED_CATALOG_PATH,
+  NATIVE_CATALOG_PATH,
+  OPENCLAW_CATALOG_PATH,
   PORTS,
+  SEARCH_SIDECARS_PATH,
   SOURCE_ROOT,
   TARGET,
 } from "./paths.mjs";
@@ -43,14 +66,24 @@ import {
   skillRequiredFields,
 } from "./skills-install.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
-import { credentialLabel, credentialStatus } from "./provider-credentials.mjs";
+import { credentialLabel } from "./provider-credentials.mjs";
+import { providerApiKeyPoolsSnapshot } from "./provider-api-key-pool.mjs";
+import {
+  effectiveProviderCredentialStatus,
+  resolveStoredCredential,
+} from "./provider-api-key-routing.mjs";
+import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
+import { trustedSearchProviderDescriptor } from "./search-sidecar-policy.mjs";
+import { readSearchSidecarState } from "./search-sidecar-state.mjs";
 import { providerNeedsCuration } from "./provider-onboarding.mjs";
 import { stateOwnershipStatus } from "./state-owner.mjs";
 import {
+  canonicalProviderId,
   providerSelectionStatus,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
+import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import {
   readVisionBridgeSettings,
   visionBridgeConfigured,
@@ -240,7 +273,12 @@ function repair() {
   // environment. Homebrew has already validated its package-owned tree above,
   // so its repair only regenerates configuration and services.
   const posixArguments = homebrewManaged ? [] : ["--force-deps"];
-  const windowsArguments = homebrewManaged ? ["-CheckoutInstall"] : ["-CheckoutInstall", "-ForceDeps"];
+  const windowsArguments = [
+    "-CheckoutInstall",
+    "-Target",
+    TARGET,
+    ...(homebrewManaged ? [] : ["-ForceDeps"]),
+  ];
   const result = process.platform === "win32"
     ? spawnSync(
         "powershell.exe",
@@ -262,6 +300,7 @@ function repair() {
       });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`Repair installer exited with ${result.status}.`);
+  repairAntigravityOAuthPermissions();
 }
 
 if (process.argv.includes("--help")) {
@@ -346,30 +385,61 @@ if (codexTarget) {
       : undefined,
   );
 }
-// Both clients hold the managed base URL, which is a local caller capability,
-// so both documents are held to the same privacy bound.
+// Gemini and DSH still carry the caller capability in their private documents.
+// Modern Codex providers obtain it from an auth command instead, so Codex's
+// config does not need to be a credential store. Legacy capability configs do.
 const privacyTarget = codexTarget
   ? CONFIG_PATH
   : TARGET === "gemini"
     ? GEMINI_ENV_PATH
-    : DSH_SETTINGS_PATH;
+    : TARGET === "cursor"
+      ? CURSOR_CATALOG_PATH
+      : TARGET === "claude"
+        ? CLAUDE_CATALOG_PATH
+        : TARGET === "openclaw"
+          ? OPENCLAW_CATALOG_PATH
+      : DSH_SETTINGS_PATH;
+const cursorAgentOnly = TARGET === "cursor" &&
+  !existsSync(CURSOR_CATALOG_PATH) && existsSync(CURSOR_LAUNCHER_PATH);
 const configMode = existsSync(privacyTarget)
   ? statSync(privacyTarget).mode & 0o777
   : undefined;
-const configProtected = privateFileIsProtected(privacyTarget);
+const codexConfigText = codexTarget && existsSync(CONFIG_PATH)
+  ? readFileSync(CONFIG_PATH, "utf8")
+  : "";
+const codexConfigCarriesCallerCapability =
+  codexTarget && redactCallerUrl(codexConfigText) !== codexConfigText;
+const privacyRequired = !codexTarget || codexConfigCarriesCallerCapability;
+const configProtected = cursorAgentOnly || (
+  configMode !== undefined && (!privacyRequired || privateFileIsProtected(privacyTarget))
+);
 add(
   configProtected ? "ok" : "fail",
   codexTarget
     ? "Codex config privacy"
     : TARGET === "gemini"
       ? "Gemini environment privacy"
+      : TARGET === "cursor"
+        ? "Cursor router-state privacy"
+        : TARGET === "claude"
+          ? "Claude router-state privacy"
+          : TARGET === "openclaw"
+            ? "OpenClaw router-state privacy"
       : "Harness settings privacy",
-  configMode === undefined
+  cursorAgentOnly
+    ? "agent-only; no Cursor App router-state document"
+    : configMode === undefined
     ? "missing"
-    : process.platform === "win32"
-      ? "current-user Windows ACL"
-      : `mode ${configMode.toString(8)}`,
-  "Run ./bin/doctor --fix; the managed router URL contains a local caller capability.",
+    : codexTarget && !privacyRequired
+      ? "router credentials stay outside config.toml"
+      : process.platform === "win32"
+        ? configProtected
+          ? "current-user Windows ACL"
+          : "Windows ACL is broader than the current user"
+        : `mode ${configMode.toString(8)}`,
+  configProtected
+    ? undefined
+    : "Run ./bin/doctor --fix; the managed router URL contains a local caller capability.",
 );
 
 let selection = { providers: [], explicit: false };
@@ -384,7 +454,13 @@ const routedTransportActive = codexTarget
   ? routedCatalogConfigured(existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "")
   : TARGET === "gemini"
     ? existsSync(GEMINI_CATALOG_PATH)
-    : existsSync(DSH_CATALOG_PATH);
+    : TARGET === "cursor"
+      ? existsSync(CURSOR_CATALOG_PATH) || existsSync(CURSOR_LAUNCHER_PATH)
+      : TARGET === "claude"
+        ? existsSync(CLAUDE_CATALOG_PATH) && existsSync(CLAUDE_LAUNCHER_PATH)
+        : TARGET === "openclaw"
+          ? existsSync(OPENCLAW_CATALOG_PATH)
+      : existsSync(DSH_CATALOG_PATH);
 // An install made with --no-provider --no-discovery is idle on purpose: the
 // selection is an explicit empty list and the discovery marker is set. That
 // state is what the operator asked for, so the empty selection and the empty
@@ -397,17 +473,29 @@ try {
   requiredRoutedModels = selectedConfiguredListedModels();
   catalogRoutedModels = routedTransportActive ? requiredRoutedModels : [];
   requiredModels = new Set(catalogRoutedModels.map((model) => model.slug));
+  // Registry selection and generic providers are two lists. A Poe-only
+  // install writes `enabled-providers.json` as `[]` and still serves curated
+  // generic routes, so naming only the registry file here reported
+  // "Enabled providers: none" while the Poe row below said OK (#774).
+  const enabledGenericIds = [...RUNTIME_PROVIDERS.values()]
+    .filter((provider) => provider.generic === true && genericProviderConfigured(provider.id))
+    .map((provider) => provider.id);
+  const enabledNames = [...selection.providers, ...enabledGenericIds];
   add(
-    selection.providers.length ? "ok" : idleInstall ? "warn" : "fail",
+    enabledNames.length ? "ok" : idleInstall ? "warn" : "fail",
     "Enabled providers",
-    selection.providers.length
-      ? `${selection.providers.join(", ")}${selection.explicit ? "" : " (legacy show-all mode)"}`
+    enabledNames.length
+      ? `${enabledNames.join(", ")}${
+        selection.explicit || enabledGenericIds.length ? "" : " (legacy show-all mode)"
+      }`
       : idleInstall
         ? "none (idle install: --no-provider)"
         : "none",
-    idleInstall
-      ? "Run ./bin/setup without --no-provider to enable a provider."
-      : "Run ./bin/setup --guided and choose at least one provider.",
+    enabledNames.length
+      ? undefined
+      : idleInstall
+        ? "Run ./bin/setup without --no-provider to enable a provider."
+        : "Run ./bin/setup --guided and choose at least one provider.",
   );
   // The router no longer refuses to serve on a selection file it cannot fully
   // resolve, so the damage has to be reported here instead of as a 502.
@@ -445,22 +533,44 @@ const catalogOk =
     ? requiredModels.size > 0 &&
       [...requiredModels].every((slug) => catalogModels.some((model) => model.slug === slug))
     : !catalogModels.some((model) => MODEL_BY_SLUG.has(String(model.slug))));
+let nativeCaptureDrift;
+if (codexTarget && codex && existsSync(NATIVE_CATALOG_PATH)) {
+  let adopted = false;
+  try {
+    adopted = Boolean(readNativeCatalogSource());
+  } catch {
+    // Invalid source state is not adoption proof; keep checking the router-owned capture.
+  }
+  try {
+    nativeCaptureDrift = nativeCatalogVersionDrift(
+      JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8")),
+      codexVersion(),
+      { adopted },
+    );
+  } catch {
+    // The merged-catalog check below remains authoritative for unreadable files.
+  }
+}
 // The merged catalog is the file Codex reads. A harness install has no
 // equivalent: its offer is the settings route, checked by "Harness routing
 // config" below. An idle install deliberately publishes no routed models, so
 // its catalog is held to the same standard as inactive transport: nothing
 // routable may be offered.
 if (codexTarget) add(
-  catalogOk ? "ok" : "fail",
+  !catalogOk ? "fail" : nativeCaptureDrift ? "warn" : "ok",
   "Merged catalog",
-  catalogOk
-    ? idleInstall
-      ? "idle install; no routed models"
-      : routedTransportActive
-        ? `${requiredModels.size} routed models`
-        : "native-only; routed transport is inactive"
-    : MERGED_CATALOG_PATH,
-  "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
+  !catalogOk
+    ? MERGED_CATALOG_PATH
+    : nativeCaptureDrift
+      ? `native catalog captured by ${nativeCaptureDrift.captured}; installed ${nativeCaptureDrift.current}`
+      : idleInstall
+        ? "idle install; no routed models"
+        : routedTransportActive
+          ? `${requiredModels.size} routed models`
+          : "native-only; routed transport is inactive",
+  nativeCaptureDrift
+    ? "Run ./bin/refresh-catalog, then fully quit and reopen Codex."
+    : "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
 );
 // The catalog tells Codex which models to offer; the gateway config decides
 // which it can actually route. When a second checkout writes one of them the
@@ -517,21 +627,24 @@ add(
 // DeepSeek-only install for a feature nobody switched on. It still reports what
 // is true, just at the severity the situation has.
 //
-// This check sees routed models only, so a native (ChatGPT-plan) engine is
-// invisible to it and a signed-in install may well read images fine while this
-// says nothing resolves.
+// Codex may spend a signed-in native vision engine on the caller's behalf.
+// The same installed-native gate used by catalog/control keeps this diagnostic
+// aligned with what the running Codex route can actually resolve.
 const visionSettings = readVisionBridgeSettings();
-const visionEngine = resolveVisionEngine(() => requiredRoutedModels, visionSettings);
+const visionCandidates = codexTarget && codexAuth?.authenticated === true
+  ? [...requiredRoutedModels, ...installedNativeVisionEngines({ hidden: readHiddenModels() })]
+  : requiredRoutedModels;
+const visionEngine = resolveVisionEngine(() => visionCandidates, visionSettings);
 if (visionSettings.enabled && !visionEngine) {
   const asked = visionBridgeConfigured();
   add(
     asked ? "warn" : "ok",
     "Vision bridge",
-    visionSettings.engine
+    visionSettings.engine && !visionSettings.defaulted
       ? `pinned engine ${visionSettings.engine} is not an enabled model that reads images`
       : asked
-        ? "enabled, but no enabled provider offers a model that reads images"
-        : "on by default, but no enabled provider offers a model that reads images yet",
+        ? "enabled, but no enabled vision engine is available"
+        : "on by default, but no enabled vision engine is available yet",
     "Enable a provider with a vision model, sign in to ChatGPT, or run ./bin/model-router codex control vision-bridge setup for a local reader.",
   );
 } else if (visionEngine?.local) {
@@ -592,8 +705,8 @@ if (!failoverSettings.enabled) {
     "ok",
     "Model failover",
     failoverCounts.free
-      ? `on, ${failoverCounts.free} free model(s) first then ${failoverCounts.subscription} of your own`
-      : `on, ${failoverCounts.subscription} of your own providers -- no free model is curated, so nothing cheaper is tried first`,
+      ? `on, ${failoverCounts.free} free model(s) first then ${failoverCounts.subscription} model(s) on your own providers`
+      : `on, ${failoverCounts.subscription} model(s) on your own providers -- no free model is curated, so nothing cheaper is tried first`,
     failoverCounts.free
       ? "Run ./bin/model-router codex control failover chain <model-slug,...> to choose the order yourself."
       : "Free catalogs change without notice so none are checked in. Run ./bin/model-router codex curate-models opencode-free to give failover a free first stop.",
@@ -724,6 +837,25 @@ add(
   "Run ./bin/doctor --fix; this capability is generated locally and is not a provider key.",
 );
 
+if (TARGET === "cursor") {
+  const cursorSecretMode = existsSync(CURSOR_PUBLIC_SECRET_PATH)
+    ? statSync(CURSOR_PUBLIC_SECRET_PATH).mode & 0o777
+    : undefined;
+  const cursorSecretValid = readableSecret(CURSOR_PUBLIC_SECRET_PATH, validCallerSecret);
+  add(
+    cursorSecretValid && privateFileIsProtected(CURSOR_PUBLIC_SECRET_PATH) ? "ok" : "fail",
+    "Cursor public edge key",
+    cursorSecretMode === undefined
+      ? "missing"
+      : !cursorSecretValid
+        ? "invalid"
+        : process.platform === "win32"
+          ? "current-user Windows ACL"
+          : `mode ${cursorSecretMode.toString(8)}`,
+    "Run ./bin/model-router cursor doctor --fix; this capability is generated locally and is not a provider key.",
+  );
+}
+
 // Tool-result retention is the one place this router keeps model-visible
 // *content* on disk rather than counts and bytes, and it has no eviction and no
 // TTL. Reporting it here is the difference between an operator learning about
@@ -824,12 +956,183 @@ if (!credentialDiscoveryOff) {
         : `not configured; ${grokOauth.setup}`,
     !grokCli.runnable ? grokCli.fix : "Run grok login, then rerun the doctor.",
   );
+  const antigravityHealth = antigravityOAuthHealth();
+  const antigravitySelected = selection.providers.includes("antigravity-oauth");
+  const antigravityStatus = !antigravitySelected
+    ? "warn"
+    : antigravityHealth.status === "ok" || antigravityHealth.status === "stale"
+      ? "ok"
+      : "fail";
+  add(
+    antigravityStatus,
+    "Antigravity OAuth",
+    antigravityHealth.detail,
+    antigravityHealth.fix,
+  );
+}
+
+const apiKeyPools = providerApiKeyPoolsSnapshot(credentialDiscoveryOff
+  ? {}
+  : {
+      resolveCredential: (providerId, credentialId) => {
+        const provider = PROVIDERS.get(providerId);
+        return provider ? resolveStoredCredential(provider, credentialId) : undefined;
+      },
+    });
+if (apiKeyPools.configured) {
+  const poolCount = Object.keys(apiKeyPools.providers).length;
+  const credentialCount = Object.values(apiKeyPools.providers)
+    .reduce((total, pool) => total + pool.credentials.length, 0);
+  const unusable = Object.entries(apiKeyPools.providers)
+    .filter(([, pool]) => pool.readiness?.usable !== true)
+    .map(([providerId, pool]) => ({
+      providerId,
+      detail: `${providerId} (${pool.readiness?.reason || "invalid_pool_state"})`,
+    }));
+  const selectedApiProviders = new Set(
+    selection.providers
+      .map((providerId) => PROVIDERS.get(providerId))
+      .filter((provider) =>
+        provider?.kind === "openai-compatible" && !providerNeedsNoKey(provider))
+      .map((provider) => canonicalProviderId(provider.id)),
+  );
+  const selectedUnusable = unusable.filter(({ providerId }) =>
+    selectedApiProviders.has(providerId),
+  );
+  const summarize = (entries) => {
+    const details = entries.map(({ detail }) => detail);
+    return details.length > 8
+      ? `${details.slice(0, 8).join(", ")}, and ${details.length - 8} more`
+      : details.join(", ");
+  };
+  let poolStatus;
+  let poolDetail;
+  if (credentialDiscoveryOff) {
+    poolStatus = "warn";
+    poolDetail = apiKeyPools.valid
+      ? `${poolCount} authoritative pool(s) not evaluated while credential discovery is disabled`
+      : "authoritative pool state is invalid but is advisory while credential discovery is disabled";
+  } else if (!apiKeyPools.valid) {
+    poolStatus = selectedApiProviders.size ? "fail" : "warn";
+    poolDetail = "authoritative pool state is invalid; provider fallback is disabled";
+  } else if (selectedUnusable.length) {
+    poolStatus = "fail";
+    poolDetail = `selected authoritative pool unavailable: ${summarize(selectedUnusable)}; provider fallback is disabled`;
+  } else if (unusable.length) {
+    poolStatus = "warn";
+    poolDetail = `unselected authoritative pool unavailable: ${summarize(unusable)}; selected providers are unaffected`;
+  } else {
+    poolStatus = "ok";
+    poolDetail = `${poolCount} pool(s), ${credentialCount} credential reference(s)`;
+  }
+  add(
+    poolStatus,
+    "Provider API-key pools",
+    poolDetail,
+    "Restore an eligible resolvable credential, or delete the pool to return to the legacy single-key path.",
+  );
+}
+const poolAuthoritySnapshot = {
+  configured: apiKeyPools.configured,
+  valid: apiKeyPools.valid,
+  providers: Object.fromEntries(
+    Object.entries(apiKeyPools.providers).map(([providerId, pool]) => [
+      providerId,
+      {
+        configured: true,
+        valid: true,
+        readiness: pool.readiness,
+      },
+    ]),
+  ),
+};
+
+for (const warning of RUNTIME_PROVIDER_WARNINGS) {
+  add(
+    "fail",
+    "Generic provider registry",
+    warning,
+    "Repair or remove the malformed generic provider descriptor, then rerun the doctor.",
+  );
+}
+
+// A skipped user model is still in the picker catalog, but the router has no
+// route for its slug and refuses it with `unrouted_model` (#689). A skipped
+// entry whose slug survives as an alias of a checked-in route is a migration,
+// not a problem, so only slugs that ended up with no route are reported.
+for (const [slug, reason] of USER_MODELS_SKIPPED) {
+  if (MODEL_BY_SLUG.has(slug)) continue;
+  add(
+    "warn",
+    `User model ${slug}`,
+    `skipped when the model registry loaded: ${reason}`,
+    "Fix or remove the entry in user-models.json, then restart the router with bin/control service restart.",
+  );
+}
+
+for (const provider of RUNTIME_PROVIDERS.values()) {
+  if (provider.generic !== true) continue;
+  const configured = genericProviderConfigured(provider.id);
+  const curated = MODELS.filter((model) => model.provider === provider.id).length;
+  add(
+    configured ? "ok" : "fail",
+    `${provider.displayName} generic provider`,
+    configured
+      ? `${provider.credentialRef ? "bound credential is available" : "no credential required"}; ${curated} curated model route(s)`
+      : "the bound credential is unavailable",
+    configured
+      ? `Run ./bin/curate-models ${provider.id} to review its routed models.`
+      : "Repair the provider-bound credential reference, then rerun the doctor.",
+  );
+  if (configured && curated === 0) {
+    add(
+      "warn",
+      `${provider.displayName} models`,
+      "provider is registered but has no curated model routes",
+      `Run ./bin/curate-models ${provider.id} in an interactive terminal.`,
+    );
+  }
+}
+
+if (TARGET === "codex" && existsSync(SEARCH_SIDECARS_PATH)) {
+  try {
+    for (const binding of readSearchSidecarState().bindings) {
+      const model = MODEL_BY_SLUG.get(binding.model);
+      const provider = RUNTIME_PROVIDERS.get(binding.providerId);
+      const ready = binding.enabled &&
+        Boolean(model) &&
+        model.searchTool === undefined &&
+        Boolean(provider) &&
+        trustedSearchProviderDescriptor(provider, { requireGeneric: true }) &&
+        genericProviderConfigured(binding.providerId);
+      add(
+        ready ? "ok" : binding.enabled ? "fail" : "warn",
+        `Search sidecar ${binding.model}`,
+        ready
+          ? `ready through ${binding.providerId}`
+          : binding.enabled
+            ? "binding, model eligibility, trusted provider, or credential is unavailable"
+            : "disabled",
+        `Run ./bin/model-router codex search-sidecar status ${binding.model}.`,
+      );
+    }
+  } catch (error) {
+    add(
+      "fail",
+      "Search sidecar state",
+      error instanceof Error ? error.message : String(error),
+      `Repair or remove ${SEARCH_SIDECARS_PATH}, then rerun the doctor.`,
+    );
+  }
 }
 
 for (const provider of PROVIDERS.values()) {
   if (provider.kind !== "openai-compatible") continue;
   if (credentialDiscoveryOff) continue;
-  const status = credentialStatus(provider, { persistent: true });
+  const status = effectiveProviderCredentialStatus(provider, {
+    persistent: true,
+    poolAuthoritySnapshot,
+  });
   const credentialType = credentialLabel(provider);
   const credentialNoun = credentialType === "API key" ? "key" : credentialType.toLowerCase();
   // A keyless provider has no key to name, so calling its row a "key" and
@@ -843,6 +1146,8 @@ for (const provider of PROVIDERS.values()) {
         ? `${provider.displayName} anonymous endpoint`
       : provider.authMode === "per-model"
         ? `${provider.displayName} per-model endpoints`
+      : provider.credential?.resolver
+        ? `${provider.displayName} credentials`
       : `${provider.displayName} ${credentialNoun}`,
     status.configured ? status.source : "not configured",
     provider.keyless
@@ -853,7 +1158,9 @@ for (const provider of PROVIDERS.values()) {
         ? provider.anonymousNote || "No key needed; only the provider's free models are available."
       : provider.authMode === "per-model"
         ? "Each model here names its own endpoint; a model that needs a key reports it on its own row."
-      : `Run ./bin/provider-key ${provider.id} set.`,
+      : provider.credential?.resolver
+        ? status.setup || "Configure Vertex project/location and Google Application Default Credentials."
+        : `Run ./bin/provider-key ${provider.id} set.`,
   );
   // A credential that resolves says nothing about whether the account's plan
   // may use the API. Only warn once the provider is actually selected, so the
@@ -971,6 +1278,137 @@ if (TARGET === "gemini") {
       "Inspect $DSH_HOME/settings.yaml, then run ./bin/model-router dsh enable.",
     );
   }
+} else if (TARGET === "cursor") {
+  try {
+    const cursor = childJson("cursor-config-manager.mjs", ["status"]);
+    add(
+      cursor.appConfigured ? "ok" : cursor.agentConfigured ? "warn" : "fail",
+      "Cursor App routing config",
+      cursor.appConfigured
+        ? `${cursor.publishedModels.length} models / ${cursor.publishedAliases.length} effort choices in ${cursor.stateDb}; ${cursor.publicBaseUrl}`
+        : cursor.agentConfigured
+          ? "Cursor App is not connected; Cursor Agent is ready locally"
+        : cursor.running
+          ? "Cursor is running with stale or incomplete router settings"
+          : `router settings are missing or stale in ${cursor.stateDb}`,
+      "Fully quit Cursor, then use Harness > Connect. The managed path asks for a hostname and configures the named tunnel itself.",
+    );
+    add(
+      cursor.launcherInstalled && cursor.cursorAgent.available ? "ok" : "fail",
+      "Cursor Agent launcher",
+      cursor.launcherInstalled
+        ? cursor.cursorAgent.available
+          ? `${cursor.launcher}; ${cursor.cursorAgent.version || cursor.cursorAgent.command}`
+          : `${cursor.launcher} is installed, but ${cursor.cursorAgent.command} is unavailable`
+        : `${cursor.launcher} is missing`,
+      "Install Cursor Agent, then use Harness > Set up & open. The local agent does not require Cursor App to quit.",
+    );
+    if (cursor.installed) {
+      const tunnel = childJson("cursor-cloudflare-tunnel.mjs", ["status"]);
+      add(
+        cursor.tunnelProvider === "cloudflare" ? (tunnel.ready ? "ok" : "fail") : "ok",
+        "Cursor App named tunnel",
+        cursor.tunnelProvider === "cloudflare"
+          ? tunnel.ready
+            ? `${tunnel.hostname}; app-only edge on 127.0.0.1:${PORTS.cursorPublic}`
+            : `managed tunnel is incomplete; next action: ${tunnel.nextAction}`
+          : "stable public endpoint is managed outside Codex Router",
+        "Use Harness > Cursor to install cloudflared, sign in once, and reconnect the hostname.",
+      );
+      const drift = childJson("cursor-config-manager.mjs", ["drift"]);
+      add(
+        !drift.missing?.length && !drift.added?.length && !drift.aliasesStale ? "ok" : "warn",
+        "Cursor App catalog freshness",
+        !drift.missing?.length && !drift.added?.length && !drift.aliasesStale
+          ? `published ${cursor.publishedModels.length} models across ${cursor.publishedAliases.length} effort choices`
+          : `missing ${drift.missing?.join(", ") || "none"}; added ${drift.added?.join(", ") || "none"}; ` +
+            `picker aliases ${drift.aliasesStale ? "need the current Cursor-safe format" : "current"}`,
+        `Fully quit Cursor, then reconnect it from Harness. Cursor owns ${CURSOR_STATE_DB_PATH} while running.`,
+      );
+    } else {
+      add(
+        "ok",
+        "Cursor Agent catalog",
+        `${cursor.routableModels.length} routed models are read live at launch`,
+        "No republish is needed for Cursor Agent.",
+      );
+    }
+  } catch (error) {
+    add(
+      "fail",
+      "Cursor routing config",
+      error instanceof Error ? error.message : String(error),
+      "Fully quit Cursor, inspect its settings database, then run ./bin/model-router cursor enable.",
+    );
+  }
+} else if (TARGET === "claude") {
+  try {
+    const claude = childJson("claude-code-config-manager.mjs", ["status"]);
+    add(
+      claude.installed && claude.baseUrlManaged ? "ok" : "fail",
+      "Claude Code routing config",
+      claude.installed
+        ? `${claude.publishedModels.length} codex_router/anthropic/... models; ${claude.baseUrl}`
+        : "router-owned launcher or model snapshot is missing",
+      "Run ./bin/model-router claude enable.",
+    );
+    add(
+      claude.claude.available ? "ok" : "fail",
+      "Claude Code CLI",
+      claude.claude.available ? claude.claude.version || claude.claude.command : "official claude CLI not found",
+      "Install Claude Code, then run ./bin/model-router claude enable.",
+    );
+    const drift = childJson("claude-code-config-manager.mjs", ["drift"]);
+    add(
+      !drift.missing?.length && !drift.added?.length ? "ok" : "warn",
+      "Claude Code catalog freshness",
+      !drift.missing?.length && !drift.added?.length
+        ? `${claude.publishedModels.length} published models match the routed catalog`
+        : `missing ${drift.missing?.join(", ") || "none"}; added ${drift.added?.join(", ") || "none"}`,
+      "Run ./bin/model-router claude enable to republish.",
+    );
+  } catch (error) {
+    add("fail", "Claude Code routing config", error instanceof Error ? error.message : String(error), "Run ./bin/model-router claude enable.");
+  }
+} else if (TARGET === "openclaw") {
+  try {
+    const openclaw = childJson("openclaw-config-manager.mjs", ["status"]);
+    add(
+      openclaw.installed && openclaw.providerInstalled && openclaw.baseUrlManaged && openclaw.configValid ? "ok" : "fail",
+      "OpenClaw routing config",
+      openclaw.configError
+        ? openclaw.configError
+        : openclaw.providerInstalled
+        ? `${openclaw.publishedModels} models in models.providers.codex-router; ${openclaw.baseUrl || "unmanaged endpoint"}`
+        : "the router-owned OpenClaw provider is missing",
+      "Run ./bin/model-router openclaw enable.",
+    );
+    add(
+      openclaw.cliInstalled ? "ok" : "fail",
+      "OpenClaw CLI",
+      openclaw.cliInstalled ? openclaw.cli || "openclaw" : "not installed",
+      "Use Harness > OpenClaw > Set up, or run ./bin/model-router openclaw enable.",
+    );
+    add(
+      openclaw.configProtected ? "ok" : "fail",
+      "OpenClaw config privacy",
+      openclaw.configProtected ? `${openclaw.config} is private` : openclaw.config || "config path unavailable",
+      "Run ./bin/model-router openclaw enable; its provider carries the local caller capability.",
+    );
+    add(
+      openclaw.catalogFresh ? "ok" : "warn",
+      "OpenClaw catalog freshness",
+      `published ${openclaw.publishedModels}, routable ${openclaw.routableModels}`,
+      "Run ./bin/model-router openclaw enable to republish.",
+    );
+  } catch (error) {
+    add(
+      "fail",
+      "OpenClaw routing config",
+      error instanceof Error ? error.message : String(error),
+      "Run ./bin/model-router openclaw enable.",
+    );
+  }
 } else try {
   const config = childJson("config-manager.mjs", ["status"]);
   add(
@@ -1018,6 +1456,66 @@ if (TARGET === "gemini") {
   );
 }
 
+// The five document-configured harnesses are published *into* rather than
+// installed *as*, so they belong to no `MODEL_ROUTER_TARGET` and would
+// otherwise be checked by no doctor run at all. They are reported here
+// whenever their publication marker says this router wrote into one of them,
+// whichever target this command happens to be running under.
+try {
+  const { routedHarnesses } = await import("./routed-harness-catalog.mjs");
+  const { ROUTED_HARNESS_CATALOG_PATHS } = await import("./paths.mjs");
+  for (const harness of routedHarnesses()) {
+    if (!existsSync(ROUTED_HARNESS_CATALOG_PATHS[harness.id])) continue;
+    const publishHint = `Run ./bin/control client-setup ${harness.id} to republish.`;
+    try {
+      const status = childJson("routed-harness-manager.mjs", [harness.id, "status"]);
+      add(
+        status.installed && status.providerInstalled && status.baseUrlManaged && status.configValid
+          ? "ok"
+          : "fail",
+        `${harness.displayName} routing config`,
+        status.configError
+          ? status.configError
+          : status.providerInstalled
+            ? `${status.publishedModels} models in ${harness.providerPath.join(".")}; ${status.baseUrl || "unmanaged endpoint"}`
+            : `the router-owned provider is missing from ${status.document}`,
+        publishHint,
+      );
+      add(
+        status.cliInstalled && !status.cliOutdated ? "ok" : "warn",
+        `${harness.displayName} CLI`,
+        !status.cliInstalled
+          ? "not installed"
+          : status.cliOutdated
+            ? `${status.cliVersion} predates ${status.cliMinimumVersion}, the first release that reads the published provider`
+            : status.cli || harness.executables[0],
+        `Use Harness > ${harness.displayName} > Set up, or install it from ${harness.siteUrl}.`,
+      );
+      add(
+        status.documentProtected ? "ok" : "fail",
+        `${harness.displayName} config privacy`,
+        status.documentProtected ? `${status.document} is private` : status.document,
+        `${publishHint} Its provider carries the local caller capability.`,
+      );
+      add(
+        status.catalogFresh ? "ok" : "warn",
+        `${harness.displayName} catalog freshness`,
+        `published ${status.publishedModels}, routable ${status.routableModels}`,
+        publishHint,
+      );
+    } catch (error) {
+      add(
+        "fail",
+        `${harness.displayName} routing config`,
+        error instanceof Error ? error.message : String(error),
+        publishHint,
+      );
+    }
+  }
+} catch {
+  // Never let a diagnostic be the thing that fails the doctor.
+}
+
 const legacy = detectLegacyInstallations();
 add(
   legacy.unknownConflict ? "fail" : legacy.installations.length ? "fail" : "ok",
@@ -1043,15 +1541,28 @@ add(
 try {
   const { nativeSessionStatus } = await import("./codex-native-session.mjs");
   const session = nativeSessionStatus();
-  if (session.present && session.fallbackEnabled) {
+  if (session.sharingEnabled) {
     const hours = session.expiresInHours;
     add(
       session.usable ? "ok" : "warn",
-      "Codex session for harness models",
+      "ChatGPT session for local clients",
       session.usable
         ? `valid${hours === undefined ? "" : ` for ${hours}h`}`
-        : "expired; open Codex once to renew it (native models are withheld until then)",
-      "Open Codex, or run `codex login`.",
+        : session.present
+          ? "expired; native models are withheld from non-Codex clients until sign-in is renewed"
+          : "sharing is enabled, but no Codex login is available; native models are withheld",
+      "Run `codex login`; the existing one-time sharing authorization will be reused.",
+    );
+  } else if (session.present) {
+    add(
+      session.usable ? "ok" : "warn",
+      "ChatGPT session for local clients",
+      session.usable
+        ? "not shared; the router exposes no native GPT models to other local clients"
+        : "not shared and not currently usable; the router exposes no native GPT models to other local clients",
+      session.usable
+        ? "To authorize every local router client once, run `./bin/model-router codex chatgpt-session enable`."
+        : "Run `codex login`, then authorize every local router client once with `./bin/model-router codex chatgpt-session enable`.",
     );
   }
 } catch {
@@ -1132,11 +1643,15 @@ if (proxyOptIn) {
 // describes Codex's own tools, so it is not part of a harness install.
 if (codexTarget) {
   const status = skillPackStatus(CODEX_HOME);
+  const skillOperatorCommand =
+    process.platform === "win32"
+      ? ".\\model-router.ps1 codex skills"
+      : "./bin/model-router codex skills";
   add(
     status.missing.length === 0 ? "ok" : "fail",
     "Codex skill pack",
     status.missing.length === 0
-      ? `${status.managed.length} verified managed skill(s)`
+      ? `${status.managed.length} verified managed skill(s), ${status.external.length} approved external skill(s)`
       : `missing: ${status.missing.join(", ")}`,
     "./bin/install",
   );
@@ -1144,16 +1659,18 @@ if (codexTarget) {
     status.stale.length === 0 ? "ok" : "warn",
     "Codex skill pack freshness",
     status.stale.length === 0
-      ? "verified skills match the checkout"
-      : `verified skills differ from the checkout: ${status.stale.join(", ")}`,
-    "./bin/install (replaces managed skills)",
+      ? "verified managed skills match the checkout; approved external skills are digest-bound"
+      : `verified managed skills differ from the checkout: ${status.stale.join(", ")}`,
+    "./bin/install (replaces managed skills only)",
   );
   if (status.collisions.length > 0) {
+    const approvalCommand =
+      `${skillOperatorCommand} approve-external ${status.collisions.join(" ")}`;
     add(
       "warn",
       "Codex skill pack collisions",
-      `existing skills not verified as codex-router-owned: ${status.collisions.join(", ")}`,
-      "rename or remove the conflicting skills, then run ./bin/install",
+      `existing skills not verified as codex-router-owned: ${status.collisions.join(", ")}; after reviewing their exact contents, approve with: ${approvalCommand}`,
+      `${approvalCommand}; or rename/remove conflicts, then run ./bin/install`,
     );
   }
   if (!status.ownershipStateValid || status.staleOwnership.length > 0) {
@@ -1164,6 +1681,24 @@ if (codexTarget) {
         ? "private ownership state is malformed; no existing skill will be replaced"
         : `stale ownership records: ${status.staleOwnership.join(", ")}`,
       "run ./bin/install; unverified existing content will be preserved",
+    );
+  }
+  if (status.staleExternal.length > 0) {
+    const reapprovable = status.staleExternal.filter((name) => status.pack.includes(name));
+    const actions = [];
+    if (reapprovable.length > 0) {
+      actions.push(
+        `after review, re-approve with: ${skillOperatorCommand} approve-external ${reapprovable.join(" ")}`,
+      );
+    }
+    actions.push(
+      `revoke stale approvals with: ${skillOperatorCommand} revoke-external ${status.staleExternal.join(" ")}`,
+    );
+    add(
+      "warn",
+      "Codex skill pack external approvals",
+      `external approvals require re-review or revocation: ${status.staleExternal.join(", ")}; ${actions.join("; ")}`,
+      actions.join("; "),
     );
   }
   // The declaration comes from the skill itself, then is compared with the

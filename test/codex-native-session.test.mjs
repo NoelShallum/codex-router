@@ -1,32 +1,64 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { test, after } from "node:test";
 
 const home = mkdtempSync(path.join(os.tmpdir(), "native-session-"));
 const authPath = path.join(home, "auth.json");
 process.env.MODEL_ROUTER_CODEX_AUTH = authPath;
+process.env.MODEL_ROUTER_STATE_DIR = path.join(home, "state");
+delete process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
+
+// Every test shares one fixture home; take it down once the file finishes so
+// repeated runs do not accumulate temp roots.
+after(() => {
+  rmSync(home, { recursive: true, force: true });
+});
 
 const {
+  nativeSessionSharingEnabled,
   nativeSessionAvailable,
   nativeSessionHeaders,
+  nativeAccountCatalogHeaders,
+  nativeSessionTokenMatches,
   nativeSessionStatus,
+  setNativeSessionSharingEnabled,
   tokenExpiryMs,
 } = await import("../src/codex-native-session.mjs");
+const { NATIVE_SESSION_CONSENT_PATH } = await import("../src/paths.mjs");
 
 const { dshNativeModels } = await import("../src/dsh-catalog.mjs");
 
 const ACCESS = "sk-test-access-token";
 const ACCOUNT = "acct-0123456789";
+const API_KEY = "sk-test-codex-api-key";
 
 function writeAuth(tokens) {
   writeFileSync(authPath, JSON.stringify({ auth_mode: "chatgpt", tokens }), "utf8");
 }
 
+function writeAuthDocument(document) {
+  writeFileSync(authPath, JSON.stringify(document), "utf8");
+}
+
 function clearAuth() {
   rmSync(authPath, { force: true });
 }
+
+test.beforeEach(() => {
+  clearAuth();
+  setNativeSessionSharingEnabled(false);
+  delete process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
+});
 
 test("no session on disk means no fallback rather than an error", () => {
   clearAuth();
@@ -35,21 +67,92 @@ test("no session on disk means no fallback rather than an error", () => {
   assert.equal(nativeSessionStatus().present, false);
 });
 
-test("a signed-in session becomes the two headers a native turn needs", () => {
+test("a signed-in session stays private until the user authorizes sharing once", () => {
   writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  assert.equal(nativeSessionSharingEnabled(), false);
+  assert.equal(nativeSessionHeaders(), undefined);
+  assert.equal(nativeSessionStatus().usable, true, "login usability is reported independently");
+
+  setNativeSessionSharingEnabled(true);
+  assert.equal(nativeSessionSharingEnabled(), true);
   assert.deepEqual(nativeSessionHeaders(), {
     authorization: `Bearer ${ACCESS}`,
     "chatgpt-account-id": ACCOUNT,
   });
   assert.equal(nativeSessionAvailable(), true);
+  assert.equal(existsSync(NATIVE_SESSION_CONSENT_PATH), true);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(NATIVE_SESSION_CONSENT_PATH).mode & 0o777, 0o600);
+  }
+  assert.doesNotMatch(readFileSync(NATIVE_SESSION_CONSENT_PATH, "utf8"), /access|account/i);
+});
+
+test("the current Codex session authenticates only its own bearer without enabling sharing", () => {
+  writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  assert.equal(nativeSessionSharingEnabled(), false);
+  assert.equal(nativeSessionTokenMatches(ACCESS), true);
+  assert.equal(nativeSessionTokenMatches("different-session-token"), false);
+  clearAuth();
+  assert.equal(nativeSessionTokenMatches(ACCESS), false);
+});
+
+test("account catalog discovery uses the signed-in session without enabling route sharing", async () => {
+  writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  assert.equal(nativeSessionSharingEnabled(), false);
+  assert.deepEqual(await nativeAccountCatalogHeaders(), {
+    authorization: `Bearer ${ACCESS}`,
+    "chatgpt-account-id": ACCOUNT,
+  });
+  assert.equal(nativeSessionHeaders(), undefined);
+});
+
+test("the current Codex API key authenticates requests but never becomes a shared session", () => {
+  writeAuthDocument({ auth_mode: "apikey", OPENAI_API_KEY: API_KEY });
+  assert.equal(nativeSessionTokenMatches(API_KEY), true);
+  assert.equal(nativeSessionTokenMatches("sk-different-api-key"), false);
+  assert.equal(nativeSessionHeaders(), undefined);
+  assert.equal(nativeSessionAvailable(), false);
+  const status = nativeSessionStatus();
+  assert.deepEqual(
+    {
+      present: status.present,
+      usable: status.usable,
+      hasAccountId: status.hasAccountId,
+    },
+    { present: true, usable: false, hasAccountId: false },
+  );
+
+  // A top-level key in another auth mode is not authority for this route.
+  writeAuthDocument({ auth_mode: "chatgpt", OPENAI_API_KEY: API_KEY });
+  assert.equal(nativeSessionTokenMatches(API_KEY), false);
+});
+
+test("direct Codex authentication uses actual expiry rather than fallback skew", () => {
+  const seconds = Math.floor(Date.now() / 1000);
+  const nearlyExpired = jwtWithExp(seconds + 30);
+  writeAuth({ access_token: nearlyExpired, account_id: ACCOUNT });
+  assert.equal(nativeSessionTokenMatches(nearlyExpired), true);
+  assert.equal(nativeSessionHeaders(), undefined, "fallback still withholds the near-expiry token");
+  const expired = jwtWithExp(seconds - 1);
+  writeAuth({ access_token: expired, account_id: ACCOUNT });
+  assert.equal(nativeSessionTokenMatches(expired), false);
+});
+test("sharing cannot be enabled before the user signs in", () => {
+  assert.throws(
+    () => setNativeSessionSharingEnabled(true),
+    /run `codex login`/i,
+  );
+  assert.equal(existsSync(NATIVE_SESSION_CONSENT_PATH), false);
 });
 
 test("status reports presence, never the credential", () => {
   writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  setNativeSessionSharingEnabled(true);
   const status = nativeSessionStatus();
   assert.equal(status.present, true);
   assert.equal(status.usable, true);
   assert.equal(status.hasAccountId, true);
+  assert.equal(status.sharingEnabled, true);
   // The whole point of the status shape: it is safe to print, log, and paste
   // into an issue. A token that reaches any of those has to be rotated.
   const serialized = JSON.stringify(status);
@@ -70,6 +173,7 @@ test("a session with no access token is not a session", () => {
 
 test("the fallback can be switched off", () => {
   writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  setNativeSessionSharingEnabled(true);
   process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "0";
   try {
     assert.equal(nativeSessionHeaders(), undefined);
@@ -78,6 +182,24 @@ test("the fallback can be switched off", () => {
   } finally {
     delete process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
   }
+});
+
+test("the environment override is explicit in both directions", () => {
+  writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "1";
+  assert.equal(nativeSessionAvailable(), true);
+
+  process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "yes";
+  assert.equal(nativeSessionAvailable(), false, "an ambiguous value is not consent");
+});
+
+test("an unrecognized consent marker fails closed", () => {
+  writeAuth({ access_token: ACCESS, account_id: ACCOUNT });
+  mkdirSync(path.dirname(NATIVE_SESSION_CONSENT_PATH), { recursive: true });
+  writeFileSync(NATIVE_SESSION_CONSENT_PATH, "not json", "utf8");
+  assert.equal(nativeSessionAvailable(), false);
+  writeFileSync(NATIVE_SESSION_CONSENT_PATH, '{"version":99,"sharing":"enabled"}\n', "utf8");
+  assert.equal(nativeSessionAvailable(), false);
 });
 
 test("native models map for the harness, minus Codex's internal variants", () => {
@@ -239,6 +361,7 @@ test("an expired session is withheld rather than spent on a certain 401", () => 
   // test is the withholding itself.
   process.env.CODEX_BIN = "/nonexistent/codex";
   try {
+    process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "1";
     writeAuth({ access_token: jwtWithExp(seconds - 3600), account_id: ACCOUNT });
     assert.equal(nativeSessionHeaders(), undefined, "a dead token must not be sent");
     assert.equal(nativeSessionStatus().expired, true);
@@ -255,12 +378,14 @@ test("an expired session is withheld rather than spent on a certain 401", () => 
     assert.ok(nativeSessionStatus().expiresInHours > 47);
   } finally {
     delete process.env.CODEX_BIN;
+    delete process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
   }
 });
 
 test("status reports the remaining life, never the token", () => {
   const seconds = Math.floor(Date.now() / 1000);
   writeAuth({ access_token: jwtWithExp(seconds + 36000), account_id: ACCOUNT });
+  setNativeSessionSharingEnabled(true);
   const status = nativeSessionStatus();
   assert.ok(status.expiresInHours > 9 && status.expiresInHours <= 10);
   assert.doesNotMatch(JSON.stringify(status), new RegExp(ACCOUNT));
@@ -295,4 +420,8 @@ test("the bearer parser is linear and rejects the shapes it should", () => {
   assert.equal(bearer(hostile), undefined);
   const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
   assert.ok(elapsedMs < 250, `parsing took ${elapsedMs.toFixed(1)}ms, which suggests backtracking`);
+});
+
+test.after(() => {
+  rmSync(home, { recursive: true, force: true });
 });

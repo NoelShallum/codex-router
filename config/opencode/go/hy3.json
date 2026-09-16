@@ -21,12 +21,12 @@
           "description": "Deep reasoning"
         }
       ],
-      "contextWindow": 131072,
-      "autoCompact": 110000,
+      "contextWindow": 262144,
+      "autoCompact": 223000,
       "inputModalities": [
         "text"
       ],
-      "compHash": "opencode-go-hy3-v1"
+      "compHash": "opencode-go-hy3-v2"
     }
   ]
 }

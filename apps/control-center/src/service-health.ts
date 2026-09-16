@@ -12,14 +12,30 @@ export interface ServiceHealthRow {
   tone: ServiceHealthTone;
 }
 
+// Which forwarders the router can report on. The labels live here so the row
+// order and the wording cannot drift from the keys `printHealth` projects.
+const FORWARDERS = [
+  ["oauth", "OAuth forwarder"],
+  ["api", "API forwarder"],
+  ["grokOauth", "Grok OAuth forwarder"],
+] as const;
+
 function dependencyRow(
   id: string,
   label: string,
   service: RouterServiceHealth | undefined,
   degraded: Set<string>,
+  routerOk?: boolean,
 ): ServiceHealthRow {
   if (!service) {
     const offline = degraded.has(id);
+    // An absent per-service payload is not the same as no information. A
+    // router that reported `ok` has already probed every dependency it knows
+    // about, so an id missing from `degraded` is reachable -- rendering it as
+    // Unknown made a healthy install look like it had never answered.
+    if (!offline && routerOk === true) {
+      return { id, label, state: "ready", status: "Ready", detail: "Reachable", tone: "success" };
+    }
     return {
       id,
       label,
@@ -64,13 +80,13 @@ export function serviceHealthRows(health?: RouterHealth): ServiceHealthRow[] {
     tone: !hasHealth ? "neutral" : routerOk ? "success" : degraded.size ? "warning" : "danger",
   }];
 
-  rows.push(dependencyRow("gateway", "Gateway", health?.gateway, degraded));
+  rows.push(dependencyRow("gateway", "Gateway", health?.gateway, degraded, routerOk));
 
-  const forwarderIds = (["oauth", "api"] as const).filter((id) => health?.[id] || degraded.has(id));
-  for (const id of forwarderIds) {
-    rows.push(dependencyRow(id, id === "oauth" ? "OAuth forwarder" : "API forwarder", health?.[id], degraded));
+  const forwarders = FORWARDERS.filter(([id]) => health?.[id] || degraded.has(id));
+  for (const [id, label] of forwarders) {
+    rows.push(dependencyRow(id, label, health?.[id], degraded, routerOk));
   }
-  if (!forwarderIds.length) {
+  if (!forwarders.length) {
     rows.push({
       id: "forwarders",
       label: "External forwarders",

@@ -7,6 +7,7 @@ import path from "node:path";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { applySubagentProofs, subagentProofSnapshot } from "./subagent-proofs.mjs";
+import { VERSION } from "./version.mjs";
 
 export const MULTI_AGENT_STATE_PATH =
   process.env.MODEL_ROUTER_MULTI_AGENT_STATE ||
@@ -67,10 +68,9 @@ export function subagentSettingsSnapshot() {
     ...settings,
     all: settings.mode === "all",
     path: MULTI_AGENT_STATE_PATH,
-    // Machine-local capability verdicts, keyed by slug: checking /
-    // experimental / proven / failed (with the failure reason). This is what
-    // lets a surface explain *why* an enabled model is or is not offered as
-    // a subagent instead of leaving it a silent no-show.
+    // Machine-local certification evidence, keyed by slug: checking /
+    // candidate / failed (with the failure reason). It explains why an
+    // unknown model is awaiting review, but cannot manufacture a v2 claim.
     proofs: subagentProofSnapshot(),
     // Per-model reasoning depth applied only to child turns. Empty when the
     // operator has never set one, which is the common case.
@@ -190,31 +190,52 @@ export function replaceMultiAgentState({ mode, enabled = [], disabled = [], effo
   return subagentSettingsSnapshot();
 }
 
+// The three modes documented in `.claude/skills/codex-subagents/SKILL.md`:
+// `proven` ships only what the registry verified, `selected` adds the routes
+// the operator explicitly turned on, and `all` advertises every non-hidden
+// route "regardless of whether it works".
+//
+// Only these lines promote, and only from an explicit choice the operator made
+// and can see in `subagents status`. A machine-local probe still promotes
+// nothing on its own -- that distinction is the whole point of the guard in
+// subagent-proofs.mjs, and it is not weakened by honouring a deliberate
+// selection here.
 export function applyMultiAgentSettings(models, settings, hidden = new Set()) {
   const disabled = new Set(settings.disabled || []);
+  const enabled = new Set(settings.enabled || []);
+  const mode = settings.mode || "proven";
   return models.map((model) => {
-    if (hidden.has(model.slug)) {
+    const slug = String(model.slug || "");
+    // An explicit `off` beats every mode, including `all`.
+    if (hidden.has(model.slug) || disabled.has(slug)) {
       return { ...model, multiAgentVersion: "v1" };
     }
-    if (disabled.has(model.slug)) {
-      return { ...model, multiAgentVersion: "v1" };
+    if (model.multiAgentVersion === "v2") return model;
+    if (mode === "all" || (mode === "selected" && enabled.has(slug))) {
+      return { ...model, multiAgentVersion: "v2", subagentSelectedByOperator: true };
     }
     return model;
   });
 }
 
 // Resolve the effective v2 claims once so catalog publication, managed agent
-// definitions, and doctor checks cannot disagree about machine-local proofs.
+// definitions, and doctor checks cannot disagree. Two things can make a route
+// v2: a checked-in registry entry, or a completed local verification of that
+// exact route. The diagnostic proof statuses still promote nothing.
+//
+// `routerVersion` defaults here rather than at each call site: a verification
+// describes one build's relay behaviour, and a caller that forgot to pass it
+// would silently carry that evidence across an upgrade.
 export function applyMultiAgentCapabilities(
   models,
   settings,
-  { hidden = new Set(), proofs = subagentProofSnapshot() } = {},
+  { hidden = new Set(), proofs = subagentProofSnapshot(), routerVersion = VERSION } = {},
 ) {
   const configured = settings || readMultiAgentSettings();
   return applySubagentProofs(
     applyMultiAgentSettings(models, configured, hidden),
     proofs,
-    { hidden, disabled: configured.disabled },
+    { hidden, disabled: configured.disabled, routerVersion },
   );
 }
 

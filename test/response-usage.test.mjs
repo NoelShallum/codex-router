@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { maxImageTokensForRoute } from "../src/prompt-image-usage.mjs";
 
 import {
   estimateInputTokens,
@@ -10,6 +11,99 @@ import {
   substituteZeroInputUsage,
   tokenUsageFromPayload,
 } from "../src/response-usage.mjs";
+
+test("DeepSeek image bytes do not fill the prompt-token estimate", () => {
+  const body = JSON.stringify({
+    input: [{ role: "user", content: [
+      { type: "input_text", text: "Inspect this screenshot." },
+      { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(3_600_000)}` },
+    ] }],
+  });
+  const contextWindow = 1_048_576;
+  // The previous behavior falsely reports a full 1M-token conversation.
+  assert.equal(estimateInputTokens(body, { contextWindow }), contextWindow);
+  const estimate = estimateInputTokens(body, { contextWindow, maxTokensPerImage: 1024 });
+  assert.ok(estimate >= 1024 && estimate < 1200, `image estimate was ${estimate}`);
+});
+
+test("DeepSeek file references still contribute image tokens", () => {
+  const body = JSON.stringify({
+    input: [{ role: "user", content: [
+      { type: "input_image", file_id: "file-api-screenshot" },
+      { type: "input_image", image_url: "https://example.com/screenshot.png" },
+    ] }],
+  });
+  const estimate = estimateInputTokens(body, { maxTokensPerImage: 1024 });
+  assert.ok(estimate >= 2048 && estimate < 2200, `image reference estimate was ${estimate}`);
+});
+
+test("image token bounds apply only to the documented direct DeepSeek models", () => {
+  for (const upstreamModel of ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"]) {
+    assert.equal(maxImageTokensForRoute({ provider: "deepseek", upstreamModel }), 1024);
+    assert.equal(maxImageTokensForRoute({ provider: "opencode-go", upstreamModel }), undefined);
+    assert.equal(maxImageTokensForRoute({ provider: "custom", upstreamModel }), undefined);
+  }
+  assert.equal(maxImageTokensForRoute({ provider: "deepseek", upstreamModel: "deepseek-v4-pro" }), undefined);
+  assert.equal(maxImageTokensForRoute(), undefined);
+});
+
+test("image estimates retain visible text, unknown fields and ciphertext handling", () => {
+  const input = [
+    { type: "reasoning", encrypted_content: "x".repeat(200_000) },
+    { role: "developer", content: [
+      { type: "input_text", text: "visible ".repeat(5_000) },
+      { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(500_000)}`, extra: "z".repeat(20_000) },
+    ] },
+  ];
+  const estimate = estimateInputTokens(JSON.stringify({ input }), { maxTokensPerImage: 1024 });
+  assert.ok(estimate > 19_000 && estimate < 20_000, `visible text estimate was ${estimate}`);
+  assert.equal(estimateInputTokens(JSON.stringify({ input }), {
+    maxTokensPerImage: 1024, contextWindow: 10_000,
+  }), 10_000);
+});
+
+test("structured tool-output images count once each without rewriting the request", () => {
+  const image_url = `data:image/png;base64,${"A".repeat(50_000)}`;
+  const body = Buffer.from(JSON.stringify({ input: [
+    { type: "function_call_output", call_id: "call1", output: [{ type: "input_image", image_url }] },
+    { type: "custom_tool_call_output", call_id: "call2", output: [{ type: "input_image", image_url }] },
+  ] }));
+  const original = Buffer.from(body);
+  const estimate = estimateInputTokens(body, { maxTokensPerImage: 1024 });
+  assert.ok(estimate >= 2048 && estimate < 2300, `tool image estimate was ${estimate}`);
+  assert.deepEqual(body, original);
+});
+
+test("image discounts never erase quoted examples, tool schemas or unknown shapes", () => {
+  const image = { type: "input_image", image_url: `data:image/png;base64,${"A".repeat(50_000)}` };
+  for (const payload of [
+    { input: [{ role: "user", content: [{ type: "input_text", text: JSON.stringify(image) }] }] },
+    { input: [{ type: "function_call_output", output: JSON.stringify(image) }] },
+    { tools: [{ example: image }], metadata: image },
+    { input: [{ type: "unknown", content: [image] }] },
+    { input: [{ role: "assistant", content: [image] }] },
+    { input: [{ role: "user", content: [{ ...image, file_id: "ambiguous" }] }] },
+  ]) {
+    const body = JSON.stringify(payload);
+    assert.equal(estimateInputTokens(body, { maxTokensPerImage: 1024 }), estimateInputTokens(body));
+  }
+});
+
+test("image estimates preserve escaped JSON byte accounting and malformed input fallback", () => {
+  // Every slash has an escape on the wire. Discount its original encoded bytes
+  // without reserializing the entire body (which would also erase indentation).
+  const body = JSON.stringify({ input: [{ role: "user", content: [
+    { type: "input_image", image_url: `data:image/png;base64,${"/".repeat(10_000)}` },
+  ] }] }, null, 2).replaceAll("/", "\\/");
+  const estimate = estimateInputTokens(body, { maxTokensPerImage: 1024 });
+  assert.ok(estimate >= 1024 && estimate < 1150, `escaped image estimate was ${estimate}`);
+  for (const invalid of [body.slice(0, -1), Buffer.concat([Buffer.from(body), Buffer.from([0xff])])]) {
+    assert.equal(estimateInputTokens(invalid, { maxTokensPerImage: 1024 }), estimateInputTokens(invalid));
+  }
+  for (const bound of [undefined, 0, -1, NaN, Infinity, "1024"]) {
+    assert.equal(estimateInputTokens(body, { maxTokensPerImage: bound }), estimateInputTokens(body));
+  }
+});
 
 async function passThrough(transform, chunks) {
   const output = [];
@@ -55,6 +149,25 @@ test("normalizes Responses and Chat Completions token usage", () => {
   );
 });
 
+test("Grok tier metering uses measured bridge metadata and keeps absence honest", () => {
+  const observe = payload => tokenUsageFromPayload(payload, { grokServiceTier: true });
+  const response = { usage: { input_tokens: 8, output_tokens: 2 }, service_tier: "priority" };
+  assert.equal(observe(response).serviceTier, undefined);
+  response.provider_specific_fields = { grok_service_tier: "default" };
+  assert.equal(observe({ type: "response.completed", response }).serviceTier, "default");
+  assert.equal(tokenUsageFromPayload(response).serviceTier, undefined, "other routes do not interpret Grok metadata");
+  response.provider_specific_fields.grok_service_tier = "unknown";
+  assert.equal(observe(response).serviceTierUnknown, true);
+  response.provider_specific_fields.grok_service_tier = "user text must not be copied";
+  assert.equal(observe(response).serviceTier, undefined);
+  assert.equal(JSON.stringify(observe(response)).includes("user text"), false);
+  const merged = mergeTokenUsage(
+    { inputTokens: 8, outputTokens: 2, totalTokens: 10, serviceTier: "default" },
+    { inputTokens: 8, outputTokens: 2, totalTokens: 10, serviceTier: "priority" },
+  );
+  assert.equal(merged.serviceTier, undefined);
+});
+
 test("captures provider-reported prefix-cache hits when they exist", () => {
   // OpenAI-compatible shape: cached prefix inside input_tokens_details.
   assert.deepEqual(
@@ -80,6 +193,71 @@ test("captures provider-reported prefix-cache hits when they exist", () => {
   );
 });
 
+test("extracts reasoning tokens from output_tokens_details when present", () => {
+  // OpenAI-compatible shape: reasoning tokens in output_tokens_details.
+  assert.deepEqual(
+    normalizeTokenUsage({
+      input_tokens: 100,
+      output_tokens: 502,
+      output_tokens_details: { reasoning_tokens: 98 },
+    }),
+    { inputTokens: 100, outputTokens: 502, totalTokens: 602, reasoningTokens: 98 },
+  );
+  // Chat-completions shape: completion_tokens_details.
+  assert.deepEqual(
+    tokenUsageFromPayload({
+      usage: {
+        prompt_tokens: 50,
+        completion_tokens: 200,
+        completion_tokens_details: { reasoning_tokens: 30 },
+      },
+    }),
+    { inputTokens: 50, outputTokens: 200, totalTokens: 250, reasoningTokens: 30 },
+  );
+  // Direct reasoning_tokens field.
+  assert.deepEqual(
+    normalizeTokenUsage({
+      input_tokens: 10,
+      output_tokens: 15,
+      reasoning_tokens: 5,
+    }),
+    { inputTokens: 10, outputTokens: 15, totalTokens: 25, reasoningTokens: 5 },
+  );
+  // No reasoning tokens: key absent, not zero.
+  assert.deepEqual(
+    normalizeTokenUsage({ input_tokens: 10, output_tokens: 5 }),
+    { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+  );
+  // An explicit zero is a measured zero and must survive.
+  assert.deepEqual(
+    normalizeTokenUsage({
+      input_tokens: 10,
+      output_tokens: 5,
+      output_tokens_details: { reasoning_tokens: 0 },
+    }),
+    { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningTokens: 0 },
+  );
+  // null/string are not source-provided counts; they stay absent.
+  assert.deepEqual(
+    normalizeTokenUsage({
+      input_tokens: 10,
+      output_tokens: 5,
+      output_tokens_details: { reasoning_tokens: null },
+    }),
+    { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+  );
+});
+
+test("a one-sided merge of two attempts drops the reporting attempt's service tier", () => {
+  for (const [first, second] of [
+    [undefined, { inputTokens: 1, outputTokens: 2, totalTokens: 3, serviceTier: "priority" }],
+    [{ inputTokens: 1, outputTokens: 2, totalTokens: 3, serviceTierUnknown: true }, undefined],
+  ]) {
+    assert.deepEqual(mergeTokenUsage(first, second), { inputTokens: 1, outputTokens: 2, totalTokens: 3 });
+  }
+  assert.equal(mergeTokenUsage(undefined, undefined), undefined);
+});
+
 test("adds up the usage of two attempts at one turn", () => {
   assert.deepEqual(
     mergeTokenUsage(
@@ -96,6 +274,21 @@ test("adds up the usage of two attempts at one turn", () => {
       { inputTokens: 10, outputTokens: 1, totalTokens: 11, cachedInputTokens: 8 },
     ),
     { inputTokens: 20, outputTokens: 2, totalTokens: 22, cachedInputTokens: 8 },
+  );
+  // Reasoning tokens merge the same way as cache tokens.
+  assert.deepEqual(
+    mergeTokenUsage(
+      { inputTokens: 50, outputTokens: 100, totalTokens: 150, reasoningTokens: 20 },
+      { inputTokens: 50, outputTokens: 100, totalTokens: 150, reasoningTokens: 30 },
+    ),
+    { inputTokens: 100, outputTokens: 200, totalTokens: 300, reasoningTokens: 50 },
+  );
+  assert.deepEqual(
+    mergeTokenUsage(
+      { inputTokens: 10, outputTokens: 2, totalTokens: 12, reasoningTokens: 0 },
+      { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+    ),
+    { inputTokens: 20, outputTokens: 4, totalTokens: 24, reasoningTokens: 0 },
   );
   // One-sided merges are the ordinary case: an attempt whose provider reported
   // nothing must not erase the one that did.
@@ -120,6 +313,91 @@ test("captures final SSE usage without changing streamed bytes", async () => {
   });
   assert.equal(transform.completedResponseObserved(), true);
   assert.equal(typeof transform.firstTokenAt(), "number");
+});
+
+test("detects first token from chat.completion.chunk without type field", async () => {
+  // Real chat.completion.chunk objects often have no `type` field, so checking
+  // type before delta meant chat first-token never fired and tray speed stayed null.
+  const body = [
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":" world"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ];
+  const transform = new ResponseUsageTransform("text/event-stream");
+  await passThrough(transform, body);
+  // First token should be detected from the first delta with content.
+  assert.equal(typeof transform.firstTokenAt(), "number");
+});
+
+test("stream, JSON, and headerless readers preserve reasoning absent vs zero", async () => {
+  const withReasoning = {
+    input_tokens: 21,
+    output_tokens: 8,
+    output_tokens_details: { reasoning_tokens: 5 },
+  };
+  const zeroReasoning = {
+    input_tokens: 21,
+    output_tokens: 8,
+    output_tokens_details: { reasoning_tokens: 0 },
+  };
+  const absentReasoning = { input_tokens: 21, output_tokens: 8 };
+
+  const sse = (usage) => [
+    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: { usage },
+    })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+
+  const stream = new ResponseUsageTransform("text/event-stream");
+  assert.equal(await passThrough(stream, sse(withReasoning)), sse(withReasoning).join(""));
+  assert.deepEqual(stream.tokenUsage(), {
+    inputTokens: 21,
+    outputTokens: 8,
+    totalTokens: 29,
+    reasoningTokens: 5,
+  });
+
+  const streamZero = new ResponseUsageTransform("text/event-stream");
+  await passThrough(streamZero, sse(zeroReasoning));
+  assert.equal(streamZero.tokenUsage().reasoningTokens, 0);
+
+  const streamAbsent = new ResponseUsageTransform("text/event-stream");
+  await passThrough(streamAbsent, sse(absentReasoning));
+  assert.equal("reasoningTokens" in streamAbsent.tokenUsage(), false);
+
+  const jsonBody = JSON.stringify({ usage: withReasoning });
+  const json = new ResponseUsageTransform("application/json");
+  assert.equal(await passThrough(json, [jsonBody]), jsonBody);
+  assert.equal(json.tokenUsage().reasoningTokens, 5);
+
+  const jsonZero = new ResponseUsageTransform("application/json");
+  await passThrough(jsonZero, [JSON.stringify({ usage: zeroReasoning })]);
+  assert.equal(jsonZero.tokenUsage().reasoningTokens, 0);
+
+  const jsonAbsent = new ResponseUsageTransform("application/json");
+  await passThrough(jsonAbsent, [JSON.stringify({ usage: absentReasoning })]);
+  assert.equal("reasoningTokens" in jsonAbsent.tokenUsage(), false);
+
+  const headerless = new ResponseUsageTransform("");
+  await passThrough(headerless, sse(withReasoning).map((part) => Buffer.from(part, "utf8")));
+  assert.equal(headerless.tokenUsage().reasoningTokens, 5);
+
+  const headerlessZero = new ResponseUsageTransform("");
+  await passThrough(
+    headerlessZero,
+    sse(zeroReasoning).map((part) => Buffer.from(part, "utf8")),
+  );
+  assert.equal(headerlessZero.tokenUsage().reasoningTokens, 0);
+
+  const headerlessAbsent = new ResponseUsageTransform("");
+  await passThrough(
+    headerlessAbsent,
+    sse(absentReasoning).map((part) => Buffer.from(part, "utf8")),
+  );
+  assert.equal("reasoningTokens" in headerlessAbsent.tokenUsage(), false);
 });
 
 test("captures JSON usage without changing the response", async () => {
@@ -388,6 +666,17 @@ test("a response with no estimate behind it is forwarded untouched", async () =>
   const transform = new ResponseUsageTransform("text/event-stream");
   assert.equal(await passThrough(transform, body), body.join(""));
   assert.equal(transform.substitutedInputTokens(), undefined);
+});
+
+test("observes a terminal SSE error without rewriting the stream", async () => {
+  const body = [
+    'event: error\n',
+    'data: {"type":"error","code":"local_router_stream_failed","message":"repair failed"}\n\n',
+  ];
+  const transform = new ResponseUsageTransform("text/event-stream");
+  assert.equal(await passThrough(transform, body), body.join(""));
+  assert.equal(transform.terminalErrorObserved(), true);
+  assert.equal(transform.completedResponseObserved(), false);
 });
 
 test("bytes the router is not rewriting survive rewrite mode exactly", async () => {
@@ -711,4 +1000,75 @@ test("a ciphertext value carrying escapes ends where JSON says it ends", () => {
       `escape ${JSON.stringify(awkward)} moved the estimate`,
     );
   }
+});
+
+test("Grok tier-only terminal metadata preserves earlier measured token counters", async () => {
+  const events = [
+    { type: "response.in_progress", response: { usage: { input_tokens: 11, output_tokens: 7 } } },
+    { type: "response.completed", response: { provider_specific_fields: { grok_service_tier: "priority" } } },
+  ];
+  const body = events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+  const transform = new ResponseUsageTransform("text/event-stream", { grokServiceTier: true });
+  assert.equal(await passThrough(transform, [body]), body);
+  assert.equal(transform.tokenUsage().inputTokens, 11);
+  assert.equal(transform.tokenUsage().outputTokens, 7);
+  assert.equal(transform.tokenUsage().totalTokens, 18);
+  assert.equal(transform.tokenUsage().serviceTier, "priority");
+});
+
+test("reasoning deltas start the first-token clock and mark reasoning as streamed", async () => {
+  // Responses API: the summary delta arrives while the model is still
+  // thinking, so the window opened here contains the reasoning tokens.
+  const responses = new ResponseUsageTransform("text/event-stream");
+  await passThrough(responses, [
+    'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"Thinking"}\n\n',
+    'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assert.equal(typeof responses.firstTokenAt(), "number");
+  assert.equal(responses.reasoningStreamed(), true);
+
+  // Chat bridges relay reasoning as delta.reasoning_content, often with no
+  // type field on the chunk at all.
+  const chat = new ResponseUsageTransform("text/event-stream");
+  await passThrough(chat, [
+    'data: {"choices":[{"delta":{"reasoning_content":"Let me"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assert.equal(typeof chat.firstTokenAt(), "number");
+  assert.equal(chat.reasoningStreamed(), true);
+
+  // Reasoning relayed after the first visible token still counts: its
+  // generation time sits inside the window either way.
+  const interleaved = new ResponseUsageTransform("text/event-stream");
+  await passThrough(interleaved, [
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+    'data: {"choices":[{"delta":{"reasoning":"then again"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assert.equal(interleaved.reasoningStreamed(), true);
+});
+
+test("a stream with only visible output reports reasoning as not streamed", async () => {
+  const transform = new ResponseUsageTransform("text/event-stream");
+  await passThrough(transform, [
+    'data: {"choices":[{"delta":{"reasoning_content":""}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assert.equal(typeof transform.firstTokenAt(), "number");
+  assert.equal(transform.reasoningStreamed(), false);
+});
+
+test("a chat tool-call delta counts as the first token", async () => {
+  const transform = new ResponseUsageTransform("text/event-stream");
+  await passThrough(transform, [
+    'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"shell","arguments":""}}]}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assert.equal(typeof transform.firstTokenAt(), "number");
+  assert.equal(transform.reasoningStreamed(), false);
 });

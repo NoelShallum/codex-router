@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { writePrivateJson } from "./file-security.mjs";
+import { curatedModelDisplayName } from "./opencode-curation.mjs";
 import { STATE_DIR } from "./paths.mjs";
+import { VERTEX_ADAPTERS } from "./vertex-adapters.mjs";
 
 // User-curated models live outside the checked-in config/ registry tree so a checkout update
 // never discards them. Entries carry the same shape as registry models;
@@ -19,12 +21,41 @@ export const USER_MODELS_PATH =
 // number is a guess, and a guess eight times too small compacts a session that
 // had the room (#266).
 export const DEFAULT_CONTEXT_WINDOW = 131072;
-const DEFAULT_AUTO_COMPACT = 110000;
+export const DEFAULT_AUTO_COMPACT = 110000;
+
+// The effort ladder a curated entry carries until something documents a real
+// one. A single level is not a claim that the model has one effort: it is the
+// only value every OpenAI-compatible route is guaranteed to accept, so it is
+// the conservative default the same way DEFAULT_CONTEXT_WINDOW is. Exported so
+// curation can tell "nobody documented this model's efforts" apart from a
+// ladder a user or a provider's own catalog supplied (#352).
+export const DEFAULT_EFFORT = "high";
+export const DEFAULT_REASONING_LEVELS = Object.freeze([
+  Object.freeze({ effort: DEFAULT_EFFORT, description: "Adaptive reasoning" }),
+]);
+
+export function defaultUserModelReasoning() {
+  return {
+    defaultEffort: DEFAULT_EFFORT,
+    reasoningLevels: DEFAULT_REASONING_LEVELS.map((level) => ({ ...level })),
+  };
+}
+
+// True while an entry still holds exactly the untouched default ladder. The
+// sizing pair plays the same role for the context window: it is the evidence
+// curation had no model-specific answer, not a value the operator chose.
+export function hasDefaultUserModelReasoning(entry) {
+  return (
+    entry?.defaultEffort === DEFAULT_EFFORT &&
+    JSON.stringify(entry?.reasoningLevels) === JSON.stringify(DEFAULT_REASONING_LEVELS)
+  );
+}
 
 // Curation may adjust presentation, sizing, and effort metadata only;
 // identity and routing fields always come from the provider id and the
 // discovered model id.
 const METADATA_FIELDS = new Set([
+  "displayName",
   "description",
   "contextWindow",
   "autoCompact",
@@ -32,12 +63,15 @@ const METADATA_FIELDS = new Set([
   "reasoningLevels",
   "defaultEffort",
   "serviceTiers",
+  "supportsSearchHistory",
   "supportsReasoningSummaries",
   "defaultReasoningSummary",
   "availabilityNux",
   "upgradeTo",
   "requiresTrailingUserTurn",
   "isFree",
+  "toolSchemaRecursion",
+  "supportedEndpoints",
 ]);
 
 // Some providers deliberately publish opaque preview ids while documenting a
@@ -45,11 +79,13 @@ const METADATA_FIELDS = new Set([
 // and upstream id: the id remains the routing identity, and a reseller cannot
 // accidentally rename another provider's model with the same slug.
 const OFFICIAL_MODEL_DISPLAY_NAMES = new Map([
-  ["opencode-free/x-preview-f-free", "Ox Alpha Free"],
 ]);
 
 export function officialModelDisplayName(providerId, upstreamId) {
-  return OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`);
+  return (
+    OFFICIAL_MODEL_DISPLAY_NAMES.get(`${providerId}/${upstreamId}`) ||
+    curatedModelDisplayName(providerId, upstreamId)
+  );
 }
 
 function gatewaySafe(value) {
@@ -81,6 +117,14 @@ export function userModelIdentity({ providerId, upstreamId, metadata }) {
   };
 }
 
+// The picker text a curated entry carries until someone gives it a better
+// one. Exported so curation can tell "nobody has written a description here"
+// apart from a description the user edited, the same way the untouched
+// DEFAULT_CONTEXT_WINDOW/DEFAULT_AUTO_COMPACT pair marks untuned sizing.
+export function defaultUserModelDescription(providerId) {
+  return `User-curated ${providerId} model; conservative default metadata that can be edited in the user model file.`;
+}
+
 export function userModelEntry({ providerId, upstreamId, requestProfile, priority, metadata }) {
   const identity = userModelIdentity({ providerId, upstreamId, metadata });
   const entry = {
@@ -89,10 +133,9 @@ export function userModelEntry({ providerId, upstreamId, requestProfile, priorit
     provider: providerId,
     listed: true,
     displayName: officialModelDisplayName(providerId, upstreamId) || `${upstreamId} (curated)`,
-    description: `User-curated ${providerId} model; conservative default metadata that can be edited in the user model file.`,
+    description: defaultUserModelDescription(providerId),
     priority,
-    defaultEffort: "high",
-    reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+    ...defaultUserModelReasoning(),
     contextWindow: DEFAULT_CONTEXT_WINDOW,
     autoCompact: DEFAULT_AUTO_COMPACT,
     inputModalities: ["text"],
@@ -102,6 +145,38 @@ export function userModelEntry({ providerId, upstreamId, requestProfile, priorit
   }
   if (requestProfile) entry.requestProfile = requestProfile;
   return entry;
+}
+
+// Vertex curation is different from an ordinary OpenAI-compatible catalog:
+// the support catalog is the reviewed source of wire behavior and
+// presentation metadata. Copy only that verified record so an interactive
+// prompt cannot turn an arbitrary Model Garden id into a routable adapter.
+export function userModelEntryFromCatalog({
+  providerId,
+  catalogModel,
+}) {
+  if (
+    providerId !== "vertex" ||
+    !catalogModel ||
+    typeof catalogModel !== "object" ||
+    !Object.hasOwn(VERTEX_ADAPTERS, catalogModel.adapter)
+  ) {
+    throw new Error("Vertex curation requires a model from the verified support catalog.");
+  }
+  const entry = userModelEntry({
+    providerId,
+    upstreamId: catalogModel.id,
+    requestProfile: catalogModel.requestProfile || VERTEX_ADAPTERS[catalogModel.adapter].requestProfile,
+    priority: catalogModel.priority,
+    metadata: catalogModel.capabilities,
+  });
+  return {
+    ...entry,
+    adapter: catalogModel.adapter,
+    displayName: catalogModel.displayName,
+    description: catalogModel.description,
+    ...(catalogModel.publisher ? { vertexPublisher: catalogModel.publisher } : {}),
+  };
 }
 
 export function readUserModels() {

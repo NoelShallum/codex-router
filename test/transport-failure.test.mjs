@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   describeTransportFailure,
+  hasProviderTransportError,
   localTransportHost,
+  providerTransportError,
   transportFailureHost,
 } from "../src/transport-failure.mjs";
 
@@ -121,6 +123,21 @@ test("a non-transport error is not diagnosed", () => {
   const unknown = new Error("nope");
   unknown.code = "ERR_SOMETHING_ELSE";
   assert.equal(describeTransportFailure(unknown), undefined);
+});
+
+test("provider transport markers carry only a safe type and code", () => {
+  const error = connectTimeout();
+  assert.deepEqual(providerTransportError(error), {
+    type: "provider_transport_error",
+    code: "UND_ERR_CONNECT_TIMEOUT",
+    message: "The provider connection failed before a response was available.",
+  });
+  assert.equal(
+    hasProviderTransportError(JSON.stringify({ error: providerTransportError(error) })),
+    true,
+  );
+  assert.equal(providerTransportError(new Error("application failure")), undefined);
+  assert.equal(hasProviderTransportError("provider unavailable"), false);
 });
 
 test("a host is found with no hostname field and no known pattern falls back", () => {

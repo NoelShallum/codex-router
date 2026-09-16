@@ -111,7 +111,7 @@ test("a credential is set beside the user's other keys and removed cleanly", () 
 test("rotating a credential replaces the value in place", () => {
   const first = applyCredential("", "CODEX_ROUTER_CALLER_KEY", "one");
   const second = applyCredential(first, "CODEX_ROUTER_CALLER_KEY", "two");
-  assert.equal(second, 'CODEX_ROUTER_CALLER_KEY: "two"\n');
+  assert.equal(second, 'refs:\n  CODEX_ROUTER_CALLER_KEY: "two"\n');
 });
 
 test("a credentials file holding nested mappings is not a credentials file", () => {
@@ -119,6 +119,214 @@ test("a credentials file holding nested mappings is not a credentials file", () 
     () => applyCredential("provider:\n  key: value\n", "CODEX_ROUTER_CALLER_KEY", "x"),
     /nested mapping/,
   );
+});
+
+// --- the harness's `version`/`refs` credentials envelope ---------------------
+//
+// Current harness builds wrap the reference map in an envelope; the builds this
+// integration was first written against kept it at the document root. Writing
+// into the wrong one of the two fails silently -- the harness resolves
+// `apiKeyEnv` under `refs`, finds nothing, and the route 401s -- so every shape
+// the router can meet is exercised here, and every document it emits is parsed
+// back by a real YAML parser rather than matched with a regular expression.
+
+// A hand-rolled structural lexer can emit a mixed-indent block that reads fine
+// to the eye and that no parser accepts. PyYAML is the arbiter when it is here;
+// when it is not, the indentation assertions below still stand on their own.
+const YAML_PARSER = (() => {
+  try {
+    execFileSync("python3", ["-c", "import yaml"], { stdio: "ignore" });
+    return "python3";
+  } catch {
+    return undefined;
+  }
+})();
+
+function parseYaml(text) {
+  const output = execFileSync(
+    YAML_PARSER,
+    ["-c", "import sys, yaml, json; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout)"],
+    { input: text, encoding: "utf8" },
+  );
+  return JSON.parse(output);
+}
+
+// What the harness will actually read out of the document, or the parser's
+// refusal to read it at all.
+function refsOf(text) {
+  if (!YAML_PARSER) return undefined;
+  return parseYaml(text)?.refs;
+}
+
+// The column an entry sits at, which must match its siblings exactly: `refs`'
+// own column plus two is the mistake this asserts against.
+function columnOf(text, key) {
+  const line = text.split("\n").find((candidate) => candidate.trimStart().startsWith(`${key}:`));
+  assert.ok(line !== undefined, `no line for ${key} in:\n${text}`);
+  return line.length - line.trimStart().length;
+}
+
+test("a reference is set inside the envelope, beside the harness's own", () => {
+  const before = "# harness credentials\nversion: 1\nrefs:\n  OTHER_KEY: existing\n";
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(
+    after,
+    "# harness credentials\nversion: 1\nrefs:\n  OTHER_KEY: existing\n" +
+      '  CODEX_ROUTER_CALLER_KEY: "secret-value"\n',
+  );
+  if (YAML_PARSER) {
+    assert.deepEqual(refsOf(after), {
+      OTHER_KEY: "existing",
+      CODEX_ROUTER_CALLER_KEY: "secret-value",
+    });
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("a reference follows the indentation the envelope already uses", () => {
+  // Four spaces is the shape that turned a two-space assumption into a
+  // document PyYAML rejects outright -- and the file is the harness's whole
+  // credential store, so the loss would be every adapter's key, not ours.
+  const before = "version: 1\nrefs:\n    OTHER_KEY: existing\n";
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(columnOf(after, "CODEX_ROUTER_CALLER_KEY"), columnOf(after, "OTHER_KEY"));
+  assert.equal(columnOf(after, "CODEX_ROUTER_CALLER_KEY"), 4);
+  if (YAML_PARSER) {
+    assert.deepEqual(refsOf(after), {
+      OTHER_KEY: "existing",
+      CODEX_ROUTER_CALLER_KEY: "secret-value",
+    });
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("a first install on a current harness writes inside the envelope, not beside it", () => {
+  // `version` with no `refs` yet is exactly the state a first install meets,
+  // and the one where guessing the legacy shape fails silently at request time.
+  const before = "version: 1\n";
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(after, 'version: 1\nrefs:\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\n');
+  if (YAML_PARSER) {
+    const parsed = parseYaml(after);
+    assert.deepEqual(parsed.refs, { CODEX_ROUTER_CALLER_KEY: "secret-value" });
+    assert.ok(!("CODEX_ROUTER_CALLER_KEY" in parsed));
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  // Removing the only reference takes the envelope key it emptied with it: a
+  // valueless `refs:` reads as null, not as "no references".
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("an absent credentials document adopts the current envelope shape", () => {
+  const after = applyCredential("", "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(after, 'refs:\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\n');
+  if (YAML_PARSER) {
+    assert.deepEqual(parseYaml(after), { refs: { CODEX_ROUTER_CALLER_KEY: "secret-value" } });
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), "");
+});
+
+test("an envelope holding no references yet is filled in rather than duplicated", () => {
+  const after = applyCredential("version: 1\nrefs:\n", "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(after, 'version: 1\nrefs:\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\n');
+  if (YAML_PARSER) {
+    assert.deepEqual(parseYaml(after).refs, { CODEX_ROUTER_CALLER_KEY: "secret-value" });
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  // The emptied `refs:` is pruned, so this comes back as `version: 1` rather
+  // than as the valueless key it started from. Both parse to a harness with no
+  // references; an empty mapping is the one of the two the router never leaves
+  // behind, here and in `removeRouteFromSettings` alike.
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), "version: 1\n");
+});
+
+test("a legacy root-level credentials document is written in its own shape", () => {
+  const before = "# keys\nDEEPSEEK_API_KEY: sk-aaa\n";
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.equal(after, '# keys\nDEEPSEEK_API_KEY: sk-aaa\nCODEX_ROUTER_CALLER_KEY: "secret-value"\n');
+  if (YAML_PARSER) {
+    assert.deepEqual(parseYaml(after), {
+      DEEPSEEK_API_KEY: "sk-aaa",
+      CODEX_ROUTER_CALLER_KEY: "secret-value",
+    });
+  }
+  assert.equal(applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"), after);
+  assert.equal(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"), before);
+});
+
+test("a reference a pre-envelope build left at the root is moved, not copied", () => {
+  // The state a router build that only knew the flat shape leaves on a current
+  // harness. The stray copy is ours and the harness never reads it; leaving it
+  // would put a second copy of the caller key on disk that no uninstall finds.
+  const before = 'version: 1\nrefs:\n  OTHER_KEY: existing\nCODEX_ROUTER_CALLER_KEY: "stale"\n';
+  const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+  assert.ok(!after.includes("stale"));
+  assert.equal(
+    after,
+    'version: 1\nrefs:\n  OTHER_KEY: existing\n  CODEX_ROUTER_CALLER_KEY: "secret-value"\n',
+  );
+  if (YAML_PARSER) {
+    const parsed = parseYaml(after);
+    assert.ok(!("CODEX_ROUTER_CALLER_KEY" in parsed));
+    assert.deepEqual(parsed.refs, {
+      OTHER_KEY: "existing",
+      CODEX_ROUTER_CALLER_KEY: "secret-value",
+    });
+  }
+  assert.equal(
+    removeCredential(before, "CODEX_ROUTER_CALLER_KEY"),
+    "version: 1\nrefs:\n  OTHER_KEY: existing\n",
+  );
+});
+
+test("a nested document under refs is refused rather than edited", () => {
+  // `refs` present is not enough to make a file a credential store. The
+  // envelope adds one legal level of nesting and not one byte more.
+  assert.throws(
+    () =>
+      applyCredential(
+        "version: 1\nrefs:\n  server:\n    host: example.com\n",
+        "CODEX_ROUTER_CALLER_KEY",
+        "x",
+      ),
+    /"refs\.server" holds a nested mapping/,
+  );
+});
+
+test("an inline refs mapping is refused rather than extended", () => {
+  assert.throws(
+    () => applyCredential("version: 1\nrefs: {}\n", "CODEX_ROUTER_CALLER_KEY", "x"),
+    /inline value rather than a block/,
+  );
+});
+
+test("every credentials shape the router writes parses back as YAML", { skip: !YAML_PARSER }, () => {
+  const shapes = [
+    "",
+    "version: 1\n",
+    "version: 1\nrefs:\n",
+    "version: 1\nrefs:\n  OTHER_KEY: existing\n",
+    "version: 1\nrefs:\n    OTHER_KEY: existing\n",
+    "version: 1\nrefs:\n      OTHER_KEY: existing\n",
+    "# comment\nversion: 1\nrefs:\n  A: 1\n  B: 2\n",
+    "DEEPSEEK_API_KEY: sk-aaa\n",
+    "",
+  ];
+  for (const before of shapes) {
+    const after = applyCredential(before, "CODEX_ROUTER_CALLER_KEY", "secret-value");
+    const parsed = parseYaml(after);
+    const stored = parsed?.refs?.CODEX_ROUTER_CALLER_KEY ?? parsed?.CODEX_ROUTER_CALLER_KEY;
+    assert.equal(stored, "secret-value", `shape did not round-trip: ${JSON.stringify(before)}`);
+    assert.equal(
+      applyCredential(after, "CODEX_ROUTER_CALLER_KEY", "secret-value"),
+      after,
+      `shape is not idempotent: ${JSON.stringify(before)}`,
+    );
+    parseYaml(removeCredential(after, "CODEX_ROUTER_CALLER_KEY"));
+  }
 });
 
 test("the default model selection names the router route", () => {
@@ -207,6 +415,57 @@ test("install writes both documents owner-only, and uninstall takes them back ou
   }
 });
 
+// `status()` deciding where the credential lives differently from the writer is
+// the failure this integration cannot afford: it reports installed, the harness
+// reads nothing, and every request 401s with no diagnostic on either side.
+test("status finds the credential wherever the writer put it, in every shape", () => {
+  const shapes = {
+    "no credentials document at all": undefined,
+    "a current harness with no references yet": "version: 1\n",
+    "an empty envelope": "version: 1\nrefs:\n",
+    "an envelope with the harness's own key": "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-aaa\n",
+    "an envelope indented four spaces": "version: 1\nrefs:\n    DEEPSEEK_API_KEY: sk-aaa\n",
+    "a legacy root-level document": "DEEPSEEK_API_KEY: sk-aaa\n",
+    "an empty file": "",
+  };
+  for (const [name, initial] of Object.entries(shapes)) {
+    const box = sandbox();
+    const credentialsPath = path.join(box.dshHome, ".credentials.yaml");
+    try {
+      if (initial !== undefined) writeFileSync(credentialsPath, initial, { mode: 0o600 });
+      assert.equal(manage("status", box).credentialInstalled, false, `${name}: before install`);
+
+      manage("install", box);
+      const after = readFileSync(credentialsPath, "utf8");
+      assert.equal(manage("status", box).credentialInstalled, true, `${name}: after install`);
+      if (YAML_PARSER) {
+        // The harness resolves `apiKeyEnv` through `refs` when the envelope is
+        // there and at the root when it is not. Whichever this document is,
+        // the key has to be where that lookup will find it.
+        const parsed = parseYaml(after);
+        const enveloped = parsed && typeof parsed === "object" && "refs" in parsed;
+        const stored = enveloped
+          ? parsed.refs?.CODEX_ROUTER_CALLER_KEY
+          : parsed?.CODEX_ROUTER_CALLER_KEY;
+        assert.equal(stored, CALLER_SECRET, `${name}: not where the harness reads`);
+      }
+
+      manage("uninstall", box);
+      assert.equal(manage("status", box).credentialInstalled, false, `${name}: after uninstall`);
+      // Whatever else the file held is still the user's, and the secret is
+      // gone rather than left behind in a corner the writer stopped using.
+      const remaining = readFileSync(credentialsPath, "utf8");
+      assert.ok(!remaining.includes(CALLER_SECRET), `${name}: secret left behind`);
+      if (initial?.includes("DEEPSEEK_API_KEY")) {
+        assert.ok(remaining.includes("DEEPSEEK_API_KEY: sk-aaa"), `${name}: lost another key`);
+      }
+    } finally {
+      rmSync(box.dshHome, { recursive: true, force: true });
+      rmSync(box.stateDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("install refuses when no provider is selected rather than publishing nothing", () => {
   const box = sandbox();
   writeFileSync(
@@ -287,6 +546,29 @@ test("uninstall removes a router-owned default even with no snapshot to restore"
     const after = settingsOf(box);
     assert.doesNotMatch(after, /provider: "codex-router"/);
     assert.doesNotMatch(after, /agent-default-model:/);
+  } finally {
+    rmSync(box.dshHome, { recursive: true, force: true });
+    rmSync(box.stateDir, { recursive: true, force: true });
+  }
+});
+
+test("caller capability refresh changes only the installed DSH route and credential", () => {
+  const box = sandbox();
+  try {
+    manage("install --set-default-model", box);
+    const settingsPath = path.join(box.dshHome, "settings.yaml");
+    const credentialsPath = path.join(box.dshHome, ".credentials.yaml");
+    const beforeSettings = readFileSync(settingsPath, "utf8");
+    const beforeCredentials = readFileSync(credentialsPath, "utf8");
+    const nextSecret = "b".repeat(48);
+    writeFileSync(path.join(box.stateDir, "caller-secret"), `${nextSecret}\n`, { mode: 0o600 });
+    const result = manage("caller-capability-refresh", box);
+    assert.equal(result.refreshed, true);
+    const afterSettings = readFileSync(settingsPath, "utf8");
+    const afterCredentials = readFileSync(credentialsPath, "utf8");
+    assert.equal(afterSettings, beforeSettings.replaceAll(CALLER_SECRET, nextSecret));
+    assert.equal(afterCredentials, beforeCredentials.replaceAll(CALLER_SECRET, nextSecret));
+    assert.match(afterSettings, /agent-default-model:/);
   } finally {
     rmSync(box.dshHome, { recursive: true, force: true });
     rmSync(box.stateDir, { recursive: true, force: true });

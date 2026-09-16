@@ -22,6 +22,16 @@ const sourceRoot = path.resolve(
 // Homebrew's superenv shim appends -Os after the crate's own -O0.
 export const EXCLUDED_OPTIONAL_RESOURCES = new Set(["pyroscope-io", "hf-xet"]);
 
+// Homebrew builds every Python resource from its source distribution. NumPy's
+// isolated build recursively tries to build Meson, Ninja, and Cython, which is
+// both wasteful and currently fails before NumPy itself is configured. Core
+// already ships a universal `numpy` formula for the same Python interpreter,
+// and virtualenv_create exposes formula dependencies through
+// --system-site-packages. Keep this mapping narrow and evidence-based: unlike
+// optional resources, these packages remain required at runtime and are owned
+// by an explicit Homebrew dependency instead of a bundled PyPI resource.
+export const HOMEBREW_PROVIDED_RESOURCES = new Map([["numpy", "numpy"]]);
+
 function versionTuple(value) {
   const match = /^(\d+)\.(\d+)(?:\.(\d+))?$/.exec(String(value));
   if (!match) throw new Error(`Invalid Python version: ${value}`);
@@ -206,6 +216,7 @@ export function renderFormula({
   pythonVersion,
   resources,
   excludedResources = [],
+  homebrewProvidedResources = [],
 }) {
   const resourceBlocks = resources
     .map(
@@ -220,6 +231,9 @@ export function renderFormula({
         .map((resource) => `  # - ${resource.name}==${resource.version}`)
         .join("\n")}\n\n`
     : "";
+  const homebrewPythonDependencies = homebrewProvidedResources
+    .map((resource) => `  depends_on ${rubyString(resource.formula)}`)
+    .join("\n");
   return `class CodexRouter < Formula
   include Language::Python::Virtualenv
 
@@ -238,7 +252,7 @@ export function renderFormula({
   depends_on "libsodium"
   depends_on "libyaml"
   depends_on "node"
-  depends_on ${rubyString(pythonFormula)}
+${homebrewPythonDependencies ? `${homebrewPythonDependencies}\n` : ""}  depends_on ${rubyString(pythonFormula)}
 
 ${exclusionComment}${resourceBlocks}
 
@@ -303,6 +317,12 @@ ${exclusionComment}${resourceBlocks}
       end
     end
 
+    # bin/codex-router is the dispatcher written for exactly this case: a
+    # package manager puts one name on PATH, not a directory of them. Routing
+    # through "bin/model-router codex" instead stranded every command outside
+    # that script's fixed whitelist -- curate-models, discover-models,
+    # refresh-catalog, test-model, support-bundle, control -- and made a bare
+    # "codex-router" or "codex-router --help" print model-router's usage.
     (bin/"codex-router").write <<~SH
       #!/bin/sh
       source_root=$(CDPATH= cd -- "#{opt_libexec}" && pwd -P)
@@ -310,28 +330,66 @@ ${exclusionComment}${resourceBlocks}
       export CODEX_ROUTER_SOURCE_ROOT="$source_root"
       export CODEX_ROUTER_NODE_BIN="#{formula_opt_bin("node")}/node"
       export CODEX_ROUTER_PACKAGE_MANAGER=homebrew
-      exec "$source_root/bin/model-router" codex "$@"
+      exec "$source_root/bin/codex-router" "$@"
     SH
+
+    # bin/codex-router deliberately refuses "install": a packaged install has
+    # no writable checkout to rewrite, so it must never be a user-facing verb.
+    # Upgrade reconciliation still legitimately needs the installer, so it
+    # gets its own private entry point rather than a hole in the dispatcher.
+    (libexec/"packaged-install").write <<~SH
+      #!/bin/sh
+      source_root=$(CDPATH= cd -- "#{opt_libexec}" && pwd -P)
+      export PATH="#{formula_opt_bin("node")}:$PATH"
+      export CODEX_ROUTER_SOURCE_ROOT="$source_root"
+      export CODEX_ROUTER_NODE_BIN="#{formula_opt_bin("node")}/node"
+      export CODEX_ROUTER_PACKAGE_MANAGER=homebrew
+      exec "$source_root/bin/install" "$@"
+    SH
+    chmod 0755, libexec/"packaged-install"
+
+    # Official Homebrew taps require serialisable post_install_steps instead of
+    # arbitrary Ruby. Keep the manifest-dependent decision in a private helper
+    # and let the declarative step runner invoke it after install or upgrade.
+    (libexec/"packaged-post-install").write <<~SH
+      #!/bin/sh
+      state_root="\${MODEL_ROUTER_STATE_DIR:-\${CODEX_ROUTER_STATE_DIR:-\${KIMI_CODEX_STATE_DIR:-$HOME/.codex/codex-router}}}"
+      manifest_path="$state_root/install-manifest.json"
+      [ -f "$manifest_path" ] || exit 0
+
+      package_manager=$("#{formula_opt_bin("node")}/node" --input-type=module -e '
+        import { readFileSync } from "node:fs";
+        const manifest = JSON.parse(readFileSync(process.argv[1], "utf8"));
+        process.stdout.write(manifest?.current?.packageManager || "");
+      ' "$manifest_path" 2>/dev/null) || {
+        printf '%s\\n' 'Warning: Existing Codex Router install manifest is invalid; run \`codex-router setup\`.' >&2
+        exit 0
+      }
+      [ "$package_manager" = homebrew ] || exit 0
+
+      helper_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+      exec "$helper_root/packaged-install"
+    SH
+    chmod 0755, libexec/"packaged-post-install"
   end
 
-  def post_install
-    state_root = ENV["MODEL_ROUTER_STATE_DIR"] || ENV["CODEX_ROUTER_STATE_DIR"] ||
-                 ENV["KIMI_CODEX_STATE_DIR"] || (Pathname(Dir.home)/".codex/codex-router")
-    manifest_path = Pathname(state_root)/"install-manifest.json"
-    return unless manifest_path.exist?
-
-    manifest = JSON.parse(manifest_path.read)
-    return if manifest.dig("current", "packageManager") != "homebrew"
-
-    system bin/"codex-router", "install"
-  rescue JSON::ParserError
-    opoo "Existing Codex Router install manifest is invalid; run \`codex-router setup\`."
+  post_install_steps do
+    run "packaged-post-install", base: :libexec
   end
 
   def caveats
     <<~EOS
       Finish the one-time Codex integration with:
         codex-router setup --guided
+
+      This formula installs the router and CLI only. It does not build or
+      download the Electron Control Center, tray/menu-bar app, or macOS desktop
+      widget. Use the recommended installer on the project homepage for the
+      complete desktop experience.
+
+      List every available command, including \`codex-router curate-models\`
+      for adding a custom provider's models, with:
+        codex-router help
 
       Before \`brew uninstall codex-router\`, remove the per-user service and
       managed Codex config with:
@@ -373,8 +431,23 @@ export async function buildFormula({
   const locked = lockedRequirements(readFileSync(lockPath, "utf8"), pythonVersion);
   const isExcluded = (requirement) =>
     EXCLUDED_OPTIONAL_RESOURCES.has(requirement.name.toLowerCase());
+  const homebrewProvidedResources = locked
+    .filter((requirement) =>
+      HOMEBREW_PROVIDED_RESOURCES.has(requirement.name.toLowerCase()),
+    )
+    .map((requirement) => ({
+      ...requirement,
+      formula: HOMEBREW_PROVIDED_RESOURCES.get(requirement.name.toLowerCase()),
+    }));
+  const isHomebrewProvided = (requirement) =>
+    HOMEBREW_PROVIDED_RESOURCES.has(requirement.name.toLowerCase());
   const excludedResources = locked.filter(isExcluded);
-  const resources = await resolveResources(locked.filter((r) => !isExcluded(r)));
+  const resources = await resolveResources(
+    locked.filter(
+      (requirement) =>
+        !isExcluded(requirement) && !isHomebrewProvided(requirement),
+    ),
+  );
   const formula = renderFormula({
     version,
     sourceUrl,
@@ -383,8 +456,11 @@ export async function buildFormula({
     pythonVersion,
     resources,
     excludedResources,
+    homebrewProvidedResources,
   });
-  return detailed ? { formula, resources, excludedResources } : formula;
+  return detailed
+    ? { formula, resources, excludedResources, homebrewProvidedResources }
+    : formula;
 }
 
 function option(args, name) {
@@ -416,14 +492,15 @@ async function main() {
   if (!/^[A-Za-z0-9@._+-]+$/.test(pythonFormula)) {
     throw new Error(`Invalid Python formula name: ${pythonFormula}`);
   }
-  const { formula, resources, excludedResources } = await buildFormula({
-    version,
-    sourceUrl,
-    sourceSha256,
-    pythonFormula,
-    pythonVersion,
-    detailed: true,
-  });
+  const { formula, resources, excludedResources, homebrewProvidedResources } =
+    await buildFormula({
+      version,
+      sourceUrl,
+      sourceSha256,
+      pythonFormula,
+      pythonVersion,
+      detailed: true,
+    });
   writeFileSync(path.resolve(output), formula, "utf8");
   process.stdout.write(
     `${JSON.stringify({
@@ -431,6 +508,9 @@ async function main() {
       resources: resources.length,
       excluded: excludedResources.map(({ name, version: resourceVersion }) =>
         `${name}==${resourceVersion}`,
+      ),
+      homebrewProvided: homebrewProvidedResources.map(
+        ({ name, formula: formulaName }) => `${name}:${formulaName}`,
       ),
     })}\n`,
   );

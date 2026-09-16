@@ -1,4 +1,4 @@
-// The companion in a browser. The router already serves apps/desktop/ui at
+// The companion in a browser. The router already serves apps/panel at
 // /panel behind the caller capability, so nothing here builds, downloads, or
 // installs anything -- the only thing missing was a way to reach it, because
 // the URL carries the capability and no surface ever produced one.
@@ -22,7 +22,7 @@ if (help) {
   process.stdout.write(
     `Usage: panel.mjs [--print]
 
-Opens the Model Router companion in your default browser.
+Opens the Codex Router companion in your default browser.
 
   --print   Write the address instead of opening it. It contains this
             machine's router capability: treat it like a password, and do

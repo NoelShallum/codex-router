@@ -98,10 +98,23 @@ function fakeSourceRoot() {
   const venvPython = path.join(venvBin, "python");
   const liteLlm = path.join(venvBin, "litellm");
   if (process.platform === "win32") {
-    // doctor probes the bundled interpreter with `--version`. A copy of the
-    // current Node executable is a small, real Windows executable that answers
-    // that probe successfully; a text file named `.exe` is not spawnable.
-    copyFileSync(process.execPath, `${venvPython}.exe`);
+    // The health probe intentionally initializes Python's stdlib, so a copied
+    // Node executable is no longer a truthful fixture. Windows CI images ship
+    // Python; link the first launcher that passes the exact production probe.
+    const python = ["python.exe", "py.exe"]
+      .flatMap((command) => {
+        const found = spawnSync("where.exe", [command], { encoding: "utf8" });
+        return found.status === 0 ? found.stdout.split(/\r?\n/).filter(Boolean) : [];
+      })
+      .find((candidate) =>
+        spawnSync(
+          candidate,
+          ["-I", "-c", "import encodings, sys; print(sys.prefix)"],
+          { encoding: "utf8" },
+        ).status === 0
+      );
+    assert.ok(python, "Windows test host needs a runnable Python launcher");
+    symlinkSync(python, `${venvPython}.exe`, "file");
     copyFileSync(process.execPath, `${liteLlm}.exe`);
   } else {
     writeFileSync(venvPython, "#!/bin/sh\nexit 0\n");
@@ -157,7 +170,12 @@ test("doctor --fix rebuilds dependencies in a checkout", () => {
   // everyone in the course of exempting packaged installs.
   const { result, argv } = runFix({ CODEX_ROUTER_PACKAGE_MANAGER: "" });
   assert.notEqual(argv, undefined, `installer was never invoked: ${result.stderr}`);
-  assert.deepEqual(argv, process.platform === "win32" ? ["-CheckoutInstall", "-ForceDeps"] : ["--force-deps"]);
+  assert.deepEqual(
+    argv,
+    process.platform === "win32"
+      ? ["-CheckoutInstall", "-Target", "codex", "-ForceDeps"]
+      : ["--force-deps"],
+  );
 });
 
 test("doctor --fix repairs a packaged install without rebuilding dependencies", () => {
@@ -166,7 +184,10 @@ test("doctor --fix repairs a packaged install without rebuilding dependencies", 
   // is dropped rather than the whole repair being refused.
   const { result, argv } = runFix({ CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" });
   assert.notEqual(argv, undefined, `installer was never invoked: ${result.stderr}`);
-  assert.deepEqual(argv, process.platform === "win32" ? ["-CheckoutInstall"] : []);
+  assert.deepEqual(
+    argv,
+    process.platform === "win32" ? ["-CheckoutInstall", "-Target", "codex"] : [],
+  );
   assert.match(result.stdout, /brew reinstall codex-router/);
 });
 

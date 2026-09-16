@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   lockedRequirements,
   EXCLUDED_OPTIONAL_RESOURCES,
+  HOMEBREW_PROVIDED_RESOURCES,
   markerApplies,
   pypiResource,
   renderFormula,
@@ -36,6 +37,7 @@ test("Homebrew lock selection follows its declared Python version", () => {
   assert.equal(versions.has("pywin32"), false);
   assert.equal(versions.has("uvloop"), true);
   assert.equal(EXCLUDED_OPTIONAL_RESOURCES.has("pyroscope-io"), true);
+  assert.equal(HOMEBREW_PROVIDED_RESOURCES.get("numpy"), "numpy");
 });
 
 test("PyPI resource resolution requires a checksummed source distribution", async () => {
@@ -142,10 +144,14 @@ test("the generated formula owns upgrades and preserves one-time setup", () => {
       },
     ],
     excludedResources: [{ name: "pyroscope-io", version: "0.8.16" }],
+    homebrewProvidedResources: [
+      { name: "numpy", version: "2.5.1", formula: "numpy" },
+    ],
   });
   assert.match(formula, /class CodexRouter < Formula/);
   assert.doesNotMatch(formula, /^\s*version\s+/m);
   assert.match(formula, /depends_on "libyaml"/);
+  assert.match(formula, /depends_on "numpy"/);
   assert.match(formula, /if OS\.mac\?/);
   assert.doesNotMatch(formula, /Formula\["node"\]\.opt_bin/);
   assert.match(formula, /install_plan\.exist\?/);
@@ -156,11 +162,33 @@ test("the generated formula owns upgrades and preserves one-time setup", () => {
   assert.match(formula, /install_plan = libexec\/"src\/install-plan\.mjs"/);
   assert.match(formula, /if install_plan\.exist\?/);
   assert.match(formula, /install_plan, "record", "node-deps"/);
-  assert.match(formula, /exec "\$source_root\/bin\/model-router" codex "\$@"/);
-  assert.match(formula, /manifest\.dig\("current", "packageManager"\) != "homebrew"/);
+  // #334: the PATH shim used to exec `bin/model-router codex`, whose fixed
+  // whitelist stranded curate-models, discover-models, refresh-catalog,
+  // test-model, support-bundle and control, and made a bare `codex-router`
+  // print the wrong usage. It must go through the packaged dispatcher.
+  assert.match(formula, /exec "\$source_root\/bin\/codex-router" "\$@"/);
+  assert.doesNotMatch(formula, /bin\/model-router" codex/);
+  // bin/codex-router refuses `install` on purpose, so upgrade reconciliation
+  // must not reach the installer through the dispatcher -- that pairing would
+  // break every `brew upgrade` the moment the shim was repointed.
+  assert.doesNotMatch(formula, /system bin\/"codex-router", "install"/);
+  assert.match(formula, /exec "\$source_root\/bin\/install" "\$@"/);
+  // Official Homebrew taps reject arbitrary Ruby post_install methods. The
+  // declarative step invokes a private helper that retains the existing
+  // manifest gate and warning without putting Ruby logic in the formula hook.
+  assert.doesNotMatch(formula, /^\s*def post_install\b/m);
+  assert.match(formula, /post_install_steps do/);
+  assert.match(formula, /run "packaged-post-install", base: :libexec/);
+  assert.match(formula, /manifest\?\.current\?\.packageManager/);
+  assert.match(formula, /\[ "\$package_manager" = homebrew \] \|\| exit 0/);
+  assert.match(formula, /exec "\$helper_root\/packaged-install"/);
+  assert.match(formula, /install manifest is invalid/);
   assert.match(formula, /codex-router setup --guided/);
+  assert.match(formula, /router and CLI only/);
+  assert.match(formula, /does not build or\s+download the Electron Control Center/);
   assert.match(formula, /codex-router uninstall/);
   assert.match(formula, /codex-router providers list --json/);
   assert.match(formula, /resource "litellm" do/);
+  assert.doesNotMatch(formula, /resource "numpy" do/);
   assert.match(formula, /pyroscope-io==0\.8\.16/);
 });

@@ -7,12 +7,18 @@
 // `.venv/`), so deleting the artifact invalidates the stamp automatically and
 // no state directory has to stay in sync with the checkout.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { trayBundleDir } from "./tray-install.mjs";
+import { legacyCompanionActions, trayBundleDir } from "./tray-install.mjs";
+import {
+  automaticTraySupervisionAllowed,
+  readTraySupervisionPreference,
+  traySupervisionPreferencePath,
+} from "./tray-supervision-preference.mjs";
+import { venvRuntimeProblem } from "./venv-runtime.mjs";
 
 export const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -66,6 +72,31 @@ function readFile(target) {
     return readFileSync(target, "utf8");
   } catch {
     return undefined;
+  }
+}
+
+function fileDigest(target) {
+  try {
+    return sha256(readFileSync(target));
+  } catch {
+    return sha256("");
+  }
+}
+
+function regularFileExists(target) {
+  try {
+    const stat = lstatSync(target);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function realDirectoryExists(target) {
+  try {
+    return lstatSync(target).isDirectory();
+  } catch {
+    return false;
   }
 }
 
@@ -152,6 +183,63 @@ function sourceFilesIn(dir, extensions) {
   }
 }
 
+function sourceTreeFiles(dir, extensions) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .flatMap((entry) => {
+        const candidate = path.join(dir, entry.name);
+        if (entry.isDirectory()) return sourceTreeFiles(candidate, extensions);
+        return extensions.length === 0
+          || extensions.some((extension) => entry.name.endsWith(extension))
+          ? [candidate]
+          : [];
+      });
+  } catch {
+    return [];
+  }
+}
+
+function controlCenterSources(root) {
+  const base = path.join(root, "apps", "control-center");
+  return [
+    // The build entrypoints decide the packaged shape just as much as the
+    // renderer and Electron sources do. A changed staging/swap contract must
+    // invalidate an installed companion on every platform it can build.
+    path.join(root, "scripts", "build-electron-companion.sh"),
+    path.join(root, "scripts", "build-electron-companion.ps1"),
+    path.join(base, "package.json"),
+    path.join(base, "package-lock.json"),
+    path.join(base, "electron-builder.yml"),
+    path.join(root, "src", "spawnable-command.mjs"),
+    path.join(root, "src", "chatgpt-login-lease.mjs"),
+    path.join(root, "src", "file-security.mjs"),
+    path.join(root, "src", "path-security.mjs"),
+    path.join(root, "src", "process-identity.mjs"),
+    path.join(base, "index.html"),
+    path.join(base, "main.mjs"),
+    path.join(base, "vite.config.ts"),
+    path.join(base, "tsconfig.json"),
+    path.join(base, "tsconfig.node.json"),
+    ...sourceTreeFiles(path.join(base, "electron"), [".mjs", ".cjs"]),
+    ...sourceTreeFiles(path.join(base, "src"), [
+      ".js",
+      ".mjs",
+      ".json",
+      ".ts",
+      ".tsx",
+      ".css",
+      ".svg",
+      ".png",
+      ".jpg",
+      ".jpeg",
+      ".webp",
+    ]),
+    path.join(base, "assets", "icon.png"),
+    path.join(base, "assets", "icon.ico"),
+  ];
+}
+
 // trayDecision offers the companion on macOS, Linux *and* Windows, so all
 // three need a staleness answer here. Covering only some would leave the rest
 // with the exact drift this gating exists to stop: a companion built once and
@@ -162,56 +250,112 @@ const TRAY_PLATFORMS = {
   darwin: {
     sources: (root) => {
       const base = path.join(root, "apps", "macos", "ModelRouterTray");
+      const widget = path.join(root, "apps", "macos", "RouterUsageWidget");
       return [
+        path.join(root, "scripts", "build-macos-tray-app.sh"),
+        path.join(root, "scripts", "build-macos-widget.sh"),
+        path.join(root, "src", "macos-developer-tools.mjs"),
         path.join(base, "Package.swift"),
         path.join(base, "Resources", "Info.plist"),
+        path.join(base, "Resources", "ModelRouterTray.entitlements"),
+        path.join(base, "Resources", "AppIcon.icns"),
         ...sourceFilesIn(path.join(base, "Sources"), [".swift"]),
+        // SwiftPM copies this tree recursively into the resource bundle. Every
+        // file is a build input regardless of extension, including future icon
+        // formats that are not known to this installer yet.
+        ...sourceTreeFiles(path.join(base, "Sources", "Resources"), []),
+        ...sourceTreeFiles(widget, [
+          ".swift",
+          ".plist",
+          ".entitlements",
+          ".pbxproj",
+          ".xcscheme",
+          ".yml",
+        ]),
+        ...controlCenterSources(root),
       ];
     },
-    artifact: (root, home) =>
-      path.join(trayBundleDir("darwin", home), "Contents", "MacOS", "ModelRouterTray"),
+    artifactRoot: (root, home) => trayBundleDir("darwin", home),
+    artifacts: (root, home) => {
+      const bundle = trayBundleDir("darwin", home);
+      const embedded = path.join(
+        bundle,
+        "Contents",
+        "Resources",
+        "Control Center.app",
+        "Contents",
+      );
+      return [
+        path.join(bundle, "Contents", "MacOS", "ModelRouterTray"),
+        path.join(
+          bundle,
+          "Contents",
+          "PlugIns",
+          "RouterUsageWidget.appex",
+          "Contents",
+          "MacOS",
+          "RouterUsageWidget",
+        ),
+        path.join(embedded, "MacOS", "Codex Router"),
+        path.join(embedded, "Resources", "app.asar"),
+      ];
+    },
     // The source fingerprint is mutable router state, not an app resource.
     // Keeping it inside Contents would invalidate the completed bundle seal.
     stamp: (root, home) => path.join(home, ".codex", "codex-router", "tray-build.json"),
     // Companions built before the per-user move live inside the checkout.
-    legacy: (root) =>
+    legacy: (root, home) => [
       path.join(root, "dist", "Model Router.app", "Contents", "MacOS", "ModelRouterTray"),
+      path.join(home, "Applications", "Model Router.app"),
+    ],
   },
   linux: {
-    sources: (root) => {
-      const base = path.join(root, "apps", "desktop");
+    sources: controlCenterSources,
+    artifactRoot: (root) =>
+      path.join(root, "apps", "control-center", "release", "linux-unpacked"),
+    artifactDirectories: (root) => {
+      const apps = path.join(root, "apps");
+      const controlCenter = path.join(apps, "control-center");
+      const releaseRoot = path.join(controlCenter, "release");
+      const release = path.join(releaseRoot, "linux-unpacked");
+      return [apps, controlCenter, releaseRoot, release, path.join(release, "resources")];
+    },
+    artifacts: (root) => {
+      const release = path.join(root, "apps", "control-center", "release", "linux-unpacked");
       return [
-        path.join(base, "package.json"),
-        path.join(base, "src-tauri", "Cargo.toml"),
-        path.join(base, "src-tauri", "tauri.conf.json"),
-        path.join(base, "src-tauri", "build.rs"),
-        ...sourceFilesIn(path.join(base, "src-tauri", "src"), [".rs"]),
-        ...sourceFilesIn(path.join(base, "ui"), [".html", ".css", ".js", ".mjs"]),
+        path.join(release, "codex-router-control-center"),
+        path.join(release, "resources", "app.asar"),
       ];
     },
-    // Tauri builds in place; the binary is the installed artifact and the
-    // stamp sits beside it, so deleting the build tree invalidates both.
-    artifact: (root) =>
-      path.join(root, "apps", "desktop", "src-tauri", "target", "release", "codex-router-desktop"),
+    // A checkout can contain packages for both operating systems (for
+    // example on a shared dual-boot volume). One platform's successful build
+    // must not certify the other platform's still-old executable.
     stamp: (root) =>
-      path.join(root, "apps", "desktop", "src-tauri", "target", "release", STAMP_NAME),
+      path.join(root, "apps", "control-center", ".codex-router-install-linux.json"),
+    legacy: (root) => legacyCompanionActions("linux", root).map((action) => action.execute),
   },
-  // Same Tauri project as Linux, same in-place build; only the artifact
-  // extension differs.
+  // Same packaged Control Center as Linux; only the artifact path differs.
   win32: {
-    sources: (root) => TRAY_PLATFORMS.linux.sources(root),
-    artifact: (root) =>
-      path.join(
-        root,
-        "apps",
-        "desktop",
-        "src-tauri",
-        "target",
-        "release",
-        "codex-router-desktop.exe",
-      ),
+    sources: controlCenterSources,
+    artifactRoot: (root) =>
+      path.join(root, "apps", "control-center", "release", "win-unpacked"),
+    artifactDirectories: (root) => {
+      const apps = path.join(root, "apps");
+      const controlCenter = path.join(apps, "control-center");
+      const releaseRoot = path.join(controlCenter, "release");
+      const release = path.join(releaseRoot, "win-unpacked");
+      return [apps, controlCenter, releaseRoot, release, path.join(release, "resources")];
+    },
+    artifacts: (root) => {
+      const release = path.join(root, "apps", "control-center", "release", "win-unpacked");
+      return [
+        path.join(release, "Codex Router.exe"),
+        path.join(release, "resources", "app.asar"),
+      ];
+    },
     stamp: (root) =>
-      path.join(root, "apps", "desktop", "src-tauri", "target", "release", STAMP_NAME),
+      path.join(root, "apps", "control-center", ".codex-router-install-win32.json"),
+    legacy: (root) => legacyCompanionActions("win32", root).map((action) => action.execute),
   },
 };
 
@@ -221,7 +365,10 @@ export function traySourceFingerprint(root = SOURCE_ROOT, platform = process.pla
   return sha256(
     definition
       .sources(root)
-      .map((file) => `${path.relative(root, file)}\0${readFile(file) ?? ""}`)
+      // Hash bytes before combining them. Reading icons as UTF-8 collapsed
+      // distinct invalid byte sequences to the same replacement character,
+      // so a changed packaged asset could incorrectly look current.
+      .map((file) => `${path.relative(root, file)}\0${fileDigest(file)}`)
       .join("\0"),
   );
 }
@@ -254,13 +401,18 @@ export const STEPS = {
           readFile(repoPath(root, PYTHON_LOCK)) ?? "",
         ].join("\0"),
       ),
-    installed: (root, platform) => {
+    installed: (root, platform, { runtimeProblem = venvRuntimeProblem } = {}) => {
       // A venv whose interpreter home was cleared (macOS wipes /private/tmp,
       // and installers that recorded a temporary Python as the venv home end
       // up with a dangling interpreter) must read as "not installed" so the
       // next install/update rebuilds it instead of skipping a broken venv.
       if (!venvPythonHomeUsable(root)) return false;
-      if (!existsSync(venvPython(root, platform))) return false;
+      const python = venvPython(root, platform);
+      if (!existsSync(python)) return false;
+      // A launcher can remain after its stdlib or recorded interpreter home
+      // has disappeared. Use the same startup probe as doctor/start so an
+      // update repairs a venv that exists on disk but cannot execute Python.
+      if (runtimeProblem(python)) return false;
       return PYTHON_REQUIREMENTS.every((requirement) => {
         const { name, version } = requirementParts(requirement);
         return installedDistributionVersion(name, { root, platform }) === version;
@@ -273,22 +425,44 @@ export const STEPS = {
 // Deliberately not a STEPS entry: those treat "artifact missing" as "run", and
 // a missing tray means the user never asked for one. An update keeps whatever
 // companion the user chose in sync; it never installs a new one.
-//   unsupported - not macOS
+//   unsupported - no desktop companion for this platform
 //   absent      - no companion installed, leave it that way
+//   disabled    - the operator explicitly disabled macOS tray supervision
+//   unavailable - its managed preference is damaged/unreadable; fail closed
 //   skip        - installed and already matches its sources
 //   rebuild     - installed but built from different sources
 export function trayRebuildPlan({
   root = SOURCE_ROOT,
   platform = process.platform,
   home = os.homedir(),
+  supervisionPreference,
 } = {}) {
   const definition = TRAY_PLATFORMS[platform];
   if (!definition) return "unsupported";
-  if (!existsSync(definition.artifact(root, home))) {
+  if (platform === "darwin") {
+    const preference = supervisionPreference ?? readTraySupervisionPreference({
+      file: traySupervisionPreferencePath({ home }),
+    });
+    if (preference.state === "disabled") return "disabled";
+    if (!automaticTraySupervisionAllowed(preference)) return "unavailable";
+  }
+  const artifacts = definition.artifacts(root, home);
+  const artifactDirectories = definition.artifactDirectories?.(root, home) ?? [];
+  const complete = artifactDirectories.every((directory) => realDirectoryExists(directory))
+    && artifacts.every((artifact) => regularFileExists(artifact));
+  if (!complete) {
+    // A package root or any one required file is installation evidence. Treat
+    // the missing remainder as corruption and rebuild it; calling a partial
+    // package "absent" would abandon a tray the user already opted into.
+    if (
+      existsSync(definition.artifactRoot(root, home))
+      || artifacts.some((artifact) => existsSync(artifact))
+    ) return "rebuild";
     // A companion at a superseded location still counts as installed, so the
     // update migrates it rather than reading as "absent" and abandoning it.
-    const legacy = definition.legacy?.(root);
-    return legacy && existsSync(legacy) ? "rebuild" : "absent";
+    const legacy = definition.legacy?.(root, home);
+    const candidates = Array.isArray(legacy) ? legacy : legacy ? [legacy] : [];
+    return candidates.some((candidate) => existsSync(candidate)) ? "rebuild" : "absent";
   }
   const stamp = readFile(definition.stamp(root, home));
   if (!stamp) return "rebuild";
@@ -318,10 +492,17 @@ export function recordTrayBuild({
   return target;
 }
 
-export function stepStatus(step, { root = SOURCE_ROOT, platform = process.platform } = {}) {
+export function stepStatus(
+  step,
+  {
+    root = SOURCE_ROOT,
+    platform = process.platform,
+    runtimeProblem = venvRuntimeProblem,
+  } = {},
+) {
   const definition = STEPS[step];
   if (!definition) throw new Error(`Unknown install step: ${step}`);
-  if (!definition.installed(root, platform)) return "run";
+  if (!definition.installed(root, platform, { runtimeProblem })) return "run";
   const stamp = readFile(definition.stamp(root));
   if (!stamp) return "run";
   try {

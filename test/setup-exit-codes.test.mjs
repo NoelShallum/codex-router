@@ -16,7 +16,7 @@ const SETUP = path.join(root, "src", "setup.mjs");
 // drifting away from install.sh and install.ps1, which read the number.
 const SETUP_INCOMPLETE_EXIT = 2;
 
-function runSetup(args) {
+function runSetup(args, extraEnv = {}) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "setup-exit-"));
   try {
     return spawnSync(process.execPath, [SETUP, ...args], {
@@ -26,6 +26,7 @@ function runSetup(args) {
         ...process.env,
         MODEL_ROUTER_STATE_DIR: stateDir,
         CODEX_HOME: stateDir,
+        ...extraEnv,
       },
     });
   } finally {
@@ -66,6 +67,16 @@ test("--no-discovery alone leaves the checkout update in place", () => {
   const result = runSetup(["--no-discovery"]);
   assert.equal(result.status, SETUP_INCOMPLETE_EXIT);
   assert.match(result.stderr, /--no-discovery requires --no-provider/);
+});
+
+test("Homebrew refuses the source-only desktop companion before setup changes anything", () => {
+  const result = runSetup(
+    ["--with-tray", "--selection-only", "--no-provider"],
+    { CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" },
+  );
+  assert.equal(result.status, SETUP_INCOMPLETE_EXIT);
+  assert.match(result.stderr, /Homebrew installs the router and CLI only/);
+  assert.match(result.stderr, /recommended curl installer/);
 });
 
 // Deliberately absent: a "no configured provider" case driven through

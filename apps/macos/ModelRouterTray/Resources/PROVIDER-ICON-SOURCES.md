@@ -23,10 +23,19 @@ blue accent and DeepSeek's original blue mark are preserved.
 | Cline | https://cline.bot/ | https://www.google.com/s2/favicons?domain=cline.bot&sz=128 |
 | MiniMax | https://www.minimax.io/ | https://www.google.com/s2/favicons?domain=minimax.io&sz=128 |
 | Meta AI | https://www.meta.ai/ | https://www.google.com/s2/favicons?domain=meta.ai&sz=128 |
+| Venice | https://venice.ai/ | https://venice.ai/apple-touch-icon.png |
+| Nous Research | https://nousresearch.com/ | https://nousresearch.com/apple-touch-icon.png |
+| OpenRouter | https://openrouter.ai/ | https://openrouter.ai/favicon/glyph.png |
+| NanoGPT | https://nano-gpt.com/ | https://nano-gpt.com/favicon.ico (same official diamond mark as https://nano-gpt.com/logo.png) |
+| Google Cloud Vertex AI | https://cloud.google.com/vertex-ai/ | https://www.google.com/s2/favicons?domain=cloud.google.com&sz=128 (Google mark, bundled as `google.svg`) |
 
 The Z.AI, Qwen, Ollama, Cline, MiniMax, and Meta AI marks were fetched on
-2026-08-15. The opencode-go routes reuse the OpenCode Free mark rather than
-shipping a duplicate asset. `custom` deliberately ships no mark at all: it is a
+2026-08-15. The Venice, Nous Research, and OpenRouter marks were fetched on
+2026-08-23 and stored as the same monochrome white-on-transparent adaptation
+the other single-color marks use, because all three ship dark artwork that
+would be invisible against the Island's black bezel. The opencode-go routes reuse the OpenCode Free mark rather than
+shipping a duplicate asset. The NanoGPT mark was fetched on 2026-08-29 and is
+bundled losslessly from the official favicon. `custom` deliberately ships no mark at all: it is a
 container for whatever endpoints an operator puts in it, and its models come
 from different vendors, so any single logo would misattribute the rest.
 

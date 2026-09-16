@@ -1,8 +1,10 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { secretEqual } from "./caller-auth.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
-import { CODEX_HOME } from "./paths.mjs";
+import { writePrivateJson } from "./file-security.mjs";
+import { CODEX_HOME, NATIVE_SESSION_CONSENT_PATH } from "./paths.mjs";
 
 // The ChatGPT session the local Codex install already holds.
 //
@@ -11,27 +13,51 @@ import { CODEX_HOME } from "./paths.mjs";
 // Codex attaches both. A DeepSeek Harness turn attaches neither, so a native
 // model advertised to the harness used to be a model it could not spend.
 //
-// This module lets the router fall back to the session already sitting in
-// `$CODEX_HOME/auth.json` -- the user is signed in to Codex on this machine, and
-// asking them to sign in again for a client running as the same user on the same
-// machine buys nothing. It is a *fallback*: a caller that presents its own
-// credential is always relayed unchanged, so Codex is untouched by this.
+// This module can fall back to the session already sitting in
+// `$CODEX_HOME/auth.json`, but only after the user authorizes that once for the
+// shared router plane. The authorization is one owner-only marker carrying no
+// credential. DeepSeek Harness, Gemini CLI, and any future local client then
+// share that decision; asking the same OS user to sign in once per harness buys
+// nothing. Separate subscription profiles are activated by an explicit
+// account switch while Codex is closed; this fallback never rotates accounts.
 //
-// The values are never logged, never returned by a status call, and never put
-// in an error message. `nativeSessionStatus` reports presence and age only,
-// which is the same bound the rest of the router holds credentials to.
+// Access and refresh tokens are never logged, returned by a status call, or
+// put in an error message. The desktop status may include the verified email
+// claim from the id_token so the user can identify the signed-in profile.
 export const CODEX_AUTH_PATH =
   process.env.MODEL_ROUTER_CODEX_AUTH || path.join(CODEX_HOME, "auth.json");
 
-// Off switch. The fallback widens what the caller key reaches -- with it, a
-// local process holding that key can spend the ChatGPT subscription and not
-// only the API-key providers -- so there has to be a way to say no.
-export function nativeSessionFallbackEnabled() {
+function consentMarkerEnabled() {
+  if (!existsSync(NATIVE_SESSION_CONSENT_PATH)) return false;
+  try {
+    const parsed = JSON.parse(readFileSync(NATIVE_SESSION_CONSENT_PATH, "utf8"));
+    return parsed?.version === 1 && parsed.sharing === "enabled";
+  } catch {
+    // This marker is an authorization boundary. An unreadable or unrecognized
+    // file cannot prove consent, so it must fail closed.
+    return false;
+  }
+}
+
+// The fallback widens what the caller key reaches -- with it, a local process
+// holding that key can spend the ChatGPT subscription and not only API-key
+// providers. Missing state therefore means off, unlike the old implicit
+// discovery behavior. `1` is an explicit headless opt-in and `0` an emergency
+// off switch; any other environment value is not consent.
+export function nativeSessionSharingEnabled() {
   // --no-discovery composes with the dedicated env switch: the Codex session
   // is a credential this process did not receive from its caller, so an idle
   // install must never spend it.
   if (discoveryDisabled()) return false;
-  return process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK !== "0";
+  const override = process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
+  if (override !== undefined) return override === "1";
+  return consentMarkerEnabled();
+}
+
+// Kept as an API alias for callers and integrations written against the first
+// version of this feature. The behavior is now explicit sharing consent.
+export function nativeSessionFallbackEnabled() {
+  return nativeSessionSharingEnabled();
 }
 
 // The `exp` claim, in epoch milliseconds. Only the claim is read; the token
@@ -49,25 +75,48 @@ export function tokenExpiryMs(accessToken) {
   }
 }
 
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function tokenEmail(idToken) {
+  try {
+    const payload = String(idToken).split(".")[1];
+    if (!payload) return undefined;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const email = typeof claims?.email === "string" ? claims.email.trim() : "";
+    return email.length <= 320 && EMAIL.test(email) ? email : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Treated as expired slightly early: a token that dies mid-flight costs a whole
 // turn, and there is nothing to gain from spending the last seconds of one.
 const EXPIRY_SKEW_MS = 120_000;
 
-function readSession() {
+function readAuthDocument() {
   // Under --no-discovery the Codex auth file is never opened; status readers
   // above report it absent rather than pretending to know what is inside.
   if (discoveryDisabled()) return undefined;
   if (!existsSync(CODEX_AUTH_PATH)) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(CODEX_AUTH_PATH, "utf8"));
+    return JSON.parse(readFileSync(CODEX_AUTH_PATH, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionFromAuthDocument(parsed) {
+  try {
     const tokens = parsed?.tokens;
     const accessToken = typeof tokens?.access_token === "string" ? tokens.access_token : "";
     const accountId = typeof tokens?.account_id === "string" ? tokens.account_id : "";
+    const idToken = typeof tokens?.id_token === "string" ? tokens.id_token : "";
     if (!accessToken) return undefined;
     const expiresAtMs = tokenExpiryMs(accessToken);
     return {
       accessToken,
       accountId,
+      email: tokenEmail(idToken),
       lastRefresh: parsed?.last_refresh,
       expiresAtMs,
       expired: expiresAtMs !== undefined && expiresAtMs - EXPIRY_SKEW_MS <= Date.now(),
@@ -78,6 +127,93 @@ function readSession() {
     // the way it did before, with the upstream's own 401.
     return undefined;
   }
+}
+
+function readSession() {
+  return sessionFromAuthDocument(readAuthDocument());
+}
+
+/**
+ * Headers for the read-only ChatGPT account catalog request.
+ *
+ * This is deliberately separate from nativeSessionHeaders(): reading the
+ * catalog is part of Codex's own signed-in model discovery and does not widen
+ * the router caller capability to spend the subscription. The returned
+ * credential must only be used for that fixed account-catalog endpoint.
+ */
+export async function nativeAccountCatalogHeaders() {
+  if (discoveryDisabled()) return undefined;
+  let session = readSession();
+  if (session?.expired) {
+    await refreshViaCodex();
+    session = readSession();
+  }
+  if (!session || session.expired) return undefined;
+  return {
+    authorization: `Bearer ${session.accessToken}`,
+    ...(session.accountId ? { "chatgpt-account-id": session.accountId } : {}),
+  };
+}
+
+// Authenticate a bearer that claims to be the already-signed-in Codex client.
+// This never enables session sharing; it only verifies the caller's own token.
+export function nativeSessionTokenMatches(token) {
+  if (typeof token !== "string" || !token) return false;
+  const auth = readAuthDocument();
+  const session = sessionFromAuthDocument(auth);
+  const actuallyExpired = session?.expiresAtMs !== undefined && session.expiresAtMs <= Date.now();
+  if (session && !actuallyExpired && secretEqual(token, session.accessToken)) return true;
+
+  // API-key login is an official Codex auth mode too. It uses the same bearer
+  // header on a requires_openai_auth provider, but stores the credential at the
+  // top level rather than under `tokens`. Matching it authenticates this one
+  // request only; session sharing below remains ChatGPT-token-only.
+  const apiKey = auth?.auth_mode === "apikey" && typeof auth?.OPENAI_API_KEY === "string"
+    ? auth.OPENAI_API_KEY
+    : "";
+  return Boolean(apiKey && secretEqual(token, apiKey));
+}
+
+/**
+ * Records or revokes the user's one-time, shared-plane authorization.
+ *
+ * Enabling is allowed only while the official Codex login is usable. The
+ * router never creates, copies, or refreshes that credential itself. A forced
+ * environment policy must be removed before the saved decision can be changed.
+ */
+export function setNativeSessionSharingEnabled(enabled) {
+  if (!enabled) {
+    if (process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK === "1") {
+      throw new Error(
+        "CODEX_ROUTER_NATIVE_SESSION_FALLBACK=1 forces ChatGPT session sharing on. Remove that environment override, then run this disable command again.",
+      );
+    }
+    rmSync(NATIVE_SESSION_CONSENT_PATH, { force: true });
+    return false;
+  }
+  if (discoveryDisabled()) {
+    throw new Error(
+      "ChatGPT session sharing cannot be enabled while credential discovery is disabled.",
+    );
+  }
+  const override = process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
+  if (override !== undefined && override !== "1") {
+    throw new Error(
+      "ChatGPT session sharing is forced off by CODEX_ROUTER_NATIVE_SESSION_FALLBACK. Remove that environment override or set it to 1 before enabling sharing.",
+    );
+  }
+  const session = readSession();
+  if (!session || session.expired) {
+    throw new Error(
+      "No usable ChatGPT session is available. Run `codex login`, complete the browser sign-in, then retry.",
+    );
+  }
+  writePrivateJson(
+    NATIVE_SESSION_CONSENT_PATH,
+    { version: 1, sharing: "enabled" },
+    { directoryMode: 0o700 },
+  );
+  return true;
 }
 
 // Codex owns this credential and is the only thing that may rewrite it.
@@ -135,7 +271,8 @@ export async function refreshViaCodex({ now = Date.now() } = {}) {
  * the request exactly as it arrived.
  */
 export function nativeSessionHeaders() {
-  if (!nativeSessionFallbackEnabled()) return undefined;
+  if (discoveryDisabled()) return undefined;
+  if (!nativeSessionSharingEnabled()) return undefined;
   const session = readSession();
   if (!session) return undefined;
   if (session.expired) {
@@ -153,6 +290,7 @@ export function nativeSessionHeaders() {
 }
 
 export function nativeSessionAvailable() {
+  if (discoveryDisabled()) return false;
   return Boolean(nativeSessionHeaders());
 }
 
@@ -175,6 +313,7 @@ export function nativeSessionStatus() {
       expired: false,
       expiresInHours: undefined,
       ageHours: undefined,
+      sharingEnabled: false,
       fallbackEnabled: false,
     };
   }
@@ -188,13 +327,16 @@ export function nativeSessionStatus() {
       ageHours = undefined;
     }
   }
+  const sharingEnabled = nativeSessionSharingEnabled();
   return {
     path: CODEX_AUTH_PATH,
     present,
-    // Usable means spendable: present, parseable, and not expired. This is what
-    // gates publishing, so the harness is never offered a model that would 401.
+    // Usable means the credential itself is spendable: present, parseable, and
+    // not expired. Publishing additionally requires explicit sharing consent,
+    // which `nativeSessionAvailable()` applies.
     usable: Boolean(session) && !session.expired,
     hasAccountId: Boolean(session?.accountId),
+    ...(session?.email ? { email: session.email } : {}),
     expired: Boolean(session?.expired),
     // The one number worth reporting: a session is only as good as the days
     // left on it, and "signed in but stale" is a different problem from
@@ -204,6 +346,7 @@ export function nativeSessionStatus() {
         ? undefined
         : Math.round(((session.expiresAtMs - Date.now()) / 36e5) * 10) / 10,
     ageHours,
-    fallbackEnabled: nativeSessionFallbackEnabled(),
+    sharingEnabled,
+    fallbackEnabled: sharingEnabled,
   };
 }

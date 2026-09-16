@@ -133,3 +133,15 @@ test("only registry-proven models receive routed agent definitions", () => {
     ["kimi-oauth/k3"],
   );
 });
+
+test("a configured subagent effort rides along in the agent definition", () => {
+  const withEffort = routedAgentDefinition(kimi, { effort: "max" });
+  assert.match(withEffort.contents, /^model_reasoning_effort = "max"$/m);
+
+  const withoutEffort = routedAgentDefinition(kimi);
+  assert.equal(
+    /model_reasoning_effort/.test(withoutEffort.contents),
+    false,
+    "an unset effort must not freeze the model's own default into the file",
+  );
+});

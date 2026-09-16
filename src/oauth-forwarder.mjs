@@ -2,10 +2,12 @@ import http from "node:http";
 
 import {
   applyKeepAliveTimeouts,
+  endStreamedResponse,
   foldInterveningAssistantMessages,
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  installGracefulShutdown,
   pipeResponse,
   readRequestBody,
   reportListenFailure,
@@ -209,7 +211,9 @@ const server = http.createServer((request, response) => {
         },
       });
     } else if (!response.writableEnded) {
-      response.destroy();
+      endStreamedResponse(response, {
+        message: "The Kimi OAuth forwarder lost the upstream response stream.",
+      });
     }
   });
 });
@@ -220,6 +224,4 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[kimi-oauth] listening");
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
-}
+installGracefulShutdown(server, { label: "kimi-oauth" });

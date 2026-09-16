@@ -27,7 +27,12 @@ export function classifySsePrefix(value, { end = false } = {}) {
   const text = bytes.toString("utf8");
   let offset = 0;
   while (offset < text.length) {
-    const newline = text.indexOf("\n", offset);
+    const nextCr = text.indexOf("\r", offset);
+    const nextLf = text.indexOf("\n", offset);
+    let newline;
+    if (nextCr === -1) newline = nextLf;
+    else if (nextLf === -1) newline = nextCr;
+    else newline = Math.min(nextCr, nextLf);
     if (newline === -1) {
       const line = text.slice(offset);
       if (line.startsWith(":")) return "event-stream";
@@ -40,9 +45,11 @@ export function classifySsePrefix(value, { end = false } = {}) {
       return end && SSE_FIELD.test(line) ? "event-stream" : "other";
     }
 
-    let line = text.slice(offset, newline);
-    if (line.endsWith("\r")) line = line.slice(0, -1);
-    offset = newline + 1;
+    const line = text.slice(offset, newline);
+    offset =
+      text[newline] === "\r" && text[newline + 1] === "\n"
+        ? newline + 2
+        : newline + 1;
     if (!line) continue;
     if (line.startsWith(":") || SSE_FIELD.test(line)) return "event-stream";
     return "other";

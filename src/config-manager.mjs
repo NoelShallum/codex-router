@@ -18,14 +18,19 @@ import { findCodexBinary, spawnableCommand } from "./codex-binary.mjs";
 
 import {
   assertCallerSecret,
-  callerBaseUrl,
   isManagedCallerBaseUrl,
+  isManagedCodexBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
+import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
 import {
   privateFileIsProtected,
   protectPrivateFile,
 } from "./file-security.mjs";
+import {
+  refreshCodexCallerCapabilityContents,
+  refreshCodexCallerCapabilityState,
+} from "./caller-key-client-refresh.mjs";
 import {
   clearCodexRouterDefault,
   readCodexRouterDefault,
@@ -38,6 +43,11 @@ import {
   readNativeCatalogSource,
 } from "./native-catalog-source.mjs";
 import {
+  loginFreeRefreshJournalMatchesState,
+  readLoginFreeRefreshJournal,
+} from "./login-free-refresh-journal.mjs";
+import { readNativeAliases } from "./native-alias.mjs";
+import {
   BACKUP_PATH,
   CALLER_SECRET_PATH,
   CODEX_PROVIDER_MODE_PATH,
@@ -47,6 +57,7 @@ import {
   MERGED_CATALOG_PATH,
   PORTS,
   SIGNED_PROVIDER_MODE_PATH,
+  SOURCE_ROOT,
   loopback,
 } from "./paths.mjs";
 import { scanTomlDocument } from "./toml-structure.mjs";
@@ -66,6 +77,10 @@ const agentConcurrencyStartMarker = "# BEGIN codex-router-agent-concurrency-mana
 const agentConcurrencyEndMarker = "# END codex-router-agent-concurrency-managed";
 const multiAgentV2StartMarker = "# BEGIN codex-router-multi-agent-v2-managed";
 const multiAgentV2EndMarker = "# END codex-router-multi-agent-v2-managed";
+const standaloneWebSearchStartMarker =
+  "# BEGIN codex-router-standalone-web-search-managed";
+const standaloneWebSearchEndMarker =
+  "# END codex-router-standalone-web-search-managed";
 const createdAgentsTableMarker = "# codex-router-created-agents-table";
 const managedAgentMaxConcurrency = 6;
 // Codex 0.147 records a child's FINAL_ANSWER as subAgentActivity
@@ -96,13 +111,34 @@ const defaultRealtimeWebsocketBaseUrl = "https://api.openai.com/v1";
 function tomlValue(value) {
   return JSON.stringify(value);
 }
+
+function managedCallerAuthBlock(providerId) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    `[model_providers.${headerId}.auth]`,
+    `command = ${tomlValue(process.execPath)}`,
+    `args = [${tomlValue(path.join(SOURCE_ROOT, "src", "caller-key-auth-command.mjs"))}, ${tomlValue(CALLER_SECRET_PATH)}]`,
+    "timeout_ms = 5000",
+    "refresh_interval_ms = 0",
+  ].join("\n");
+}
 const realtimeCallBaseUrlKey = "experimental_realtime_webrtc_call_base_url";
 const realtimeWebsocketBaseUrlKey = "experimental_realtime_ws_base_url";
 const markerPairs = [
   // The legacy layout parked the managed provider table inside the root
   // block, so the root pair recognizes that header as managed too.
-  [startMarker, endMarker, "[model_providers.codex-router]"],
-  [providerStartMarker, providerEndMarker, "[model_providers.codex-router]"],
+  [
+    startMarker,
+    endMarker,
+    ["[model_providers.codex-router]", "[model_providers.codex-router.auth]"],
+  ],
+  [
+    providerStartMarker,
+    providerEndMarker,
+    ["[model_providers.codex-router]", "[model_providers.codex-router.auth]"],
+  ],
   [
     signedProviderStartMarker,
     signedProviderEndMarker,
@@ -110,26 +146,35 @@ const markerPairs = [
   ],
   [agentConcurrencyStartMarker, agentConcurrencyEndMarker],
   [multiAgentV2StartMarker, multiAgentV2EndMarker],
+  [standaloneWebSearchStartMarker, standaloneWebSearchEndMarker],
   ["# BEGIN kimi-codex-router-managed", "# END kimi-codex-router-managed"],
   ["# BEGIN kimi-codex-proxy-managed", "# END kimi-codex-proxy-managed"],
 ];
 const command = process.argv[2] || "status";
 const adoptNativeCatalog = process.argv.includes("--adopt-native-catalog");
+const preserveRootOpenaiSignedMode = process.argv.includes("--preserve-root-openai");
 let nativeCatalogNeedsActivation = false;
 
 function configuredRouterBaseUrl() {
   if (!existsSync(CALLER_SECRET_PATH)) {
     throw new Error("The local router caller key is missing; run ./bin/doctor --fix.");
   }
-  const secret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
-  return callerBaseUrl(PORTS.router, secret);
+  assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
+  // Keep an explicitly activated client capability during repair, catalog
+  // refresh, port migration and caller-key rotation. Fresh installs stay /v1.
+  const existingBase = rootValue(splitRoot(current).rootLines, "openai_base_url");
+  if (isManagedRouterBaseUrl(existingBase) &&
+      new URL(existingBase).pathname.replace(/\/$/, "").endsWith(CODEX_PATCH_HOOK_BASE_PATH)) {
+    return loopback(PORTS.router, CODEX_PATCH_HOOK_BASE_PATH);
+  }
+  return loopback(PORTS.router, "/v1");
 }
 
 function isManagedRouterBaseUrl(value) {
   return (
     managedRouterBaseUrls.has(value) ||
-    isManagedCallerBaseUrl(value, PORTS.router) ||
-    isManagedCallerBaseUrl(value, LEGACY_PORTS.router)
+    isManagedCodexBaseUrl(value, PORTS.router) ||
+    isManagedCodexBaseUrl(value, LEGACY_PORTS.router)
   );
 }
 
@@ -165,10 +210,13 @@ function foreignTableSegments(innerLines, managedHeader) {
   // the scanner throw, which aborts the rewrite before anything is written —
   // the same fail-closed posture the signed-routing path takes.
   const { headers } = scanTomlDocument(innerLines.join("\n"));
+  const managedHeaders = new Set(
+    (Array.isArray(managedHeader) ? managedHeader : [managedHeader]).filter(Boolean),
+  );
   const hoisted = [];
   for (let position = 0; position < headers.length; position += 1) {
     const start = headers[position].index;
-    if (managedHeader && innerLines[start].trim() === managedHeader) continue;
+    if (managedHeaders.has(innerLines[start].trim())) continue;
     const end =
       position + 1 < headers.length ? headers[position + 1].index : innerLines.length;
     hoisted.push(...innerLines.slice(start, end));
@@ -178,18 +226,28 @@ function foreignTableSegments(innerLines, managedHeader) {
   return hoisted;
 }
 
+function standaloneCommentIndexes(input) {
+  const scanned = scannedConfig(input) || scannedConfig(input, { rootOnly: true });
+  if (scanned) return new Set(scanned.comments);
+  // Preserve legacy malformed-path migration behavior.
+  return new Set(input.split("\n").flatMap((line, index) =>
+    line.trimStart().startsWith("#") ? [index] : []));
+}
+
 function removeMarkerPair(input, start, end, managedHeader) {
+  const comments = standaloneCommentIndexes(input);
   const lines = input.split("\n");
   const output = [];
   let index = 0;
   while (index < lines.length) {
-    if (lines[index].trim() !== start) {
+    if (!comments.has(index) || lines[index].trim() !== start) {
       output.push(lines[index]);
       index += 1;
       continue;
     }
     let endIndex = index + 1;
-    while (endIndex < lines.length && lines[endIndex].trim() !== end) {
+    while (endIndex < lines.length &&
+      (!comments.has(endIndex) || lines[endIndex].trim() !== end)) {
       endIndex += 1;
     }
     if (endIndex >= lines.length) {
@@ -346,6 +404,8 @@ ${managedMultiAgentV2FeatureLine()}
 function withManagedMultiAgentV2(input) {
   const cleaned = withoutManagedMultiAgentV2(input);
   if (hasModernMultiAgentConfig(cleaned)) return cleaned;
+  const scanned = scannedConfig(cleaned);
+  if (!scanned) return cleaned;
   if (!installedCodexSupportsMultiAgentV2()) return cleaned;
   const featureLine = managedMultiAgentV2FeatureLine();
   const managedLines = [
@@ -354,18 +414,24 @@ function withManagedMultiAgentV2(input) {
     multiAgentV2EndMarker,
   ];
   const lines = cleaned.split("\n");
-  const featuresHeader = lines.findIndex((line) =>
-    /^\s*\[features\]\s*(?:#.*)?$/.test(line),
-  );
+  const featuresHeader = scanned.headers.find(({ path }) =>
+    path.length === 1 && path[0] === "features")?.index ?? -1;
   if (featuresHeader === -1) {
-    const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+    const firstTable = scanned.headers[0]?.index ?? -1;
     const insertionIndex = firstTable === -1 ? lines.length : firstTable;
     lines.splice(insertionIndex, 0, "", "[features]", ...managedLines);
     return `${lines.join("\n").trimEnd()}\n`;
   }
-  let tableEnd = featuresHeader + 1;
-  while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
-  lines.splice(tableEnd, 0, ...managedLines, "");
+  const tableEnd = scanned.headers.find(({ index }) => index > featuresHeader)?.index ?? lines.length;
+  // Keep the managed feature inside the table content and reuse the table's
+  // existing trailing separator. Inserting after those blanks and appending
+  // another one made every disable -> enable cycle grow the config by one line.
+  let insertionIndex = tableEnd;
+  while (insertionIndex > featuresHeader + 1 && !lines[insertionIndex - 1].trim()) {
+    insertionIndex -= 1;
+  }
+  const hasTableSeparator = insertionIndex < tableEnd;
+  lines.splice(insertionIndex, 0, ...managedLines, ...(hasTableSeparator ? [] : [""]));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -418,44 +484,52 @@ function probeAgentConcurrencyScalar() {
 function withManagedAgentConcurrency(input) {
   const cleaned = withoutManagedAgentConcurrency(input);
   if (hasModernMultiAgentConfig(cleaned)) return cleaned;
-  const { rootLines } = splitRoot(cleaned);
-  if (
-    rootLines.some((line) =>
-      /^\s*(?:max_concurrent_threads_per_session|max_threads)\s*=/.test(line),
-    )
-  ) {
+  const scanned = scannedConfig(cleaned);
+  // An optional tuning setting is never worth guessing at malformed TOML.
+  if (!scanned) return cleaned;
+  if (scanned.assignments.some(({ tablePath, key }) =>
+    (tablePath.length === 0 || (tablePath.length === 1 && tablePath[0] === "agents")) &&
+    key.length === 1 &&
+    ["max_concurrent_threads_per_session", "max_threads"].includes(key[0]))) {
     return cleaned;
   }
-
   const lines = cleaned.split("\n");
-  const agentsHeader = lines.findIndex((line) =>
-    /^\s*\[\s*agents\s*\]\s*(?:#.*)?$/.test(line),
-  );
-  if (agentsHeader !== -1) {
-    let tableEnd = agentsHeader + 1;
-    while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
-    const userConfigured = lines
-      .slice(agentsHeader + 1, tableEnd)
-      .some((line) =>
-        /^\s*(?:max_concurrent_threads_per_session|max_threads)\s*=/.test(line),
-      );
-    if (userConfigured) return cleaned;
-  }
   if (!installedCodexAcceptsAgentConcurrencyScalar()) return cleaned;
   const managedLines = [
     agentConcurrencyStartMarker,
     `max_concurrent_threads_per_session = ${managedAgentMaxConcurrency}`,
     agentConcurrencyEndMarker,
   ];
-  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const firstTable = scanned.headers[0]?.index ?? -1;
   const insertionIndex = firstTable === -1 ? lines.length : firstTable;
   lines.splice(insertionIndex, 0, ...managedLines, "");
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+// The structural read of a config, or undefined when the lexer refuses it. A
+// legacy config can carry an unescaped Windows path inside a basic string --
+// `model_catalog_json = "D:\\a\\kimi-proxy\\merged-models.json"`, whose `\\a` is
+// not a valid TOML escape -- and refusing to touch those would leave the
+// operator unable to so much as disable the router. Those keep the line
+// matching they have always had; every config that can be read structurally
+// gets the accurate answer.
+function scannedConfig(contents, options) {
+  try {
+    return scanTomlDocument(contents, options);
+  } catch {
+    return undefined;
+  }
+}
+
 function splitRoot(input) {
   const lines = input.split("\n");
-  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  // A line inside a multiline string can begin with `[` without opening a
+  // table; asking the structural lexer keeps the boundary honest, and keeps
+  // `rootLines` a document the lexer can read on its own below.
+  const scanned = scannedConfig(input, { rootOnly: true });
+  const firstTable = scanned
+    ? scanned.headers[0]?.index ?? -1
+    : lines.findIndex((line) => /^\s*\[/.test(line));
   return firstTable === -1
     ? { rootLines: lines, tableLines: [] }
     : { rootLines: lines.slice(0, firstTable), tableLines: lines.slice(firstTable) };
@@ -483,12 +557,15 @@ function assignmentValue(line) {
 }
 
 function rootValue(lines, key) {
-  const match = lines.find((line) => new RegExp(`^\\s*${key}\\s*=`).test(line));
-  return match ? assignmentValue(match) : undefined;
+  const [index] = rootAssignmentIndexes(lines.join("\n"), key);
+  const assignment = scannedConfig(lines.join("\n"), { rootOnly: true })
+    ?.assignments.find((entry) => entry.index === index);
+  return assignment?.kind === "string" ? assignment.value
+    : index === undefined ? undefined : assignmentValue(lines[index]);
 }
 
 function rootHasValue(lines, key) {
-  return lines.some((line) => new RegExp(`^\\s*${key}\\s*=`).test(line));
+  return rootAssignmentIndexes(lines.join("\n"), key).length > 0;
 }
 
 function nativeRealtimeCallBaseUrl(lines) {
@@ -500,13 +577,51 @@ function nativeRealtimeCallBaseUrl(lines) {
     : `${chatgptBaseUrl}/codex`;
 }
 
+// Line indices of the genuine root-level assignments of `key`, read from the
+// structural lexer instead of matched out of the text. A line can look exactly
+// like an assignment without being one -- prose inside a multiline string, an
+// element of a multi-line array -- and rewriting or deleting such a line
+// destroys the value it belongs to while leaving the real assignment in place.
+function rootAssignmentIndexes(contents, key) {
+  const scanned = scannedConfig(contents, { rootOnly: true });
+  if (!scanned) {
+    // Unreadable document: the previous line matching, bounded to the root
+    // section the same way it used to be.
+    const lines = contents.split("\n");
+    const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+    const limit = firstTable === -1 ? lines.length : firstTable;
+    const expression = new RegExp(`^\\s*${key}\\s*=`);
+    const found = [];
+    for (let index = 0; index < limit; index += 1) {
+      if (expression.test(lines[index])) found.push(index);
+    }
+    return found;
+  }
+  return scanned.assignments
+    .filter(
+      (assignment) =>
+        assignment.tablePath.length === 0 &&
+        assignment.key.length === 1 &&
+        assignment.key[0] === key,
+    )
+    .map(({ index, kind }) => {
+      if (kind === "multiline-string") {
+        throw new Error(`${key} must be a single-line TOML string.`);
+      }
+      return index;
+    });
+}
+
 function replaceRootValue(contents, key, value) {
+  // Indices are absolute, and every root assignment precedes the first table,
+  // so they address `rootLines` unchanged.
   const { rootLines, tableLines } = splitRoot(contents);
-  const filtered = rootLines.filter(
-    (line) => !new RegExp(`^\\s*${key}\\s*=`).test(line),
-  );
+  const removable = new Set(rootAssignmentIndexes(rootLines.join("\n"), key));
+  const filtered = rootLines.filter((_line, index) => !removable.has(index));
   if (value !== undefined) {
-    const managedBlock = filtered.findIndex((line) => line.trim() === startMarker);
+    const comments = standaloneCommentIndexes(filtered.join("\n"));
+    const managedBlock = filtered.findIndex((line, index) =>
+      comments.has(index) && line.trim() === startMarker);
     filtered.splice(
       managedBlock === -1 ? filtered.length : managedBlock,
       0,
@@ -516,6 +631,17 @@ function replaceRootValue(contents, key, value) {
   return [...trimBlankEdges(filtered), "", ...trimBlankEdges(tableLines)]
     .join("\n")
     .trimEnd();
+}
+
+function replaceRootValueInPlace(contents, key, value) {
+  // Login-free changes must refuse an unreadable document before mutation.
+  scanTomlDocument(contents);
+  if (value === undefined) return replaceRootValue(contents, key, value);
+  const lines = contents.split("\n");
+  const [index] = rootAssignmentIndexes(contents, key);
+  if (index === undefined) return replaceRootValue(contents, key, value);
+  lines[index] = `${key} = ${JSON.stringify(value)}`;
+  return lines.join("\n").trimEnd();
 }
 
 function providerTableRanges(contents, providerId) {
@@ -553,18 +679,126 @@ function managedSignedProviderBlock(providerId, baseUrl) {
     `base_url = ${JSON.stringify(baseUrl)}`,
     'wire_api = "responses"',
     "requires_openai_auth = true",
-    // Codex 0.146+ performs standalone web search on the client and sends
-    // the resulting items back through the selected custom provider. Keep
-    // this opt-in on the managed provider table; older Codex versions ignore
-    // the unknown field and retain their existing behavior.
+    // Current Codex builds expose the standalone web-search client tool only
+    // when both the provider and the selected model advertise support. Keep
+    // the provider half enabled; the catalog's supports_search_tool field is
+    // the per-model gate.
+    "supports_standalone_web_search = true",
+    "supports_websockets = true",
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
+function signedProviderSwitchState(rootLines) {
+  const previousPresent = rootHasValue(rootLines, "model_provider");
+  return {
+    version: 1,
+    managedProvider: signedProviderId,
+    previousPresent,
+    ...(previousPresent
+      ? { previousModelProvider: rootValue(rootLines, "model_provider") }
+      : {}),
+  };
+}
+
+function managedSignedProviderSwitchContents(contents, baseUrl) {
+  const withoutPriorBlock = removeMarkerPair(
+    contents,
+    signedProviderStartMarker,
+    signedProviderEndMarker,
+    `[model_providers.${signedProviderId}]`,
+  );
+  const withProvider = `${withoutPriorBlock.trimEnd()}\n\n${managedSignedProviderBlock(
+    signedProviderId,
+    baseUrl,
+  )}\n`;
+  return `${replaceRootValue(withProvider, "model_provider", signedProviderId)}\n`;
+}
+
+function withoutManagedSignedProviderSwitch(contents) {
+  return removeMarkerPair(
+    contents,
+    signedProviderStartMarker,
+    signedProviderEndMarker,
+    `[model_providers.${signedProviderId}]`,
+  );
+}
+
+function signedProviderSwitchBlockStatus(contents) {
+  const range = signedManagedRange(contents);
+  if (!range) {
+    const hasArtifacts =
+      contents.includes(signedProviderStartMarker) ||
+      contents.includes(signedProviderEndMarker) ||
+      providerTableRanges(contents, signedProviderId).length > 0;
+    return hasArtifacts ? "drift" : "absent";
+  }
+  const actual = range.lines.slice(range.start, range.end).join("\n");
+  const baseUrl = rootValue(splitRoot(contents).rootLines, "openai_base_url");
+  return managedSignedProviderBlockMatches(actual, signedProviderId, baseUrl)
+    ? "owned"
+    : "drift";
+}
+
+function managedLoginFreeProviderBlock(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (external models)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "supports_standalone_web_search = true",
+    "supports_websockets = true",
+    managedCallerAuthBlock(providerId),
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
+// The immediately previous managed shape advertised the HTTP fallback even
+// after standalone search was added. Accept that exact signed block during an
+// update so enabling the new edge transport cannot turn router-owned state
+// into apparent user drift.
+function managedSignedProviderBlockHttpFallback(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (with ChatGPT)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = true",
     "supports_standalone_web_search = true",
     "supports_websockets = false",
     signedProviderEndMarker,
   ].join("\n");
 }
 
+function managedLoginFreeProviderBlockHttpFallback(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (external models)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "supports_standalone_web_search = true",
+    "supports_websockets = false",
+    managedCallerAuthBlock(providerId),
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
 // Keep accepting the pre-standalone-search managed block while upgrading it
-// in place. Existing signed state must not become "user-owned" merely because
+// in place. Existing signed state must not become user-owned merely because
 // this optional Codex capability was added.
 function managedSignedProviderBlockLegacy(providerId, baseUrl) {
   const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
@@ -582,10 +816,35 @@ function managedSignedProviderBlockLegacy(providerId, baseUrl) {
   ].join("\n");
 }
 
+function managedLoginFreeProviderBlockLegacy(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (external models)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "supports_websockets = false",
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
 function managedSignedProviderBlockMatches(actual, providerId, baseUrl) {
   return [
     managedSignedProviderBlock(providerId, baseUrl),
+    managedSignedProviderBlockHttpFallback(providerId, baseUrl),
     managedSignedProviderBlockLegacy(providerId, baseUrl),
+  ].includes(actual);
+}
+
+function managedLoginFreeProviderBlockMatches(actual, providerId, baseUrl) {
+  return [
+    managedLoginFreeProviderBlock(providerId, baseUrl),
+    managedLoginFreeProviderBlockHttpFallback(providerId, baseUrl),
+    managedLoginFreeProviderBlockLegacy(providerId, baseUrl),
   ].includes(actual);
 }
 
@@ -598,6 +857,9 @@ function replaceProviderTreeWithManaged(contents, state) {
   const ranges = providerTableRanges(contents, state.managedProvider);
   state.previousProviderSections = ranges.map((range) =>
     range.lines.slice(range.start, range.end).join("\n"));
+  const blockGenerator = state.loginFree
+    ? managedLoginFreeProviderBlock
+    : managedSignedProviderBlock;
   const replacements = new Map(
     ranges.map((range, index) => [
       range.start,
@@ -606,7 +868,7 @@ function replaceProviderTreeWithManaged(contents, state) {
         text: [
           signedProviderSlot(state, index),
           ...(state.mode === "provider-table" && index === 0
-            ? [managedSignedProviderBlock(state.managedProvider, state.managedBaseUrl)]
+            ? [blockGenerator(state.managedProvider, state.managedBaseUrl)]
             : []),
         ].join("\n"),
       },
@@ -625,7 +887,7 @@ function replaceProviderTreeWithManaged(contents, state) {
   }
   let next = output.join("\n");
   if (state.mode === "provider-table" && ranges.length === 0) {
-    next = `${next.trimEnd()}\n\n${signedProviderSlot(state, 0)}\n${managedSignedProviderBlock(
+    next = `${next.trimEnd()}\n\n${signedProviderSlot(state, 0)}\n${blockGenerator(
       state.managedProvider,
       state.managedBaseUrl,
     )}\n`;
@@ -676,11 +938,17 @@ function signedProviderBlockIsOwned(contents, state) {
   if (!range) return false;
   const actual = range.lines.slice(range.start, range.end).join("\n");
   const slotIndex = lines.indexOf(signedProviderSlot(state, 0));
+  const blockMatches = state.loginFree
+    ? managedLoginFreeProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl)
+    : managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl);
+  const providerTreeInsideManagedBlock =
+    providerRanges.length >= 1 &&
+    providerRanges[0].start === range.start + 1 &&
+    providerRanges.every(({ start }) => start > range.start && start < range.end);
   return (
-    managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl) &&
+    blockMatches &&
     slotIndex + 1 === range.start &&
-    providerRanges.length === 1 &&
-    providerRanges[0].start === range.start + 1
+    providerTreeInsideManagedBlock
   );
 }
 
@@ -722,26 +990,94 @@ function restoreSignedProviderTable(contents, state) {
   );
 }
 
-function managedSignedProviderContents(contents, managedProvider, managedBaseUrl) {
+function managedSignedProviderContents(
+  contents,
+  managedProvider,
+  managedBaseUrl,
+  { loginFree = false, ownershipId } = {},
+) {
+  // Login-free mode routes through the provider identity that is already
+  // selected, so the separate codex-router provider generated by
+  // enabledContents() is redundant. Use the established marker remover: it
+  // hoists foreign tables that the desktop app may have parked inside the
+  // managed block instead of deleting them with the provider table.
+  const prepared = loginFree
+    ? removeMarkerPair(
+        contents,
+        providerStartMarker,
+        providerEndMarker,
+        "[model_providers.codex-router]",
+      )
+    : contents;
   const state = {
     version: 3,
     mode: managedProvider === "openai" ? "root-openai" : "provider-table",
     managedProvider,
     managedBaseUrl,
-    ownershipId: randomBytes(16).toString("hex"),
+    ownershipId: ownershipId || randomBytes(16).toString("hex"),
     previousProviderSections: [],
+    ...(loginFree ? { loginFree: true } : {}),
   };
   return {
     state,
-    contents: replaceProviderTreeWithManaged(contents, state),
+    contents: replaceProviderTreeWithManaged(prepared, state),
   };
+}
+
+function providerModeStateFromManaged(managedState, restoreState) {
+  return {
+    ...managedState,
+    loginFree: true,
+    previousModelPresent: restoreState.previousModelPresent,
+    ...(restoreState.previousModelPresent
+      ? { previousModel: restoreState.previousModel }
+      : {}),
+  };
+}
+
+function switchedProviderModeState(rootLines, restoreState) {
+  const previousPresent = rootHasValue(rootLines, "model_provider");
+  const previousModelPresent =
+    restoreState?.previousModelPresent ?? rootHasValue(rootLines, "model");
+  return {
+    version: 1,
+    previousPresent,
+    ...(previousPresent
+      ? { previousModelProvider: rootValue(rootLines, "model_provider") }
+      : {}),
+    previousModelPresent,
+    ...(previousModelPresent
+      ? { previousModel: restoreState?.previousModel ?? rootValue(rootLines, "model") }
+      : {}),
+  };
+}
+
+function restoreProviderModeModel(contents, state) {
+  const { rootLines } = splitRoot(contents);
+  const present = rootHasValue(rootLines, "model");
+  if (
+    present === state.previousModelPresent &&
+    (!present || rootValue(rootLines, "model") === state.previousModel)
+  ) {
+    return contents;
+  }
+  return `${replaceRootValue(
+    contents,
+    "model",
+    state.previousModelPresent ? state.previousModel : undefined,
+  )}\n`;
 }
 
 function signedProviderStateIsOwned(contents, state) {
   const { rootLines } = splitRoot(contents);
   const activeProvider = rootValue(rootLines, "model_provider") || "openai";
   if (activeProvider !== state.managedProvider) return false;
-  if (state.version === 1) return activeProvider === signedProviderId;
+  if (state.version === 1) {
+    return (
+      activeProvider === signedProviderId &&
+      signedProviderSwitchBlockStatus(contents) === "owned"
+    );
+  }
   if (state.mode === "root-openai") {
     return (
       isManagedRouterBaseUrl(rootValue(rootLines, "openai_base_url")) &&
@@ -755,13 +1091,28 @@ function readProviderModeState() {
   if (!existsSync(CODEX_PROVIDER_MODE_PATH)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(CODEX_PROVIDER_MODE_PATH, "utf8"));
-    if (
-      parsed?.version !== 1 ||
-      typeof parsed.previousPresent !== "boolean" ||
-      (parsed.previousPresent && typeof parsed.previousModelProvider !== "string") ||
-      typeof parsed.previousModelPresent !== "boolean" ||
-      (parsed.previousModelPresent && typeof parsed.previousModel !== "string")
-    ) {
+    const recognizedV1 =
+      parsed?.version === 1 &&
+      typeof parsed.previousPresent === "boolean" &&
+      (!parsed.previousPresent || typeof parsed.previousModelProvider === "string") &&
+      typeof parsed.previousModelPresent === "boolean" &&
+      (!parsed.previousModelPresent || typeof parsed.previousModel === "string");
+    const recognizedV3 =
+      parsed?.version === 3 &&
+      (parsed.mode === "root-openai" || parsed.mode === "provider-table") &&
+      typeof parsed.managedProvider === "string" &&
+      parsed.managedProvider.length > 0 &&
+      parsed.mode === (parsed.managedProvider === "openai" ? "root-openai" : "provider-table") &&
+      typeof parsed.managedBaseUrl === "string" &&
+      isManagedRouterBaseUrl(parsed.managedBaseUrl) &&
+      typeof parsed.ownershipId === "string" &&
+      /^[0-9a-f]{32}$/.test(parsed.ownershipId) &&
+      Array.isArray(parsed.previousProviderSections) &&
+      parsed.previousProviderSections.every((section) => typeof section === "string") &&
+      parsed.loginFree === true &&
+      typeof parsed.previousModelPresent === "boolean" &&
+      (!parsed.previousModelPresent || typeof parsed.previousModel === "string");
+    if (!recognizedV1 && !recognizedV3) {
       throw new Error("invalid state");
     }
     return parsed;
@@ -883,7 +1234,6 @@ function legacyManagedRouterProvider(contents) {
   ) {
     end += 1;
   }
-
   const fields = new Map();
   for (const line of lines.slice(start + 1, end)) {
     const trimmed = line.trim();
@@ -901,7 +1251,12 @@ function legacyManagedRouterProvider(contents) {
     fields.get("wire_api") === "responses";
   const currentShape =
     (fields.size === 3 ||
-      (fields.size === 4 && fields.get("supports_standalone_web_search") === "true")) &&
+      (fields.size === 4 &&
+        (fields.get("supports_standalone_web_search") === "true" ||
+          fields.get("requires_openai_auth") === "true")) ||
+      (fields.size === 5 &&
+        fields.get("supports_standalone_web_search") === "true" &&
+        fields.get("requires_openai_auth") === "true")) &&
     fields.get("name") === "Codex Router (external models)";
   const prototypeShape =
     (fields.size === 4 ||
@@ -932,16 +1287,86 @@ function clean(contents) {
     removeCreatedAgentsTableIfEmpty(removeMarkedBlock(contents)),
   );
   const { rootLines, tableLines } = splitRoot(withoutBlock);
-  const filtered = rootLines.filter((line) => {
-    if (/^\s*openai_base_url\s*=/.test(line)) {
+  const rootText = rootLines.join("\n");
+  const bases = new Set(rootAssignmentIndexes(rootText, "openai_base_url"));
+  const catalogs = new Set(rootAssignmentIndexes(rootText, "model_catalog_json"));
+  const comments = standaloneCommentIndexes(rootText);
+  const filtered = rootLines.filter((line, index) => {
+    if (bases.has(index)) {
       return !(knownManaged && isRecognizedRouterBaseUrl(assignmentValue(line)));
     }
-    if (/^\s*model_catalog_json\s*=/.test(line)) {
+    if (catalogs.has(index)) {
       return !knownCatalogPaths.includes(assignmentValue(line));
     }
-    return !markerPairs.flat().includes(line.trim());
+    return !comments.has(index) || !markerPairs.flat().includes(line.trim());
   });
   return { rootLines: filtered, tableLines };
+}
+
+function providerModeStateIsOwned(contents, state) {
+  if (!state) return false;
+  if (state.version === 1) {
+    const { rootLines } = splitRoot(contents);
+    return rootValue(rootLines, "model_provider") === routerProviderId;
+  }
+  if (state.version === 3) {
+    return signedProviderStateIsOwned(contents, state);
+  }
+  return false;
+}
+
+function providerModeRestoreSourceIsOwned(contents, state) {
+  if (!state) return false;
+  const { rootLines } = splitRoot(contents);
+  const providerPresent = rootHasValue(rootLines, "model_provider");
+  const modelPresent = rootHasValue(rootLines, "model");
+  if (state.version === 1) {
+    return (
+      providerPresent === state.previousPresent &&
+      (!providerPresent || rootValue(rootLines, "model_provider") === state.previousModelProvider) &&
+      modelPresent === state.previousModelPresent &&
+      (!modelPresent || rootValue(rootLines, "model") === state.previousModel)
+    );
+  }
+  if (state.version !== 3) return false;
+  const activeProvider = rootValue(rootLines, "model_provider") || "openai";
+  if (
+    activeProvider !== state.managedProvider ||
+    modelPresent !== state.previousModelPresent ||
+    (modelPresent && rootValue(rootLines, "model") !== state.previousModel)
+  ) {
+    return false;
+  }
+  const actualSections = providerTableRanges(contents, state.managedProvider).map((range) =>
+    range.lines.slice(range.start, range.end).join("\n").trimEnd()
+  );
+  return (
+    actualSections.length === state.previousProviderSections.length &&
+    actualSections.every(
+      (section, index) => section === state.previousProviderSections[index].trimEnd(),
+    )
+  );
+}
+
+function refreshJournalOwnsModel(model, journal) {
+  if (!model) return false;
+  if (model === journal.displayModel || model === journal.canonicalModel) return true;
+  const aliases = readNativeAliases();
+  return (aliases[model] || model) === journal.canonicalModel;
+}
+
+function refreshJournalOwnsActiveModel(contents, journal) {
+  return refreshJournalOwnsModel(
+    rootValue(splitRoot(contents).rootLines, "model"),
+    journal,
+  );
+}
+
+function applyRefreshJournalModel(contents, journal) {
+  if (rootValue(splitRoot(contents).rootLines, "model") === journal.canonicalModel) {
+    return contents;
+  }
+  return `${replaceRootValueInPlace(contents, "model", journal.canonicalModel)}\n`;
 }
 
 function snapshot(contents) {
@@ -953,7 +1378,32 @@ function snapshot(contents) {
   const signedActive = signedState
     ? signedProviderStateIsOwned(contents, signedState)
     : false;
+  const providerModeState = readProviderModeState();
+  if (signedState && providerModeState) {
+    throw new Error(
+      "Invalid Codex routing state: signed routing and login-free mode are both recorded.",
+    );
+  }
+  const loginFreeActive = providerModeState
+    ? providerModeStateIsOwned(contents, providerModeState)
+    : false;
   const routerDefault = readCodexRouterDefault();
+  const managedRouterUrlPresent = contents.split("\n").some((line) => {
+    if (!/^\s*(?:openai_base_url|base_url)\s*=/.test(line)) return false;
+    return isManagedRouterBaseUrl(assignmentValue(line));
+  });
+  const managedRouterArtifactsPresent =
+    managedRouterUrlPresent ||
+    catalog === MERGED_CATALOG_PATH ||
+    [
+      startMarker,
+      endMarker,
+      providerStartMarker,
+      providerEndMarker,
+      signedProviderStartMarker,
+      signedProviderEndMarker,
+      signedProviderSlotPrefix,
+    ].some((marker) => contents.includes(marker));
   return {
     mode:
       isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
@@ -961,16 +1411,20 @@ function snapshot(contents) {
         : "native",
     model: rootValue(rootLines, "model") || null,
     model_provider: activeProvider,
-    login_free: rootValue(rootLines, "model_provider") === routerProviderId,
-    login_free_managed:
-      rootValue(rootLines, "model_provider") === routerProviderId &&
-      existsSync(CODEX_PROVIDER_MODE_PATH),
+    login_free: Boolean(loginFreeActive),
+    login_free_managed: Boolean(
+      loginFreeActive && privateFileIsProtected(CODEX_PROVIDER_MODE_PATH),
+    ),
     provider_mode_state_present: existsSync(CODEX_PROVIDER_MODE_PATH),
     signed_routing: Boolean(signedActive),
     signed_routing_managed: Boolean(
       signedActive && privateFileIsProtected(SIGNED_PROVIDER_MODE_PATH),
     ),
     signed_provider_state_present: existsSync(SIGNED_PROVIDER_MODE_PATH),
+    signed_provider_state_version: signedState?.version ?? null,
+    signed_provider_mode:
+      signedState?.version === 1 ? "provider-switch" : signedState?.mode ?? null,
+    managed_router_artifacts_present: managedRouterArtifactsPresent,
     router_default_model: routerDefault?.model || null,
     router_default_managed: Boolean(routerDefault),
     openai_base_url: baseUrl ? redactCallerUrl(baseUrl) : null,
@@ -996,8 +1450,10 @@ function restoreRouterDefault(contents, state = readCodexRouterDefault()) {
   )}\n`;
 }
 
-function enabledContents(contents) {
+function enabledContents(contents, { loginFreeProvider = false } = {}) {
   const { rootLines: currentRoot } = splitRoot(contents);
+  // Validate before publishing: status also reads this setting after the write.
+  rootAssignmentIndexes(currentRoot.join("\n"), "model");
   const currentProvider = rootValue(currentRoot, "model_provider");
   const preparedSource = adoptNativeCatalog
     ? readNativeCatalogSource()
@@ -1041,9 +1497,8 @@ function enabledContents(contents) {
     ) {
       throw new Error(`Refusing to replace user-owned model_catalog_json: ${existingCatalog}`);
     }
-    rootLines = rootLines.filter(
-      (line) => !/^\s*model_catalog_json\s*=/.test(line),
-    );
+    const removable = new Set(rootAssignmentIndexes(rootLines.join("\n"), "model_catalog_json"));
+    rootLines = rootLines.filter((_line, index) => !removable.has(index));
     nativeCatalogNeedsActivation = preparedSource.status === "pending";
   }
   const managedRealtimeOverrides = [];
@@ -1080,7 +1535,13 @@ function enabledContents(contents) {
     'name = "Codex Router (external models)"',
     `base_url = ${JSON.stringify(routerBaseUrl)}`,
     'wire_api = "responses"',
+    // Provider support is necessary but not sufficient: Codex also reads the
+    // selected catalog model's supports_search_tool value before exposing the
+    // standalone web-search client tool.
     "supports_standalone_web_search = true",
+    ...(loginFreeProvider
+      ? ["requires_openai_auth = false", managedCallerAuthBlock(routerProviderId)]
+      : ["requires_openai_auth = true"]),
     providerEndMarker,
   ];
   return withManagedAgentConcurrency(
@@ -1100,9 +1561,8 @@ function restoreNativeCatalog(contents) {
   ) {
     throw new Error(`Refusing to replace user-owned model_catalog_json: ${existing}`);
   }
-  const rootLines = cleaned.rootLines.filter(
-    (line) => !/^\s*model_catalog_json\s*=/.test(line),
-  );
+  const removable = new Set(rootAssignmentIndexes(cleaned.rootLines.join("\n"), "model_catalog_json"));
+  const rootLines = cleaned.rootLines.filter((_line, index) => !removable.has(index));
   rootLines.push(`model_catalog_json = ${tomlValue(source.path)}`);
   return `${[
     ...trimBlankEdges(rootLines),
@@ -1129,6 +1589,7 @@ if (!new Set([
   "enable",
   "disable",
   "status",
+  "caller-capability-refresh",
   "login-free-enable",
   "login-free-disable",
   "signed-enable",
@@ -1137,7 +1598,7 @@ if (!new Set([
   "router-default-clear",
 ]).has(command)) {
   console.error(
-    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
+    "Usage: config-manager.mjs enable|disable|status|caller-capability-refresh|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
   );
   process.exit(2);
 }
@@ -1148,6 +1609,61 @@ if (command === "status") {
   process.exit(0);
 }
 
+const refreshJournal = readLoginFreeRefreshJournal();
+const resumeLoginFreeRefresh = process.argv.includes("--resume-login-free-refresh");
+const parkLoginFreeRefresh = process.argv.includes("--park-login-free-refresh");
+const restoreDisabledLoginFree = process.argv.includes("--restore-disabled-login-free");
+const completeLoginFreeRefresh = process.argv.includes("--complete-login-free-refresh");
+if (restoreDisabledLoginFree && completeLoginFreeRefresh) {
+  throw new Error("A login-free refresh step cannot restore and complete at once.");
+}
+const internalRefreshStep =
+  (command === "enable" &&
+    resumeLoginFreeRefresh &&
+    !parkLoginFreeRefresh &&
+    !restoreDisabledLoginFree &&
+    !completeLoginFreeRefresh) ||
+  (command === "disable" &&
+    process.argv.includes("--preserve-login-free-state") &&
+    parkLoginFreeRefresh &&
+    !resumeLoginFreeRefresh &&
+    !restoreDisabledLoginFree &&
+    !completeLoginFreeRefresh) ||
+  (command === "login-free-enable" &&
+    !resumeLoginFreeRefresh &&
+    !parkLoginFreeRefresh &&
+    (restoreDisabledLoginFree || completeLoginFreeRefresh));
+if (refreshJournal && !internalRefreshStep) {
+  throw new Error(
+    "A login-free catalog refresh is pending; rerun bin/refresh-catalog before changing Codex routing.",
+  );
+}
+if (
+  !refreshJournal &&
+  (resumeLoginFreeRefresh ||
+    parkLoginFreeRefresh ||
+    restoreDisabledLoginFree ||
+    completeLoginFreeRefresh)
+) {
+  throw new Error("No login-free catalog refresh is pending; refusing internal refresh step.");
+}
+if (command === "caller-capability-refresh") {
+  const currentStatus = snapshot(current);
+  if (currentStatus.mode !== "router") {
+    throw new Error("Codex Router is not the active managed route; refusing caller capability refresh.");
+  }
+  const nextBase = configuredRouterBaseUrl();
+  const nextContents = refreshCodexCallerCapabilityContents(current, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router });
+  const providerState = readProviderModeState();
+  const signedState = readSignedProviderModeState();
+  const nextProviderState = providerState ? refreshCodexCallerCapabilityState(providerState, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router }) : undefined;
+  const nextSignedState = signedState ? refreshCodexCallerCapabilityState(signedState, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router }) : undefined;
+  atomicWrite(nextContents);
+  if (nextProviderState) writeProviderModeState(nextProviderState);
+  if (nextSignedState) writeSignedProviderModeState(nextSignedState);
+  process.stdout.write(`${JSON.stringify({ refreshed: true })}\n`);
+  process.exit(0);
+}
 let next;
 let pendingProviderModeState;
 let clearNativeCatalogSourceAfterWrite = false;
@@ -1157,12 +1673,30 @@ let pendingRouterDefaultState;
 let clearRouterDefaultState = false;
 if (command === "enable") {
   const signedState = readSignedProviderModeState();
-  if (signedState?.version === 1) {
+  const providerState = readProviderModeState();
+  if (refreshJournal && !providerState) {
     throw new Error(
-      "A recognized older signed-routing mode is still active; turn it off before updating the router.",
+      "The login-free refresh journal has no matching provider state; refusing recovery.",
     );
   }
-  if (signedState) {
+  if (signedState && providerState) {
+    throw new Error(
+      "Signed routing and login-free provider state cannot both be active; turn one off before updating the router.",
+    );
+  }
+  if (signedState?.version === 1) {
+    if (!signedProviderStateIsOwned(current, signedState)) {
+      throw new Error(
+        `Signed routing lost ownership while model_provider is ${
+          rootValue(splitRoot(current).rootLines, "model_provider") || "openai"
+        }; refusing to update it.`,
+      );
+    }
+    next = managedSignedProviderSwitchContents(
+      enabledContents(current),
+      configuredRouterBaseUrl(),
+    );
+  } else if (signedState) {
     if (!signedProviderStateIsOwned(current, signedState)) {
       throw new Error(
         `Signed routing lost ownership while model_provider is ${
@@ -1176,9 +1710,79 @@ if (command === "enable") {
       enabled,
       signedState.managedProvider,
       configuredRouterBaseUrl(),
+      { ownershipId: signedState.ownershipId },
     );
     next = refreshed.contents;
     pendingSignedProviderModeState = refreshed.state;
+  } else if (providerState?.version === 1) {
+    const active = providerModeStateIsOwned(current, providerState);
+    const journal = refreshJournal;
+    const journalOwned = journal && loginFreeRefreshJournalMatchesState(journal);
+    const resumable =
+      journalOwned && providerModeRestoreSourceIsOwned(current, providerState);
+    if (
+      (!active && !resumable) ||
+      (active && journal && (!journalOwned || !refreshJournalOwnsActiveModel(current, journal)))
+    ) {
+      throw new Error(
+        "Login-free mode lost ownership of model_provider codex-router; refusing to update it.",
+      );
+    }
+    // Keep the v1 state intact so login-free-disable can still restore the
+    // provider and model captured by the older router.
+    next = enabledContents(
+      resumable ? applyRefreshJournalModel(current, journal) : current,
+      { loginFreeProvider: true },
+    );
+    if (resumable) {
+      next = `${replaceRootValueInPlace(next, "model_provider", routerProviderId)}\n`;
+    }
+  } else if (providerState) {
+    const active = providerModeStateIsOwned(current, providerState);
+    const journal = refreshJournal;
+    const journalOwned = journal && loginFreeRefreshJournalMatchesState(journal);
+    const resumable =
+      journalOwned && providerModeRestoreSourceIsOwned(current, providerState);
+    if (
+      (!active && !resumable) ||
+      (active && journal && (!journalOwned || !refreshJournalOwnsActiveModel(current, journal)))
+    ) {
+      throw new Error(
+        `Login-free mode lost ownership while model_provider is ${
+          rootValue(splitRoot(current).rootLines, "model_provider") || "openai"
+        }; refusing to update it.`,
+      );
+    }
+    const restored = active
+      ? restoreSignedProviderTable(current, providerState)
+      : current;
+    const enabled = enabledContents(
+      resumable ? applyRefreshJournalModel(restored, journal) : restored,
+      { loginFreeProvider: providerState.mode === "root-openai" },
+    );
+    if (providerState.mode === "root-openai") {
+      // Current Codex Desktop builds reserve the built-in `openai` provider id,
+      // so an explicit auth-free [model_providers.openai] table makes the whole
+      // config invalid. Migrate the draft root-openai state back to the proven
+      // codex-router provider switch while retaining its original model restore.
+      pendingProviderModeState = switchedProviderModeState(
+        splitRoot(current).rootLines,
+        providerState,
+      );
+      next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;
+    } else {
+      const refreshed = managedSignedProviderContents(
+        enabled,
+        providerState.managedProvider,
+        configuredRouterBaseUrl(),
+        { loginFree: true, ownershipId: providerState.ownershipId },
+      );
+      next = refreshed.contents;
+      pendingProviderModeState = providerModeStateFromManaged(
+        refreshed.state,
+        providerState,
+      );
+    }
   } else {
     next = enabledContents(current);
   }
@@ -1215,27 +1819,128 @@ if (command === "enable") {
   }
   const defaultRestored = restoreRouterDefault(current);
   clearRouterDefaultState = Boolean(readCodexRouterDefault());
-  const enabled = enabledContents(defaultRestored);
   const { rootLines } = splitRoot(defaultRestored);
+  const currentProvider = rootValue(rootLines, "model_provider") || "openai";
   const loginFreeModel = String(process.argv[3] || "").trim();
-  const alreadyManaged =
-    rootValue(rootLines, "model_provider") === routerProviderId &&
-    existsSync(CODEX_PROVIDER_MODE_PATH);
-  if (!alreadyManaged) {
-    pendingProviderModeState = {
-      version: 1,
-      previousPresent: rootHasValue(rootLines, "model_provider"),
-      ...(rootHasValue(rootLines, "model_provider")
-        ? { previousModelProvider: rootValue(rootLines, "model_provider") }
-        : {}),
-      previousModelPresent: rootHasValue(rootLines, "model"),
-      ...(rootHasValue(rootLines, "model")
-        ? { previousModel: rootValue(rootLines, "model") }
-        : {}),
-    };
+  const withLoginFreeModel = (contents) => {
+    if (!loginFreeModel) return contents;
+    if (rootValue(splitRoot(contents).rootLines, "model") === loginFreeModel) {
+      return contents;
+    }
+    return `${replaceRootValueInPlace(contents, "model", loginFreeModel)}\n`;
+  };
+  const state = readProviderModeState();
+  if (
+    restoreDisabledLoginFree &&
+    refreshJournal &&
+    loginFreeModel !== refreshJournal.canonicalModel
+  ) {
+    throw new Error(
+      "The login-free refresh model does not match its protected journal; refusing recovery.",
+    );
   }
-  next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;
-  if (loginFreeModel) next = `${replaceRootValue(next, "model", loginFreeModel)}\n`;
+  const journalOwned =
+    refreshJournal && loginFreeRefreshJournalMatchesState(refreshJournal);
+  if (
+    restoreDisabledLoginFree &&
+    (!journalOwned ||
+      !state ||
+      providerModeStateIsOwned(current, state) ||
+      !providerModeRestoreSourceIsOwned(defaultRestored, state))
+  ) {
+    throw new Error(
+      "The login-free refresh no longer owns its inactive restore source; refusing recovery.",
+    );
+  }
+  if (
+    completeLoginFreeRefresh &&
+    (!journalOwned ||
+      !state ||
+      !providerModeStateIsOwned(current, state) ||
+      !refreshJournalOwnsActiveModel(current, refreshJournal) ||
+      !refreshJournalOwnsModel(loginFreeModel, refreshJournal))
+  ) {
+    throw new Error(
+      "The login-free refresh no longer owns its provider state or model route; refusing completion.",
+    );
+  }
+  if (state?.version === 1) {
+    const active = providerModeStateIsOwned(current, state);
+    const resumable =
+      restoreDisabledLoginFree &&
+      journalOwned &&
+      providerModeRestoreSourceIsOwned(defaultRestored, state);
+    if (
+      !active &&
+      !resumable
+    ) {
+      throw new Error(
+        "Login-free mode lost ownership of model_provider codex-router; refusing to update it.",
+      );
+    }
+    // A v1 install already selected codex-router. Refresh it without changing
+    // the old restore record; disabling remains able to put both original
+    // root assignments back exactly.
+    next = enabledContents(withLoginFreeModel(defaultRestored), {
+      loginFreeProvider: true,
+    });
+    if (!active) next = `${replaceRootValue(next, "model_provider", routerProviderId)}\n`;
+  } else if (state) {
+    const active = providerModeStateIsOwned(current, state);
+    const resumable =
+      restoreDisabledLoginFree &&
+      journalOwned &&
+      providerModeRestoreSourceIsOwned(defaultRestored, state);
+    if (
+      !active &&
+      !resumable
+    ) {
+      throw new Error(
+        `Login-free mode lost ownership while model_provider is ${currentProvider}; refusing to update it.`,
+      );
+    }
+    const restored = active
+      ? restoreSignedProviderTable(defaultRestored, state)
+      : defaultRestored;
+    const enabled = enabledContents(withLoginFreeModel(restored), {
+      loginFreeProvider: state.mode === "root-openai",
+    });
+    if (state.mode === "root-openai") {
+      pendingProviderModeState = switchedProviderModeState(rootLines, state);
+      next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;
+    } else {
+      const refreshed = managedSignedProviderContents(
+        enabled,
+        state.managedProvider,
+        configuredRouterBaseUrl(),
+        { loginFree: true, ownershipId: state.ownershipId },
+      );
+      next = refreshed.contents;
+      pendingProviderModeState = providerModeStateFromManaged(refreshed.state, state);
+    }
+  } else {
+    const enabled = enabledContents(withLoginFreeModel(defaultRestored), {
+      loginFreeProvider: currentProvider === "openai",
+    });
+    if (currentProvider === "openai") {
+      pendingProviderModeState = switchedProviderModeState(rootLines);
+      next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;
+    } else {
+      const managed = managedSignedProviderContents(
+        enabled,
+        currentProvider,
+        configuredRouterBaseUrl(),
+        { loginFree: true },
+      );
+      pendingProviderModeState = providerModeStateFromManaged(managed.state, {
+        previousModelPresent: rootHasValue(rootLines, "model"),
+        ...(rootHasValue(rootLines, "model")
+          ? { previousModel: rootValue(rootLines, "model") }
+          : {}),
+      });
+      next = managed.contents;
+    }
+  }
 } else if (command === "signed-enable") {
   if (existsSync(CODEX_PROVIDER_MODE_PATH)) {
     throw new Error("Turn off login-free mode before enabling signed routing.");
@@ -1243,9 +1948,20 @@ if (command === "enable") {
   const { rootLines } = splitRoot(current);
   const currentProvider = rootValue(rootLines, "model_provider") || "openai";
   const state = readSignedProviderModeState();
-  if (state?.version === 1) {
+  if (preserveRootOpenaiSignedMode && currentProvider !== "openai") {
     throw new Error(
-      "A recognized older signed-routing mode is still active; turn it off before enabling the task-preserving mode.",
+      "The root-OpenAI signed mode can only be restored from the OpenAI provider.",
+    );
+  }
+  if (state?.version === 1) {
+    if (!signedProviderStateIsOwned(current, state)) {
+      throw new Error(
+        `Signed routing lost ownership while model_provider is ${currentProvider}; turn it off before enabling it again.`,
+      );
+    }
+    next = managedSignedProviderSwitchContents(
+      enabledContents(current),
+      configuredRouterBaseUrl(),
     );
   } else if (state) {
     if (!signedProviderStateIsOwned(current, state)) {
@@ -1260,6 +1976,7 @@ if (command === "enable") {
         enabled,
         state.managedProvider,
         configuredRouterBaseUrl(),
+        { ownershipId: state.ownershipId },
       );
       next = upgraded.contents;
       pendingSignedProviderModeState = upgraded.state;
@@ -1269,9 +1986,14 @@ if (command === "enable") {
   } else {
     const enabled = enabledContents(current);
     const routerBaseUrl = configuredRouterBaseUrl();
-    const managed = managedSignedProviderContents(enabled, currentProvider, routerBaseUrl);
-    pendingSignedProviderModeState = managed.state;
-    next = managed.contents;
+    if (currentProvider === "openai" && !preserveRootOpenaiSignedMode) {
+      pendingSignedProviderModeState = signedProviderSwitchState(rootLines);
+      next = managedSignedProviderSwitchContents(enabled, routerBaseUrl);
+    } else {
+      const managed = managedSignedProviderContents(enabled, currentProvider, routerBaseUrl);
+      pendingSignedProviderModeState = managed.state;
+      next = managed.contents;
+    }
   }
   next = applyRouterDefault(next);
 } else {
@@ -1279,6 +2001,18 @@ if (command === "enable") {
   const signedState = readSignedProviderModeState();
   const { rootLines } = splitRoot(current);
   const currentProvider = rootValue(rootLines, "model_provider");
+  if (parkLoginFreeRefresh) {
+    if (
+      !state ||
+      !loginFreeRefreshJournalMatchesState(refreshJournal) ||
+      !providerModeStateIsOwned(current, state) ||
+      !refreshJournalOwnsActiveModel(current, refreshJournal)
+    ) {
+      throw new Error(
+        "The login-free refresh no longer owns its provider state or model route; refusing to park it.",
+      );
+    }
+  }
   let restored = current;
   if (command === "signed-disable") {
     if (!signedState) {
@@ -1294,12 +2028,27 @@ if (command === "enable") {
           `Refusing to replace user-owned model_provider: ${currentProvider || "unset"}.`,
         );
       }
+      const blockStatus = signedProviderSwitchBlockStatus(current);
+      if (blockStatus === "drift") {
+        throw new Error(
+          `Signed routing lost ownership of model_providers.${signedProviderId}; refusing to replace it.`,
+        );
+      }
+      restored = blockStatus === "owned"
+        ? withoutManagedSignedProviderSwitch(current)
+        : current;
     } else if (signedState.version === 1) {
+      if (!signedProviderStateIsOwned(current, signedState)) {
+        throw new Error(
+          `Signed routing lost ownership of model_providers.${signedProviderId}; refusing to replace it.`,
+        );
+      }
       restored = `${replaceRootValue(
         current,
         "model_provider",
         signedState.previousPresent ? signedState.previousModelProvider : undefined,
       )}\n`;
+      restored = withoutManagedSignedProviderSwitch(restored);
     } else {
       const effectiveProvider = currentProvider || "openai";
       if (effectiveProvider !== signedState.managedProvider) {
@@ -1310,25 +2059,39 @@ if (command === "enable") {
       restored = restoreSignedProviderTable(current, signedState);
     }
   } else if (state) {
-    if (currentProvider !== routerProviderId) {
-      throw new Error(
-        `Refusing to replace user-owned model_provider: ${currentProvider || "unset"}.`,
-      );
+    if (state.version === 1) {
+      if (currentProvider !== routerProviderId) {
+        throw new Error(
+          `Refusing to replace user-owned model_provider: ${currentProvider || "unset"}.`,
+        );
+      }
+      restored = `${replaceRootValue(
+        current,
+        "model_provider",
+        state.previousPresent ? state.previousModelProvider : undefined,
+      )}\n`;
+      restored = restoreProviderModeModel(restored, state);
+    } else if (state.version === 3) {
+      const effectiveProvider = currentProvider || "openai";
+      if (!providerModeStateIsOwned(current, state)) {
+        throw new Error(
+          `Login-free mode lost ownership to model_provider ${effectiveProvider}; refusing to replace it.`,
+        );
+      }
+      restored = restoreSignedProviderTable(current, state);
+      restored = restoreProviderModeModel(restored, state);
     }
-    restored = `${replaceRootValue(
-      current,
-      "model_provider",
-      state.previousPresent ? state.previousModelProvider : undefined,
-    )}\n`;
-    restored = `${replaceRootValue(
-      restored,
-      "model",
-      state.previousModelPresent ? state.previousModel : undefined,
-    )}\n`;
   } else if (command === "login-free-disable" && currentProvider === routerProviderId) {
     throw new Error("Codex login-free mode is not managed by this router.");
   }
-  if (command === "login-free-disable" || command === "signed-disable") {
+  if (command === "login-free-disable") {
+    // Login-free mode removes the ordinary inert codex-router provider block
+    // while it temporarily owns the selected provider table. Rebuild the
+    // enabled router document after restoring that table so turning the mode
+    // off returns to the exact pre-toggle routing surface instead of leaving
+    // the standard provider definition missing.
+    next = enabledContents(restored);
+  } else if (command === "signed-disable") {
     next = restored;
   } else {
     if (signedState?.version === 1) {
@@ -1376,6 +2139,9 @@ if (existsSync(CONFIG_PATH) && !existsSync(BACKUP_PATH)) {
   copyFileSync(CONFIG_PATH, BACKUP_PATH);
 }
 if (existsSync(BACKUP_PATH)) protectPrivateFile(BACKUP_PATH);
+const previousProviderModeState = pendingProviderModeState
+  ? readProviderModeState()
+  : undefined;
 const previousSignedProviderModeState = pendingSignedProviderModeState
   ? readSignedProviderModeState()
   : undefined;
@@ -1389,7 +2155,13 @@ try {
   atomicWrite(next);
   if (activateNativeCatalogSourceAfterWrite) activateNativeCatalogSource();
 } catch (error) {
-  if (pendingProviderModeState) clearProviderModeState();
+  if (pendingProviderModeState) {
+    if (previousProviderModeState) {
+      writeProviderModeState(previousProviderModeState);
+    } else {
+      clearProviderModeState();
+    }
+  }
   if (pendingSignedProviderModeState) {
     if (previousSignedProviderModeState) {
       writeSignedProviderModeState(previousSignedProviderModeState);
@@ -1416,7 +2188,12 @@ try {
   }
   throw error;
 }
-if (command === "disable" || command === "login-free-disable") clearProviderModeState();
+if (
+  command === "login-free-disable" ||
+  (command === "disable" && !process.argv.includes("--preserve-login-free-state"))
+) {
+  clearProviderModeState();
+}
 if (clearNativeCatalogSourceAfterWrite) clearNativeCatalogSource();
 if (command === "disable" || command === "signed-disable") clearSignedProviderModeState();
 if (clearRouterDefaultState) clearCodexRouterDefault();

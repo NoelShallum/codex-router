@@ -10,6 +10,18 @@ export type ViewId =
 
 export type ModelViewFocus = "providers" | "models";
 
+/** Startup reads settle independently so a slow ledger or provider probe does
+ * not hold every page behind one application-wide loading state. */
+export interface RouterDataReady {
+  snapshot: boolean;
+  providers: boolean;
+  presence: boolean;
+  health: boolean;
+  accountUsage: boolean;
+  accountPool: boolean;
+  providerUsage: boolean;
+}
+
 export interface ModelViewFocusRequest {
   region: ModelViewFocus;
   id: number;
@@ -26,11 +38,25 @@ export interface RouterModel {
   /** Base native Codex entries stay client-managed; variants remain router-managed. */
   nativeClientManaged?: boolean;
   multiAgentVersion?: "v1" | "v2" | string;
+  /** Repository verdict; unlike `multiAgentVersion`, preserves unknown vs explicit v1. */
+  subagentCertification?: "v1" | "v2" | "unknown";
   visible: boolean;
   defaultEffort?: string;
   reasoningLevels?: string[];
   contextWindow?: number;
   autoCompact?: number;
+  inputModalities?: string[];
+  isFree?: boolean;
+  /** False only for a checked-in research route that is not currently routable. */
+  available?: boolean;
+}
+
+export interface RouterKnownModel {
+  slug: string;
+  displayName: string;
+  provider: string;
+  available: boolean;
+  contextWindow?: number;
   inputModalities?: string[];
   isFree?: boolean;
 }
@@ -40,6 +66,11 @@ export interface SubagentSettings {
   enabled: string[];
   disabled: string[];
   efforts?: Record<string, string>;
+  /** Machine-local v2 capability evidence, populated by the live probe. */
+  proofs?: Record<string, {
+    status: "checking" | "candidate" | "experimental" | "proven" | "failed" | string;
+    reason?: string;
+  }>;
   all?: boolean;
 }
 
@@ -174,6 +205,7 @@ export interface ToolResultAgingStats {
   evaluatedRequests?: number;
   largestResultBytes?: number;
   resultsAged?: number;
+  resultsShaped?: number;
   bytesSaved?: number;
   estimatedTokensSaved?: number;
   firstAt?: string;
@@ -210,6 +242,7 @@ export interface RouterTarget {
   routerDefaultModel?: string;
   routerDefaultManaged?: boolean;
   usageEvents?: UsageEvent[];
+  usageEventHours?: UsageEventHour[];
   modelSettings?: {
     subagents: SubagentSettings;
     picker: { hidden: string[]; visible?: string[]; hasExplicitVisibility?: boolean; path?: string };
@@ -223,6 +256,86 @@ export interface RouterSnapshot {
   targets: { codex?: RouterTarget; [target: string]: RouterTarget | undefined };
   /** The router-owned model policy, independent of any client adapter. */
   catalog?: RouterCatalogSnapshot;
+  /** Safe consent/login projection. Never contains token, account, or path data. */
+  chatgptSession?: ChatGptSessionStatus;
+}
+
+export interface RouterDashboardProvider {
+  id: string;
+  displayName: string;
+  kind: string;
+  enabled: boolean;
+  ownedBy?: string;
+  authMode?: string;
+}
+
+export interface RouterDashboardModel {
+  slug: string;
+  displayName: string;
+  provider: string;
+  enabled: boolean;
+  visible: boolean;
+  native?: boolean;
+  isFree?: boolean;
+}
+
+export interface RouterDashboardSnapshot {
+  version: number;
+  source: string;
+  enabledProviders: string[];
+  providers: RouterDashboardProvider[];
+  models: RouterDashboardModel[];
+}
+
+export interface ChatGptSessionStatus {
+  sharing: "enabled" | "disabled";
+  session: "usable" | "expired" | "unavailable";
+  present: boolean;
+  expiresInHours?: number;
+  email?: string;
+}
+
+export interface ChatGptSubscriptionAccount {
+  id: string;
+  state: "active" | "paused" | "revoked" | string;
+  paused: boolean;
+  priority: number;
+  label?: string;
+  createdAt?: string;
+  subscription?: {
+    status?: "pending" | "usable" | "expired" | "invalid" | string;
+    authenticated?: boolean;
+    usable?: boolean;
+    expired?: boolean;
+    hasAccountId?: boolean;
+    expiresInHours?: number;
+    email?: string;
+    usage?: { period: "weekly" | "monthly" | "current"; remainingPercent: number; resetsAt?: number | null };
+  };
+  health?: { state?: string; lastStatus?: number; lastError?: string };
+  turns: number;
+  requests: number;
+}
+
+export interface ChatGptAccountPool {
+  version: number;
+  policy: { enabled: boolean; mode: "switch"; selectedAccountId?: string };
+  accounts: Record<string, ChatGptSubscriptionAccount>;
+  loginAttempts?: Record<string, {
+    status: "pending" | "failed";
+    error?: string;
+    retryable?: boolean;
+    removable?: boolean;
+  }>;
+  sessions: { count: number };
+  profile?: ChatGptProfileSwitch;
+}
+
+export interface ChatGptProfileSwitch {
+  desired?: string;
+  active?: string;
+  pending: boolean;
+  running?: boolean;
 }
 
 export interface RouterCatalogSnapshot {
@@ -230,22 +343,36 @@ export interface RouterCatalogSnapshot {
   configured: boolean;
   enabledProviders: string[];
   models: RouterModel[];
+  /** Safe checked-in inventory; never implies that a route is publishable. */
+  knownModels?: RouterKnownModel[];
   picker: { hidden: string[]; visible?: string[]; hasExplicitVisibility?: boolean; path?: string };
   subagents: SubagentSettings;
+  /** Metadata-only route dashboard. No credentials, endpoints, or sessions. */
+  dashboard?: RouterDashboardSnapshot;
 }
 
 export interface ProviderSetup {
   id: string;
   displayName: string;
-  kind: "oauth" | "api" | "anonymous" | "per-model";
+  kind: "oauth" | "api" | "anonymous" | "per-model" | "configuration";
   configured: boolean;
   action: string;
   planNote?: string;
+  catalogSources?: Array<{
+    id: string;
+    displayName: string;
+    kind: "models-endpoint" | "devin" | string;
+  }>;
   credentialLabel?: string;
+  configurationNote?: string;
   cliInstalled?: boolean;
   cliRunnable?: boolean;
   signIn?: boolean;
   signedIn?: boolean;
+  verified?: boolean;
+  disconnectable?: boolean;
+  probeNote?: string;
+  blockedNote?: string;
   signInAction?: string;
 }
 
@@ -254,8 +381,32 @@ export interface ProviderCatalog {
   discovered: string[];
   registered: string[];
   unregistered: string[];
+  /** Unregistered models whose protocol route is certified for curation. */
+  addable: string[];
+  /** Non-addable model id to the reason its route is withheld. */
+  blocked: Record<string, string>;
   unavailable: string[];
   contextLengths?: Record<string, number>;
+  metadata?: Record<string, {
+    contextWindow?: number;
+    maxOutputTokens?: number;
+    inputModalities?: string[];
+    outputModalities?: string[];
+    supportsTools?: boolean;
+    supportsToolChoice?: boolean;
+    reasoning?: {
+      supported?: boolean;
+      configurable?: boolean;
+      supportedEfforts?: string[];
+      defaultEffort?: string;
+      mandatory?: boolean;
+      defaultEnabled?: boolean;
+      advertisedSupportedEfforts?: string[];
+      advertisedDefaultEffort?: string;
+      effectiveMetadataSource?: string;
+    };
+    metadataSource?: string;
+  }>;
   free?: string[];
   /** True when the list came from the stored copy rather than a live request. */
   cached?: boolean;
@@ -299,6 +450,9 @@ export interface UsageMetric {
 
 export interface AccountUsage {
   fetchedAt?: string;
+  accountSelection?: string;
+  accountEmail?: string | null;
+  profilePending?: boolean;
   planType?: string;
   primary?: UsageMetric | null;
   secondary?: UsageMetric | null;
@@ -374,6 +528,21 @@ export interface ProviderUsageSnapshot {
   providers: ProviderUsage[];
 }
 
+// One local hour of router traffic, aggregated by the router over the whole
+// window rather than over the capped `usageEvents` sample. `usageEvents` still
+// carries the per-request detail the recent-activity list needs; these buckets
+// carry the totals a 24-hour chart cannot get from a bounded sample.
+export interface UsageEventHour {
+  startedAt: string;
+  tokens: number;
+  requests: number;
+  measuredTokens: boolean;
+  regularInputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  measuredBreakdown: boolean;
+}
+
 export interface UsageEvent {
   meteringVersion?: number;
   at: string;
@@ -390,6 +559,9 @@ export interface UsageEvent {
   cachedInputTokens?: number;
   outputTokens?: number;
   billedOutputTokens?: number;
+  /** Reasoning tokens (silent thinking) included in outputTokens. */
+  reasoningTokens?: number;
+  reasoningStreamed?: boolean;
   totalTokens?: number;
   estimatedInputTokens?: number;
   retries?: number;
@@ -399,6 +571,7 @@ export interface UsageEvent {
   progressOnlyRetried?: boolean;
   emptyCompletionUnrepairable?: boolean;
   emptyCompletionGuardReleased?: boolean;
+  emptyCompletionPreludeLimit?: "bytes" | "time";
 }
 
 export interface ActiveRequest {
@@ -430,6 +603,7 @@ export interface RouterHealth {
   gateway?: RouterServiceHealth;
   oauth?: RouterServiceHealth;
   api?: RouterServiceHealth;
+  grokOauth?: RouterServiceHealth;
   activity?: {
     state?: "idle" | "starting" | "generating" | "error" | "offline" | string;
     activeCount?: number;
@@ -457,18 +631,44 @@ export interface PresenceSnapshot {
 
 export interface OperationEvent {
   id?: string;
+  name?: string;
   action?: string;
   status?: "started" | "completed" | "failed" | string;
   message?: string;
+  error?: string;
 }
 
-export type HarnessId = "codex" | "deepcode";
+export type HarnessId =
+  | "codex"
+  | "dsh"
+  | "gemini"
+  | "cursor"
+  | "claude"
+  | "openclaw"
+  // Document-configured harnesses: published into rather than installed as.
+  // See `src/routed-harness-catalog.mjs`.
+  | "opencode"
+  | "pi"
+  | "omp"
+  | "commandcode"
+  | "hermes";
 export type HarnessSurface = "app" | "terminal";
 
 export interface HarnessDescriptor {
   id: HarnessId;
   displayName: string;
-  ownership: "openai" | "third-party";
+  ownership:
+    | "openai"
+    | "deepseek"
+    | "google"
+    | "cursor"
+    | "anthropic"
+    | "openclaw"
+    | "opencode"
+    | "pi"
+    | "omp"
+    | "commandcode"
+    | "nousresearch";
   description: string;
   cliInstalled: boolean;
   cliVersion?: string;
@@ -476,6 +676,21 @@ export interface HarnessDescriptor {
   configured: boolean;
   canInstall: boolean;
   installRequirement?: string;
+  /** Whether this client is installed and has an updater this router can run. */
+  canUpdate?: boolean;
+  /** The command an update would run, e.g. `opencode upgrade`. */
+  updateCommand?: string;
+  publicOrigin?: string;
+  agentConfigured?: boolean;
+  appConfigured?: boolean;
+  tunnel?: {
+    provider: "cloudflare";
+    binaryInstalled: boolean;
+    loggedIn: boolean;
+    configured: boolean;
+    hostname?: string;
+    nextAction: "install-cloudflared" | "login" | "choose-hostname" | "ready";
+  };
   docsUrl: string;
 }
 
@@ -483,6 +698,22 @@ export interface HarnessSnapshot {
   platform: string;
   terminalAvailable: boolean;
   harnesses: HarnessDescriptor[];
+}
+
+export type AgentBridgeId = "anthropic" | "cursor" | "gemini";
+
+export interface AgentBridgeDescriptor {
+  id: AgentBridgeId;
+  displayName: string;
+  protocol: "claude-code" | "acp" | string;
+  installed: boolean;
+  sessions: number;
+  authentication: "client-owned" | "unavailable" | string;
+}
+
+export interface AgentBridgeSnapshot {
+  version: 1;
+  bridges: AgentBridgeDescriptor[];
 }
 
 export interface HarnessSession {
@@ -515,7 +746,16 @@ export interface ContextSessionsSnapshot {
   counts: {
     total: number;
     codex: number;
-    deepcode: number;
+    dsh: number;
+    cursor: number;
+    claude: number;
+    gemini: number;
+    openclaw: number;
+    opencode: number;
+    pi: number;
+    omp: number;
+    commandcode: number;
+    hermes: number;
     archived: number;
   };
 }
@@ -526,6 +766,8 @@ export interface RouterControlApi {
   toggleMaximizeWindow(): Promise<unknown>;
   closeWindow(): Promise<unknown>;
   getSnapshot(): Promise<RouterSnapshot>;
+  getChatGptSession(): Promise<ChatGptSessionStatus>;
+  getChatGptAccountPool(): Promise<ChatGptAccountPool>;
   getHealth(): Promise<RouterHealth>;
   getProviders(): Promise<ProviderSetupSnapshot>;
   discoverProviderModels(provider: string, options?: { refresh?: boolean }): Promise<ProviderCatalog>;
@@ -538,6 +780,7 @@ export interface RouterControlApi {
   repairInstall(): Promise<DoctorSnapshot>;
   getPresence(): Promise<PresenceSnapshot>;
   getHarnesses(): Promise<HarnessSnapshot>;
+  getAgentBridges(): Promise<AgentBridgeSnapshot>;
   getContextSessions(): Promise<ContextSessionsSnapshot>;
   refreshAll(): Promise<unknown>;
   setProviderEnabled(provider: string, enabled: boolean): Promise<unknown>;
@@ -548,6 +791,17 @@ export interface RouterControlApi {
   setSubagentMode(mode: "all" | "selected" | "proven"): Promise<unknown>;
   setSubagentModel(slug: string, enabled: boolean): Promise<unknown>;
   setSubagentEffort(slug: string, effort: string): Promise<unknown>;
+  /** Runs the five live checks for each route in parallel; a complete pass promotes that route here. */
+  certifySubagentModels(slugs: string[]): Promise<{
+    results?: Array<{
+      slug: string;
+      certified?: boolean;
+      /** The run never reached a verdict: rate limit, outage, or a harness refusal. */
+      deferred?: boolean;
+      failedLabel?: string;
+      reason?: string;
+    }>;
+  }>;
   setSubagentSelection(selectAll: boolean): Promise<unknown>;
   setPickerModel(slug: string, visible: boolean): Promise<unknown>;
   setPickerModels(showAll: boolean): Promise<unknown>;
@@ -571,13 +825,30 @@ export interface RouterControlApi {
   setRouterDefault(model: string): Promise<unknown>;
   clearRouterDefault(): Promise<unknown>;
   setSignedRouting(enabled: boolean): Promise<unknown>;
+  setChatGptSessionSharing(enabled: boolean): Promise<ChatGptSessionStatus>;
+  addChatGptSubscriptionAccount(label?: string): Promise<unknown>;
+  loginChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  removeChatGptSubscriptionAccount(accountId: string): Promise<unknown>;
+  setChatGptAccountSelection(selection: string): Promise<unknown>;
   setPresence(mode: "always" | "follow-codex"): Promise<PresenceSnapshot>;
   controlService(action: "status" | "start"): Promise<unknown>;
   controlTray(action: "enable" | "disable" | "status" | "restart"): Promise<unknown>;
   launchHarness(harnessId: HarnessId, surface: HarnessSurface): Promise<unknown>;
-  installHarness(harnessId: "deepcode"): Promise<unknown>;
+  probeAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  loginAgentBridge(bridgeId: AgentBridgeId): Promise<unknown>;
+  setupHarness(harnessId: HarnessId, hostname?: string): Promise<unknown>;
+  /** Move one routed client, or every installed one ("all"), to its latest release. */
+  updateHarness(harnessId: HarnessId | "all"): Promise<unknown>;
+  prepareCursorTunnel(): Promise<unknown>;
+  connectCursor(hostname?: string): Promise<unknown>;
+  disconnectCursor(): Promise<unknown>;
+  disconnectHarness(harnessId: HarnessId): Promise<unknown>;
   openHarnessSession(harnessId: HarnessId, sessionId: string, surface: HarnessSurface, model?: string): Promise<unknown>;
   openExternal(url: string): Promise<void>;
+  onNavigation?(listener: (request: {
+    destination: "usage" | "usage-resets";
+    sourceId?: string;
+  }) => void): () => void;
   onOperation?(listener: (event: OperationEvent) => void): () => void;
 }
 

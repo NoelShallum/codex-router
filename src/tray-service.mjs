@@ -4,8 +4,9 @@ import path from "node:path";
 import { SOURCE_ROOT } from "./paths.mjs";
 
 // macOS supervises the tray through launchd and Windows through Task
-// Scheduler. Linux is still launched directly by bin/model-router-tray, so its
-// commands succeed as no-ops rather than failing an install.
+// Scheduler. Linux is launched directly by bin/model-router-tray: its normal
+// Electron tray/window works, but there is no portable graphical-session
+// supervisor contract to mutate here.
 const SUPERVISORS = {
   darwin: "tray-service-macos.mjs",
   win32: "tray-service-windows.mjs",
@@ -17,17 +18,19 @@ const command = process.argv[2] || "status";
 
 const supervisor = SUPERVISORS[platform];
 if (!supervisor) {
-  // Still exit 0 -- an install must not fail over a companion this platform
-  // does not supervise -- but say so. A bare {"supported":false} on stdout was
-  // read as success by anyone running `control tray enable` and waiting for a
-  // tray that was never going to appear.
+  const why =
+    `Tray supervision is unavailable on ${platform}; ` +
+    "launch or rebuild the Control Center with ./bin/model-router-tray.";
+  // Status remains a successful machine-readable capability probe. A
+  // mutation is different: exit non-zero so CLI and Electron callers cannot
+  // turn an unsupported enable/disable/restart into a false success toast.
   if (command !== "status") {
-    process.stderr.write(
-      `The tray is not supervised on ${platform}; launch it with ./bin/model-router-tray.\n`,
-    );
+    process.stderr.write(`${why}\n`);
   }
-  process.stdout.write(`${JSON.stringify({ installed: false, supported: false })}\n`);
-  process.exit(0);
+  process.stdout.write(
+    `${JSON.stringify({ installed: false, supported: false, state: "unsupported", why })}\n`,
+  );
+  process.exit(command === "status" ? 0 : 1);
 }
 
 const result = spawnSync(

@@ -112,6 +112,7 @@ test("snapshot reports zeroed savings stats before any usage is recorded", () =>
     evaluatedRequests: 0,
     largestResultBytes: 0,
     resultsAged: 0,
+    resultsShaped: 0,
     bytesSaved: 0,
     estimatedTokensSaved: 0,
     firstAt: undefined,

@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,8 +20,9 @@ import { fileURLToPath } from "node:url";
 // test file gets a block of ports of its own, and the blocks sit *below* every
 // platform's ephemeral range (Linux from 32768, macOS and Windows from 49152),
 // so no other process's bind(0) can be handed one of ours and no other test
-// file shares a block. What remains is a leftover from an earlier run of the
-// same file, which the bind check catches by moving up the block.
+// file using this helper shares a block. What remains is a leftover from an
+// earlier run of the same file, which the bind check catches by moving up the
+// block.
 //
 // Nothing here serializes: the blocks are disjoint by construction, so no test
 // file ever waits on another.
@@ -38,11 +39,17 @@ const MIN_BLOCK = 32;
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // The same listing in every process, so every file agrees on who owns what
-// without any shared state to coordinate. Adding a test file reshuffles the
-// blocks, which is harmless: one run sees one listing.
+// without any shared state to coordinate. Files that never import this helper
+// do not consume address space: counting all of them shrank routing.test.mjs's
+// block below its real listener count as unrelated unit-test files were added.
+// Adding a port-pool consumer reshuffles the blocks, which is harmless: one run
+// sees one listing.
 function blockFor(entry) {
   const files = readdirSync(TEST_DIR)
     .filter((file) => file.endsWith(".test.mjs"))
+    .filter((file) =>
+      readFileSync(path.join(TEST_DIR, file), "utf8").includes("./port-pool.mjs"),
+    )
     .sort();
   const index = files.indexOf(path.basename(entry));
   if (index === -1) return undefined;
@@ -51,8 +58,9 @@ function blockFor(entry) {
     Math.min(MAX_BLOCK, Math.floor((LAST_PORT - FIRST_PORT) / Math.max(files.length, 1))),
   );
   const start = FIRST_PORT + index * size;
-  // More test files than the range can seat. Falling back keeps the suite
-  // working; it just stops being race-proof, which is what it was before.
+  // More port-consuming test files than the range can seat. Falling back keeps
+  // the suite working; it just stops being race-proof, which is what it was
+  // before.
   if (start + size > LAST_PORT) return undefined;
   return { start, size };
 }

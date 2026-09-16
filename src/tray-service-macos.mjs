@@ -9,6 +9,10 @@ import {
   TRAY_LAUNCH_AGENT_PATH,
   TRAY_SERVICE_LABEL,
 } from "./paths.mjs";
+import {
+  readTraySupervisionPreference,
+  setTraySupervisionPreference,
+} from "./tray-supervision-preference.mjs";
 
 const launchctl = "/bin/launchctl";
 const domain = `gui/${process.getuid()}`;
@@ -29,7 +33,7 @@ function xml(value) {
 // exits cleanly — an unconditional KeepAlive would make Quit impossible.
 //
 // `--supervised` marks the launch as launchd's rather than the user's. Opening
-// Model Router by hand reveals the menu bar item and starts the router on
+// Codex Router by hand reveals the menu bar item and starts the router on
 // purpose; a login start must not, or follow mode would be overridden every
 // time the user logs in. AppDelegate.launchedByUser reads this argument.
 function plist() {
@@ -123,16 +127,22 @@ if (command === "render") {
 } else if (command === "status") {
   const description = loaded();
   const installed = existsSync(TRAY_LAUNCH_AGENT_PATH);
+  const preference = readTraySupervisionPreference();
   process.stdout.write(
     `${JSON.stringify({
       installed,
       loaded: Boolean(description) && installed,
       appPresent: existsSync(TRAY_APP_BINARY),
+      supervisionPreference: preference.state,
       state: description ? description.match(/state = ([^\n]+)/)?.[1]?.trim() || "loaded" : "stopped",
       path: TRAY_LAUNCH_AGENT_PATH,
     })}\n`,
   );
 } else if (command === "install") {
+  // Record explicit enablement before touching launchd. If bootstrap fails, the
+  // preference still captures what the operator asked for and a later repair
+  // may retry it; it can never silently fall back to a prior disable marker.
+  setTraySupervisionPreference(true);
   if (!existsSync(TRAY_APP_BINARY)) {
     throw new Error(
       `The tray app is not built at ${TRAY_APP_PATH}. Run ./bin/model-router-tray first.`,
@@ -141,8 +151,15 @@ if (command === "render") {
   bootout();
   writeAgent();
   bootstrap();
-  process.stdout.write(`${JSON.stringify({ installed: true, path: TRAY_LAUNCH_AGENT_PATH })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    installed: true,
+    path: TRAY_LAUNCH_AGENT_PATH,
+    supervisionPreference: "enabled",
+  })}\n`);
 } else if (command === "uninstall") {
+  // Persist the disable intent before stopping the process. Even an interrupted
+  // uninstall must prevent a later install/update from resurrecting the tray.
+  setTraySupervisionPreference(false);
   bootout();
   try {
     run(["disable", service], { quiet: true });
@@ -150,7 +167,10 @@ if (command === "render") {
     // Best effort.
   }
   if (existsSync(TRAY_LAUNCH_AGENT_PATH)) unlinkSync(TRAY_LAUNCH_AGENT_PATH);
-  process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    installed: false,
+    supervisionPreference: "disabled",
+  })}\n`);
 } else if (command === "stop") {
   bootout();
   process.stdout.write(`${JSON.stringify({ state: "stopped" })}\n`);

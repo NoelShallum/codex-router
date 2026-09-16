@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 const USER_URL =
   process.env.GITHUB_COPILOT_USER_URL ||
@@ -39,10 +39,6 @@ export function assertGitHubCopilotCredential(value) {
   const problem = githubCopilotCredentialProblem(token);
   if (problem) throw new Error(problem);
   return token;
-}
-
-function tokenFingerprint(token) {
-  return createHash("sha256").update(token).digest("hex");
 }
 
 function githubCopilotHost(hostname) {
@@ -112,6 +108,11 @@ async function resolveSession(githubToken, fetchImpl, now) {
     await response.body?.cancel().catch(() => undefined);
     const error = new Error(`GitHub Copilot authentication returned HTTP ${response.status}.`);
     error.status = response.status === 401 || response.status === 403 ? 503 : 502;
+    // `status` is the local answer exposed to a caller. Pool failover needs the
+    // provider's credential-specific answer instead: a rejected source token
+    // should cool only that pool entry and try the next one, while the
+    // unpooled surface continues to report a setup-oriented 503.
+    error.providerStatus = response.status;
     throw error;
   }
   const payload = await response.json().catch(() => undefined);
@@ -124,7 +125,6 @@ async function resolveSession(githubToken, fetchImpl, now) {
     token: githubToken,
     baseUrl: copilotApiBaseUrl(payload),
     checkedAt: now,
-    sourceFingerprint: tokenFingerprint(githubToken),
   };
 }
 
@@ -138,24 +138,27 @@ export async function ensureFreshGitHubCopilotSession(
   } catch (cause) {
     const error = new Error(cause.message);
     error.status = 503;
+    error.providerStatus = 401;
     throw error;
   }
-  const sourceFingerprint = tokenFingerprint(token);
   if (
     !force &&
-    cached?.sourceFingerprint === sourceFingerprint &&
+    cached?.token === token &&
     now - cached.checkedAt < SESSION_TTL_MS
   ) {
     return cached;
   }
-  if (pending?.sourceFingerprint === sourceFingerprint) return pending.promise;
+  if (pending?.token === token) return pending.promise;
   const promise = resolveSession(token, fetchImpl, now).then((session) => {
     cached = session;
     return session;
   }).finally(() => {
     if (pending?.promise === promise) pending = undefined;
   });
-  pending = { sourceFingerprint, promise };
+  // The resolved session already has to retain this token for inference. Keep
+  // the in-flight comparison equally short-lived instead of deriving and
+  // retaining a fast verifier for a credential.
+  pending = { token, promise };
   return promise;
 }
 

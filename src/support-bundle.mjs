@@ -1,10 +1,16 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  statSync,
+  readSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -12,14 +18,30 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { redactCallerUrl } from "./caller-auth.mjs";
+import {
+  antigravityTokenPath,
+  validateAntigravityToken,
+} from "./antigravity-oauth-session.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
 import { redactProxyCredentials } from "./proxy-environment.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
+import {
+  boundedOperationChild,
+  operationDeadlineFromEnvironment,
+  runOperationProcessTree,
+} from "./process-tree.mjs";
 import { detectLegacyInstallations } from "./legacy-migration.mjs";
-import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import {
+  PROVIDERS,
+  RUNTIME_PROVIDERS,
+  providerNeedsNoKey,
+} from "./model-registry.mjs";
+import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import {
   CALLER_SECRET_PATH,
   CONFIG_PATH,
+  CURSOR_PUBLIC_SECRET_PATH,
   INTERNAL_SECRET_PATH,
   LOG_PATH,
   SOURCE_ROOT,
@@ -28,8 +50,40 @@ import {
 import {
   credentialPaths,
   credentialStatus,
+  genericProviderCredentialPath,
 } from "./provider-credentials.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
+import {
+  readProviderCredentialStore,
+  redactCredentialText,
+} from "./provider-credential-store.mjs";
+import { providerApiKeyPoolsSupportSnapshot } from "./provider-api-key-pool.mjs";
+import { resolveStoredCredential } from "./provider-api-key-routing.mjs";
+
+const ANTIGRAVITY_RECORD_KEYS = new Set([
+  "version",
+  "managed_by",
+  "session_generation",
+  "project_revision",
+  "client_id",
+  "client_secret",
+  "access_token",
+  "refresh_token",
+  "expires_at",
+  "expires_in",
+  "project_id",
+  "project_source",
+  "project_checked_at",
+  "tier_id",
+  "email",
+  "token_type",
+  "probe_version",
+  "probe_verified_at",
+  "probe_model",
+  "probe_activation",
+]);
+const MAX_PRIVATE_SOURCE_BYTES = 64 * 1024;
+const MAX_SUPPORT_BUNDLE_OPERATION_MS = 2 * 60_000;
 
 function runJson(script, args = []) {
   const result = spawnSync(
@@ -56,9 +110,62 @@ function commandVersion(command, args) {
   }
 }
 
+// The commit that describes the installed tree, or null when no commit does.
+//
+// `git -C <dir> rev-parse HEAD` answers for the nearest *enclosing* repository,
+// which is not always the router's. A Homebrew keg lives at
+// `<brew prefix>/Cellar/codex-router/<version>/libexec`, and the Homebrew
+// prefix is itself a Git checkout of `homebrew/brew`, so the plain rev-parse
+// reported brew.git's HEAD as the router's commit -- a SHA that does not exist
+// in this repository at all. Issue #761 was triaged against exactly that
+// phantom commit. A tarball install has no commit; saying so is the honest
+// answer and keeps triage on `packageVersion`.
+//
+// Requiring the toplevel to *be* SOURCE_ROOT is what distinguishes "this tree
+// is a checkout" from "this tree sits inside someone else's checkout". It also
+// declines to answer for a router vendored into a subdirectory of a larger
+// repository, where the enclosing HEAD likewise does not identify this tree.
+export function gitCommitForSourceRoot(root) {
+  const toplevel = commandVersion("git", ["-C", root, "rev-parse", "--show-toplevel"]);
+  if (!toplevel) return null;
+  // Compared through realpath because Git reports the resolved path while
+  // SOURCE_ROOT can arrive symlinked -- macOS `/var` and `/tmp` both are, and
+  // so is an install root someone symlinked into place. Without this the check
+  // would reject a genuine checkout for spelling its own path differently.
+  if (!samePath(toplevel, root)) return null;
+  return commandVersion("git", ["-C", root, "rev-parse", "HEAD"]);
+}
+
+// Windows spells the same directory three ways, and Git and Node each pick a
+// different one: Git reports a forward-slash long path, `os.tmpdir()` hands
+// back an 8.3 short name (`C:\Users\RUNNER~1\...`), and the drive letter's case
+// is not fixed. `realpathSync.native` asks the OS to canonicalize, which is the
+// only one of these that undoes a short name; the plain JS implementation does
+// not, and comparing its output rejected a genuine checkout on Windows.
+function samePath(left, right) {
+  const a = realPath(left);
+  const b = realPath(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function realPath(target) {
+  const resolved = path.resolve(target);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    // `.native` throws on a path that does not exist; the JS implementation is
+    // the fallback, and its own failure leaves the resolved spelling.
+    try {
+      return realpathSync(resolved);
+    } catch {
+      return resolved;
+    }
+  }
+}
+
 function fileMetadata(target) {
   if (!existsSync(target)) return { path: target, exists: false };
-  const metadata = statSync(target);
+  const metadata = lstatSync(target);
   return {
     path: target,
     exists: true,
@@ -68,40 +175,111 @@ function fileMetadata(target) {
   };
 }
 
-function redactLogs(contents) {
-  return redactCallerUrl(contents)
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
-    .replace(/("(?:api[_-]?key|access[_-]?token|refresh[_-]?token)"\s*:\s*")[^"]+/gi, "$1[REDACTED]")
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[=:]\s*["']?)[^\s"',}]+/gi, "$1[REDACTED]")
-    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_KEY]");
+function privateText(target) {
+  let descriptor;
+  try {
+    const metadata = lstatSync(target);
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isFile() ||
+      metadata.size > MAX_PRIVATE_SOURCE_BYTES
+    ) return { status: "unsafe" };
+    descriptor = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const opened = fstatSync(descriptor);
+    if (
+      !opened.isFile() ||
+      opened.size > MAX_PRIVATE_SOURCE_BYTES ||
+      opened.dev !== metadata.dev ||
+      opened.ino !== metadata.ino
+    ) return { status: "unsafe" };
+    const buffer = Buffer.alloc(MAX_PRIVATE_SOURCE_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = readSync(descriptor, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > MAX_PRIVATE_SOURCE_BYTES) return { status: "unsafe" };
+    return {
+      status: "readable",
+      contents: buffer.subarray(0, length).toString("utf8"),
+    };
+  } catch (error) {
+    return error?.code === "ENOENT" ? { status: "absent" } : { status: "unsafe" };
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
 }
 
-function logTail() {
-  if (!existsSync(LOG_PATH)) return null;
-  const lines = readFileSync(LOG_PATH, "utf8").split(/\r?\n/);
-  return redactLogs(lines.slice(-200).join("\n"));
+function discoveredValues(values) {
+  return [...values].filter((value) => value.length > 0);
+}
+
+function unsafeSecretDiscovery(values) {
+  return { status: "unsafe", values: discoveredValues(values) };
 }
 
 function knownLocalSecrets() {
+  // In no-discovery mode, reading a credential merely so a later redactor can
+  // recognize its value would still violate the operator's promise. The
+  // bundle therefore omits logs below (the only arbitrary text it can copy)
+  // and relies on structural redaction for the remaining generated fields.
+  if (discoveryDisabled()) return { status: "disabled", values: [] };
   const values = new Set();
-  const files = [CALLER_SECRET_PATH, INTERNAL_SECRET_PATH];
+  const files = [CALLER_SECRET_PATH, INTERNAL_SECRET_PATH, CURSOR_PUBLIC_SECRET_PATH];
   for (const provider of PROVIDERS.values()) {
     if (provider.kind !== "openai-compatible") continue;
     // A keyless provider holds no secret, so there is nothing to collect and
     // nothing to redact for it.
     if (providerNeedsNoKey(provider)) continue;
     files.push(...credentialPaths(provider));
-    for (const name of provider.credential.environment) {
+    for (const name of provider.credential?.environment || []) {
       const value = process.env[name]?.trim();
       if (value) values.add(value);
     }
   }
-  for (const target of files) {
-    if (!existsSync(target)) continue;
-    const value = readFileSync(target, "utf8").trim();
+  for (const entry of readProviderCredentialStore().credentials) {
+    if (entry.providerType !== "generic") continue;
+    try {
+      files.push(genericProviderCredentialPath(entry.providerId));
+    } catch {
+      // Invalid generic metadata is already ignored by the fail-closed store reader.
+    }
+  }
+  for (const target of new Set(files)) {
+    const source = privateText(target);
+    if (source.status === "unsafe") return unsafeSecretDiscovery(values);
+    const value = source.status === "readable" ? source.contents.trim() : "";
     if (value) values.add(value);
   }
-  return [...values].filter((value) => value.length >= 8);
+  const oauthSource = privateText(antigravityTokenPath());
+  if (oauthSource.status === "unsafe") return unsafeSecretDiscovery(values);
+  if (oauthSource.status === "readable") {
+    try {
+      const token = JSON.parse(oauthSource.contents);
+      validateAntigravityToken(token);
+      if (Object.keys(token).some((key) => !ANTIGRAVITY_RECORD_KEYS.has(key))) {
+        throw new Error("unsupported Antigravity OAuth credential field");
+      }
+      // This router's operator-owned OAuth pair is kept in the same private
+      // record as the tokens. Treat the client id as private too: although
+      // OAuth client ids are public identifiers, the setup contract promises
+      // neither half of the pair will escape through logs or support output.
+      for (const field of ["client_id", "client_secret", "access_token", "refresh_token"]) {
+        const value = token[field];
+        if (typeof value === "string" && value.trim()) values.add(value.trim());
+      }
+    } catch {
+      // An invalid credential may contain a value that an old log copied
+      // verbatim. Without a trustworthy parse there is no complete redaction
+      // set, so the caller must omit the arbitrary log text altogether.
+      return unsafeSecretDiscovery(values);
+    }
+  }
+  return {
+    status: "safe",
+    values: discoveredValues(values),
+  };
 }
 
 // The manifest records the proxy the service was installed with so a later
@@ -122,12 +300,31 @@ function sharableInstallManifest() {
   };
 }
 
-function redactBundle(contents) {
-  let redacted = redactCallerUrl(contents);
-  for (const secret of knownLocalSecrets()) {
-    redacted = redacted.replaceAll(secret, "[REDACTED]");
+function redactBundle(contents, knownSecrets) {
+  return redactCredentialText(redactCallerUrl(contents), knownSecrets);
+}
+
+export function redactSupportBundleObjectForTests(value, knownSecrets = []) {
+  if (typeof value === "string") return redactCredentialText(value, knownSecrets);
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSupportBundleObjectForTests(item, knownSecrets));
   }
-  return redacted;
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  for (const [key, child] of Object.entries(value)) {
+    const compactKey = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+    const secretField =
+      compactKey === "authorization" ||
+      compactKey === "password" ||
+      compactKey.endsWith("token") ||
+      compactKey.endsWith("secret") ||
+      compactKey.endsWith("apikey") ||
+      compactKey.endsWith("key");
+    output[key] = secretField
+      ? "[REDACTED]"
+      : redactSupportBundleObjectForTests(child, knownSecrets);
+  }
+  return output;
 }
 
 function outputOption() {
@@ -139,12 +336,28 @@ function outputOption() {
 }
 
 export function createSupportBundle(options = {}) {
+  // An arbitrary historical log may contain a credential that was rotated or
+  // deleted before this bundle discovers current values. There is no safe
+  // epoch proof for the existing log file, so support bundles never copy it.
+  const secretDiscovery = knownLocalSecrets();
+  const includeLogs = false;
   const credentialSources = {};
   for (const provider of PROVIDERS.values()) {
     if (provider.kind !== "openai-compatible") continue;
     const status = credentialStatus(provider);
     credentialSources[provider.id] = status.configured
       ? { configured: true, source: status.source, persistent: status.persistent }
+      : { configured: false };
+  }
+  for (const provider of RUNTIME_PROVIDERS.values()) {
+    if (provider.generic !== true) continue;
+    const configured = genericProviderConfigured(provider.id);
+    credentialSources[provider.id] = configured
+      ? {
+          configured: true,
+          source: provider.credentialRef ? "bound credential reference" : "not required",
+          persistent: Boolean(provider.credentialRef),
+        }
       : { configured: false };
   }
   let selection;
@@ -157,16 +370,14 @@ export function createSupportBundle(options = {}) {
   const bundle = {
     schemaVersion: 1,
     createdAt: new Date().toISOString(),
-    privacy: options.includeLogs
-      ? "Includes a redacted log tail that may still contain prompts or provider responses."
-      : "Credential values, prompts, response bodies, and log contents are excluded.",
+    privacy: "Log contents are always omitted because historical logs cannot be proven free of rotated or deleted credentials; credential values, prompts, and response bodies are also excluded.",
     runtime: {
       platform: process.platform,
       release: os.release(),
       architecture: process.arch,
       node: process.version,
       packageVersion: packageJson.version,
-      gitCommit: commandVersion("git", ["-C", SOURCE_ROOT, "rev-parse", "HEAD"]),
+      gitCommit: gitCommitForSourceRoot(SOURCE_ROOT),
       python: commandVersion(
         path.join(
           SOURCE_ROOT,
@@ -182,13 +393,18 @@ export function createSupportBundle(options = {}) {
     service: runJson("service.mjs", ["status"]),
     selection,
     credentialSources,
+    apiKeyPools: providerApiKeyPoolsSupportSnapshot({
+      resolveCredential: (providerId, credentialId) => {
+        const provider = PROVIDERS.get(providerId);
+        return provider ? resolveStoredCredential(provider, credentialId) : undefined;
+      },
+    }),
     ownership: detectLegacyInstallations(),
     install: sharableInstallManifest(),
     files: {
       config: fileMetadata(CONFIG_PATH),
       log: fileMetadata(LOG_PATH),
     },
-    ...(options.includeLogs ? { redactedLogTail: logTail() } : {}),
   };
 
   mkdirSync(SUPPORT_DIR, { recursive: true, mode: 0o700 });
@@ -198,17 +414,49 @@ export function createSupportBundle(options = {}) {
     options.output || path.join(SUPPORT_DIR, `codex-router-support-${timestamp}.json`),
   );
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const serialized = redactBundle(`${JSON.stringify(bundle, null, 2)}\n`);
+  const serialized = redactBundle(
+    `${JSON.stringify(redactSupportBundleObjectForTests(bundle, secretDiscovery.values), null, 2)}\n`,
+    secretDiscovery.values,
+  );
   writeFileSync(target, serialized, {
     encoding: "utf8",
     mode: 0o600,
   });
   protectPrivateFile(target);
-  return { path: target, includedLogs: Boolean(options.includeLogs) };
+  return { path: target, includedLogs: includeLogs };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (!boundedOperationChild(process.env, {
+    maximumMs: MAX_SUPPORT_BUNDLE_OPERATION_MS,
+  })) {
+    const deadline = operationDeadlineFromEnvironment(process.env, {
+      timeoutMs: MAX_SUPPORT_BUNDLE_OPERATION_MS,
+      maximumMs: MAX_SUPPORT_BUNDLE_OPERATION_MS,
+    });
+    try {
+      const result = await runOperationProcessTree(
+        process.execPath,
+        [fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+        {
+          cwd: SOURCE_ROOT,
+          env: process.env,
+          childEnvironment: {
+            CODEX_ROUTER_OPERATION_CHILD: "1",
+          },
+          deadline,
+          stdio: "inherit",
+        },
+      );
+      process.exitCode = result.status ?? 1;
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  } else {
   try {
+    // Keep the historical switch parse-compatible for scripts and older UI
+    // builds, but never let it change the log-free privacy boundary.
     const known = new Set(["--help", "--include-logs", "--output"]);
     for (let index = 2; index < process.argv.length; index += 1) {
       const argument = process.argv[index];
@@ -216,14 +464,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       if (argument === "--output") index += 1;
     }
     if (process.argv.includes("--help")) {
-      process.stdout.write(`Usage: support-bundle [--include-logs] [--output PATH]
+      process.stdout.write(`Usage: support-bundle [--output PATH]
 
 Creates a mode-600 JSON diagnostic bundle without credential values.
-Logs are excluded by default because they may contain prompts or responses.
+Log contents are always excluded because historical logs may contain private
+prompts, responses, or credentials that have since been rotated or deleted.
 `);
     } else {
       const result = createSupportBundle({
-        includeLogs: process.argv.includes("--include-logs"),
         output: outputOption(),
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -231,5 +479,6 @@ Logs are excluded by default because they may contain prompts or responses.
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
+  }
   }
 }

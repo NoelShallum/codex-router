@@ -17,17 +17,24 @@ no_discovery=false
 previous_revision=
 force=false
 target=codex
+cursor_public_url=
+cursor_hostname=
 
 usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install external model routes for Codex or DeepSeek Harness.
+Install external model routes for Codex, DeepSeek Harness, Gemini CLI, Cursor, Claude Code, or OpenClaw.
 
 Options:
   --install-dir PATH  Stable checkout used by the background service
   --target APP        Install for "codex" (default), "dsh" (DeepSeek Harness),
-                      or "gemini" (Gemini CLI)
+                      "gemini" (Gemini CLI), "cursor", "claude", or "openclaw"
+  --cursor-public-url URL
+                      Stable HTTPS tunnel origin for Cursor App; forward it
+                      to the local Cursor edge port printed during setup
+  --cursor-hostname HOST
+                      Public hostname for a router-managed Cloudflare named tunnel
   --prepare-only      Install dependencies without changing either app
   --api-key           Alias for --kimi-api-key
   --kimi-api-key      Prompt securely for a Kimi Platform API key
@@ -56,6 +63,37 @@ EOF
 die() {
   printf 'codex-router: %s\n' "$*" >&2
   exit 1
+}
+
+# The single restore path for a step that runs after the pull. Every such step
+# can leave the checkout on code the machine cannot run -- `npm ci` empties
+# node_modules before it refills it -- so failing one has to return the managed
+# checkout to the revision the service was last known to work on, exactly as a
+# failed setup does. Steps that run before the pull have nothing to restore and
+# keep using die() directly.
+restore_previous_revision() {
+  if [ -n "$previous_revision" ]; then
+    git -C "$repo_dir" switch --detach "$previous_revision" >/dev/null 2>&1 || true
+    die "$1; the managed source checkout was restored to $previous_revision. Re-run this installer to retry the update from main."
+  fi
+  die "$1"
+}
+
+# A failed setup rolls HEAD back with `switch --detach`, so the next run
+# finds no current branch. `src/update.mjs` and install.ps1 already switch
+# that state back to main before pulling; refusing here is how a Homebrew
+# user who then ran this script stayed on refs/codex-router/rollback (#761).
+ensure_main_branch() {
+  current_branch=$(git -C "$1" branch --show-current || true)
+  if [ "$current_branch" != "main" ]; then
+    if [ -z "$current_branch" ]; then
+      git -C "$1" switch main >/dev/null 2>&1 ||
+        die "$1 is in a detached HEAD state and could not be restored to main; run 'git switch main' there and retry."
+      current_branch=$(git -C "$1" branch --show-current || true)
+    fi
+    [ "$current_branch" = "main" ] ||
+      die "$1 must be on its main branch before updating"
+  fi
 }
 
 # Mirrors DIRTY_PREVIEW_LIMIT in src/update.mjs and $DirtyPreviewLimit in
@@ -100,13 +138,23 @@ local_modifications_message() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target)
-      [ "$#" -ge 2 ] || die "--target requires codex, dsh, or gemini"
+      [ "$#" -ge 2 ] || die "--target requires codex, dsh, gemini, cursor, claude, or openclaw"
       target=$2
       shift 2
       ;;
     --install-dir)
       [ "$#" -ge 2 ] || die "--install-dir requires a path"
       install_dir=$2
+      shift 2
+      ;;
+    --cursor-public-url)
+      [ "$#" -ge 2 ] || die "--cursor-public-url requires an HTTPS origin"
+      cursor_public_url=$2
+      shift 2
+      ;;
+    --cursor-hostname)
+      [ "$#" -ge 2 ] || die "--cursor-hostname requires a public hostname"
+      cursor_hostname=$2
       shift 2
       ;;
     --prepare-only)
@@ -186,9 +234,20 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$target" in
-  codex|dsh|gemini) ;;
-  *) die "--target must be codex, dsh, or gemini" ;;
+  codex|dsh|gemini|cursor|claude|openclaw) ;;
+  *) die "--target must be codex, dsh, gemini, cursor, claude, or openclaw" ;;
 esac
+if [ -n "$cursor_public_url" ]; then
+  [ "$target" = cursor ] || die "--cursor-public-url applies to --target cursor only"
+  MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL=$cursor_public_url
+  export MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL
+fi
+if [ -n "$cursor_hostname" ]; then
+  [ "$target" = cursor ] || die "--cursor-hostname applies to --target cursor only"
+  [ -z "$cursor_public_url" ] || die "use either --cursor-hostname or --cursor-public-url, not both"
+  MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME=$cursor_hostname
+  export MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME
+fi
 # Legacy migration replaces an older router's managed Codex config block, and
 # the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
 # counterpart in the harness, whose integration is one settings section.
@@ -247,9 +306,7 @@ if [ -z "$repo_dir" ]; then
       git -C "$install_dir" reset --hard HEAD ||
         die "unable to discard the local changes in $install_dir"
     fi
-    current_branch=$(git -C "$install_dir" branch --show-current)
-    [ "$current_branch" = "main" ] ||
-      die "$install_dir must be on its main branch before updating"
+    ensure_main_branch "$install_dir"
     printf 'Updating %s...\n' "$install_dir"
     previous_revision=$(git -C "$install_dir" rev-parse HEAD)
     git -C "$install_dir" update-ref refs/codex-router/rollback "$previous_revision"
@@ -274,6 +331,14 @@ command -v node >/dev/null 2>&1 ||
 command -v npm >/dev/null 2>&1 ||
   die "npm is required and is normally included with Node.js"
 
+# The key prompt imports modules from node_modules, which a fresh clone does
+# not have yet: bin/install installs them, and it runs later. Doing it here is
+# what makes the prompt work at all, and the failure has to reach the restore
+# path rather than abort under `set -e`.
+if [ -n "$configure_provider_keys" ]; then
+  node "$repo_dir/src/node-dependency-install.mjs" ||
+    restore_previous_revision "installing Node dependencies failed"
+fi
 for provider_id in $configure_provider_keys; do
   "$repo_dir/bin/provider-key" "$provider_id" set
 done
@@ -309,16 +374,27 @@ if [ "$setup_status" -eq 2 ]; then
   printf 'setup did not finish configuring; the update was kept. Re-run setup to continue, or ./bin/rollback to return to the previous revision.\n' >&2
   exit 2
 elif [ "$setup_status" -ne 0 ]; then
-  if [ -n "$previous_revision" ]; then
-    git -C "$repo_dir" switch --detach "$previous_revision" >/dev/null 2>&1 || true
-    die "setup failed; the managed source checkout was restored to $previous_revision"
-  fi
-  die "setup failed"
+  restore_previous_revision "setup failed"
 fi
 
-cat <<'EOF'
-
-Codex Router is installed. Fully quit Codex, reopen it, and start a new task.
-The model picker will show only the providers you enabled while preserving
-native GPT models.
-EOF
+case "$target" in
+  dsh)
+    printf '\nCodex Router is installed for DeepSeek Harness. Its route is live on the next request; no restart is needed.\n'
+    ;;
+  gemini)
+    printf '\nCodex Router is installed for Gemini CLI. The next gemini invocation reads the new route.\n'
+    ;;
+  cursor)
+    printf '\nCodex Router is installed for Cursor. Run cursor-router-agent for the CLI; fully quit and reopen Cursor App for its router/... models.\n'
+    ;;
+  claude)
+    printf '\nCodex Router is installed for Claude Code. Run claude-router and choose a codex_router/anthropic/... model.\n'
+    ;;
+  openclaw)
+    printf '\nCodex Router installed OpenClaw and published every routed model under its codex-router provider. Run openclaw to start.\n'
+    ;;
+  *)
+    printf '\nCodex Router is installed. Fully quit Codex, reopen it, and start a new task.\n'
+    printf 'The model picker will show only the providers you enabled while preserving native GPT models.\n'
+    ;;
+esac

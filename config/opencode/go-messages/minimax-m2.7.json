@@ -12,7 +12,7 @@
       "priority": 41,
       "upgradeTo": {
         "model": "opencode-go-messages/minimax-m3",
-        "markdown": "MiniMax M3 is available on your opencode Go subscription\n\n{model_to} succeeds {model_from} and grows the context window from 128K to 1M tokens. Accept to switch your default model; MiniMax M2.7 stays available in the picker."
+        "markdown": "MiniMax M3 is available on your opencode Go subscription\n\n{model_to} succeeds {model_from} and grows the context window from 200K to 1M tokens. Accept to switch your default model; MiniMax M2.7 stays available in the picker."
       },
       "defaultEffort": "high",
       "reasoningLevels": [
@@ -21,12 +21,12 @@
           "description": "Deep reasoning"
         }
       ],
-      "contextWindow": 131072,
-      "autoCompact": 110000,
+      "contextWindow": 204800,
+      "autoCompact": 174000,
       "inputModalities": [
         "text"
       ],
-      "compHash": "opencode-go-messages-minimax-m2-7-v1"
+      "compHash": "opencode-go-messages-minimax-m2-7-v2"
     }
   ]
 }

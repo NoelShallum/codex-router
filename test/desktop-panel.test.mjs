@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import test from "node:test";
+import { chromium } from "playwright";
 
 import { COMMANDS } from "../src/desktop-commands.mjs";
 import { writeJson } from "../src/http-utils.mjs";
@@ -11,16 +12,21 @@ import {
   panelCommandAllowed,
   panelLocalCommand,
 } from "../src/desktop-panel.mjs";
-import { commandRefused, readOnlyCapabilities } from "../apps/desktop/ui/model.mjs";
+import { commandRefused, readOnlyCapabilities } from "../apps/panel/model.mjs";
+
+test("panel OAuth commands allow the browser flow its full timeout", () => {
+  const command = COMMANDS.connect_oauth({ provider: "antigravity-oauth" });
+  assert.ok(command.timeoutMs >= 10 * 60_000);
+});
 
 // The panel is served by the router, so these drive the real handler over a
 // real socket rather than calling it in-process: the routing, the headers and
 // the JSON contract are the parts a browser actually depends on.
-function serve() {
+function serve(panelOptions = {}) {
   const server = http.createServer(async (request, response) => {
     const route = new URL(request.url, "http://127.0.0.1").pathname;
     if (isPanelRoute(route)) {
-      if (await handlePanelRequest(request, response, route, { writeJson })) return;
+      if (await handlePanelRequest(request, response, route, { writeJson, ...panelOptions })) return;
     }
     writeJson(response, 404, { error: { type: "not_found", message: "no route" } });
   });
@@ -30,7 +36,10 @@ function serve() {
       resolve({
         server,
         url: (path) => `http://127.0.0.1:${port}${path}`,
-        close: () => new Promise((done) => server.close(done)),
+        close: () => new Promise((done) => {
+          server.close(done);
+          server.closeAllConnections?.();
+        }),
       });
     });
   });
@@ -52,7 +61,7 @@ test("the panel serves the shared UI with the bridge injected", async () => {
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type"), /text\/html/);
     const body = await response.text();
-    // The same UI the shells load, plus the one function app.js calls.
+    // The retained panel UI plus the one bridge function app.js calls.
     assert.match(body, /window\.__TAURI__/);
     assert.match(body, /fetch\("\.\/invoke"/);
     assert.match(body, /data-tab="connections"/);
@@ -71,11 +80,43 @@ test("the panel serves each asset the UI loads", async () => {
       ["/panel/styles.css", /text\/css/],
       ["/panel/app.js", /javascript/],
       ["/panel/model.mjs", /javascript/],
+      ["/panel/i18n.mjs", /javascript/],
       ["/panel/thinking-orb.mjs", /javascript/],
     ]) {
       const response = await fetch(url(asset));
       assert.equal(response.status, 200, `${asset} did not serve`);
       assert.match(response.headers.get("content-type"), pattern, asset);
+    }
+  } finally {
+    await close();
+  }
+});
+
+// #350: i18n.mjs shipped in apps/panel and was imported by both app.js and
+// model.mjs, but was never added to the panel's allowlist, so the module graph
+// failed to load and the panel rendered blank. The list above is hand-written
+// and drifted; this derives the expectation from what the UI actually imports,
+// so the next module added to the graph cannot repeat it.
+test("every module the panel UI imports is on the allowlist", async () => {
+  const entryPoints = ["app.js", "model.mjs", "thinking-orb.mjs", "i18n.mjs"];
+  const required = new Set();
+  for (const entry of entryPoints) {
+    const source = readFileSync(new URL(`../apps/panel/${entry}`, import.meta.url), "utf8");
+    for (const [, specifier] of source.matchAll(/from\s+"\.\/([\w.-]+\.m?js)"/g)) {
+      required.add(specifier);
+    }
+  }
+  assert.ok(required.has("i18n.mjs"), "expected the UI to import i18n.mjs");
+
+  const { url, close } = await serve();
+  try {
+    for (const file of required) {
+      const response = await fetch(url(`/panel/${file}`));
+      assert.equal(
+        response.status,
+        200,
+        `${file} is imported by the panel UI but is not served; add it to ASSETS in src/desktop-panel.mjs`,
+      );
     }
   } finally {
     await close();
@@ -107,7 +148,7 @@ test("the panel refuses the commands that change credentials or state", async ()
     }
     assert.equal(panelCommandAllowed("save_api_key"), false);
     assert.equal(panelCommandAllowed("control_snapshot"), true);
-    // The full table is still reachable for a shell that asks for it.
+    // The full table is still reachable under an explicit unrestricted policy.
     assert.equal(panelCommandAllowed("save_api_key", { readOnly: false }), true);
   } finally {
     await close();
@@ -129,8 +170,8 @@ test("the panel tells the UI it is read-only over the same command bridge", asyn
     const { value } = await response.json();
     assert.equal(value.capabilities.readOnly, true);
     assert.equal(readOnlyCapabilities(value)?.readOnly, true);
-    // What a shell that carries the full table sends: no capabilities block,
-    // so nothing is refused and the tray and Electron window are unaffected.
+    // A future unrestricted host can omit the capabilities block, in which
+    // case the shared client refuses nothing.
     assert.equal(readOnlyCapabilities({ os: "darwin", islandSupported: true }), null);
   } finally {
     await close();
@@ -167,7 +208,7 @@ test("the advertised allowed commands are exactly the ones the panel permits", (
 // would still pass if a control named a command nobody gates.
 test("the panel's own answer marks the settings in the shipped markup dead", () => {
   const { capabilities } = panelLocalCommand("platform_info")();
-  const markup = readFileSync(new URL("../apps/desktop/ui/index.html", import.meta.url), "utf8");
+  const markup = readFileSync(new URL("../apps/panel/index.html", import.meta.url), "utf8");
   const declared = new Set([...markup.matchAll(/data-command="([a-z_]+)"/g)].map(([, name]) => name));
   assert.ok(declared.size >= 15, `only ${declared.size} controls declare a command`);
   for (const command of declared) {
@@ -182,18 +223,28 @@ test("the panel's own answer marks the settings in the shipped markup dead", () 
   assert.equal(commandRefused(capabilities, "set_island_enabled"), false);
 });
 
-// Reaching the tray or the Electron window means already running code on this
-// machine, so neither is narrowed by any of the above.
-test("a shell that is not the browser panel still carries the full table", () => {
+// The packaged Control Center has its own typed IPC boundary. The browser
+// allowlist must not leak into that native application and disable mutations.
+test("the packaged Control Center is not narrowed by the browser allowlist", () => {
   for (const command of Object.keys(COMMANDS)) {
     assert.equal(panelCommandAllowed(command, { readOnly: false }), true, command);
   }
   assert.equal(panelCommandAllowed("rm_minus_rf", { readOnly: false }), false);
-  // The Electron shell runs the table directly rather than through the panel's
-  // gate, which is what keeps the read-only posture local to the browser.
-  const electron = readFileSync(new URL("../apps/electron/main.js", import.meta.url), "utf8");
-  assert.doesNotMatch(electron, /panelCommandAllowed/);
-  assert.match(electron, /runDesktopCommand\(command, args \?\? \{\}, \{ root \}\)/);
+  const controlCenter = readFileSync(
+    new URL("../apps/control-center/electron/ipc.mjs", import.meta.url),
+    "utf8",
+  );
+  const preload = readFileSync(
+    new URL("../apps/control-center/electron/preload.cjs", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(controlCenter, /panelCommandAllowed/);
+  const exposed = new Set([...preload.matchAll(/\bcall\("([^"]+)"/g)].map(([, name]) => name));
+  const handled = new Set(
+    [...controlCenter.matchAll(/\bhandle(?:Action)?\("([^"]+)"/g)].map(([, name]) => name),
+  );
+  assert.ok(exposed.size >= 50, `only ${exposed.size} Control Center commands are exposed`);
+  assert.deepEqual([...handled].sort(), [...exposed].sort());
 });
 
 test("an unknown command is refused rather than shelled out", async () => {
@@ -255,20 +306,22 @@ test("malformed JSON and wrong methods are answered, not crashed on", async () =
 // in a real browser, because the two defects that got through here -- relative
 // assets resolving one level too high at "/panel", and the UI's non-CLI
 // commands being refused -- both served a 200 and rendered an empty panel.
-const chromiumPath = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome";
-const browserSkip = !existsSync(chromiumPath)
-  ? "no preinstalled chromium"
-  : !existsSync(new URL("../apps/electron/node_modules/playwright", import.meta.url))
-    ? "playwright is not installed (npm ci --prefix apps/electron)"
-    : false;
+const chromiumPath = [
+  process.env.CODEX_ROUTER_TEST_CHROMIUM,
+  chromium.executablePath(),
+  "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
+  "/usr/bin/google-chrome",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+].find((candidate) => candidate && existsSync(candidate));
+const browserSkip = chromiumPath ? false : "no Chromium executable is available";
 
 test("the panel renders and answers in a real browser", { skip: browserSkip }, async () => {
-  // Playwright's entry is CommonJS; imported from ESM the namespace may carry
-  // the exports directly or behind `default` depending on the interop path.
-  const loaded = await import("../apps/electron/node_modules/playwright/index.js");
-  const chromium = loaded.chromium ?? loaded.default?.chromium;
-  assert.ok(chromium, "playwright did not expose chromium");
-  const { url, close } = await serve();
+  // The route and bridge are production code; only the slow external control
+  // commands are deterministic here. Their real execution is covered above,
+  // while this test owns the browser/module/rendering boundary.
+  const { url, close } = await serve({ runCommand: async () => ({}) });
   const browser = await chromium.launch({ executablePath: chromiumPath });
   try {
     const page = await browser.newPage({ viewport: { width: 420, height: 720 } });
@@ -283,7 +336,10 @@ test("the panel renders and answers in a real browser", { skip: browserSkip }, a
       }
     });
 
-    await page.goto(url("/panel/"), { waitUntil: "networkidle" });
+    // The live dashboard polls continuously, so it intentionally never reaches
+    // Playwright's network-idle state. DOM readiness plus the rendered-data
+    // assertions below is the stable browser contract.
+    await page.goto(url("/panel/"), { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(1200);
 
     // The bridge is present and the UI painted real data through it.
@@ -293,8 +349,11 @@ test("the panel renders and answers in a real browser", { skip: browserSkip }, a
     );
     await page.click('button.tab[data-tab="connections"]');
     await page.waitForTimeout(600);
-    const text = await page.locator("body").innerText();
-    assert.match(text, /anthropic|cerebras|deepseek/i, "provider rows did not render");
+    assert.match(
+      await page.locator("#router-status").innerText(),
+      /Router online/i,
+      "the control snapshot did not render",
+    );
     assert.equal(
       await page.evaluate(() => document.querySelector("button.tab.is-active")?.dataset.tab),
       "connections",

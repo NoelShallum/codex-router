@@ -76,6 +76,7 @@ test("status never prints the complete base URL", () => {
   assert.equal(status.baseUrlManaged, true);
   assert.equal(status.installed, true);
   assert.equal(status.documentReadable, true);
+  assert.equal(status.managedBlockPresent, true);
   assert.equal(status.defaultModel, "vendor/large");
   assert.deepEqual(status.publishedModels, ["vendor/small", "vendor/large"]);
 });
@@ -130,4 +131,35 @@ test("no published catalog means no drift to report", () => {
   removeGeminiIntegration();
   rmSync(GEMINI_CATALOG_PATH, { force: true });
   assert.equal(geminiCatalogDrift({ routedModels: routedModels() }), undefined);
+});
+
+test("status distinguishes a retained catalog from a missing managed environment block", () => {
+  publishGeminiIntegration({ routedModels: routedModels() });
+  const managed = readFileSync(envPath, "utf8");
+  try {
+    writePrivateFile(envPath, "USER_SETTING=keep\n");
+    const status = geminiIntegrationStatus();
+    assert.equal(status.installed, true);
+    assert.equal(status.baseUrlManaged, true);
+    assert.equal(status.documentReadable, true);
+    assert.equal(status.managedBlockPresent, false);
+  } finally {
+    writePrivateFile(envPath, managed);
+  }
+});
+
+test("caller capability refresh changes endpoint/key without changing Gemini publication policy", async () => {
+  publishGeminiIntegration({ routedModels: routedModels(), setDefaultModel: false });
+  const before = JSON.parse(readFileSync(GEMINI_CATALOG_PATH, "utf8"));
+  const nextKey = "rotated-gemini-caller-capability-with-sufficient-length";
+  writePrivateFile(path.join(stateDir, "caller-secret"), `${nextKey}\n`);
+  const module = await import("../src/gemini-config-manager.mjs");
+  module.refreshCallerCapability();
+  const after = JSON.parse(readFileSync(GEMINI_CATALOG_PATH, "utf8"));
+  const document = readFileSync(envPath, "utf8");
+  assert.equal(after.defaultModel, null);
+  assert.deepEqual(after.models, before.models);
+  assert.equal(after.updatedAt, before.updatedAt);
+  assert.match(document, new RegExp(nextKey));
+  assert.ok(!document.includes("GEMINI_MODEL="));
 });

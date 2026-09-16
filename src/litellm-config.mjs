@@ -1,11 +1,13 @@
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
+import { grokGatewayStreamTimeoutSeconds } from "./grok-stream-timeouts.mjs";
 import { LITELLM_CONFIG_PATH } from "./paths.mjs";
 import { MODELS, providerForModel } from "./model-registry.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
+import { vertexAdapterForModel } from "./vertex-adapters.mjs";
 
 // Big enough for real Codex turns, small enough that a small model stays
 // entirely on the GPU of a 16 GB machine.
@@ -19,6 +21,7 @@ export function renderLiteLlmConfig() {
   const lines = ["model_list:"];
   for (const model of MODELS) {
     const provider = providerForModel(model);
+    const vertexAdapter = vertexAdapterForModel(model, provider);
     // A local model is routed with Ollama's own protocol rather than its
     // OpenAI-compatible surface, purely so `num_ctx` can be set. That surface
     // ignores it, and Ollama then reserves the model's maximum context: on a
@@ -45,14 +48,15 @@ export function renderLiteLlmConfig() {
       );
       continue;
     }
-    const apiBaseEnv = provider.kind === "oauth"
+    const apiBaseEnv = vertexAdapter?.liteLlmBaseEnv || (provider.kind === "oauth"
       ? provider.proxyBaseEnv
       : provider.protocol === "anthropic"
         ? "CODEX_ROUTER_ANTHROPIC_FORWARD_BASE_URL"
-        : "CODEX_ROUTER_API_FORWARD_BASE_URL";
+        : "CODEX_ROUTER_API_FORWARD_BASE_URL");
     const translatedModel =
       provider.kind === "oauth" ? model.upstreamModel : model.gatewayModel;
-    const protocol = provider.protocol === "anthropic" ? "anthropic" : "openai";
+    const protocol = vertexAdapter?.liteLlmProtocol ||
+      (provider.protocol === "anthropic" ? "anthropic" : "openai");
     const responsesSurface = provider.protocol === "openai-responses";
     lines.push(
       `  - model_name: ${yamlString(model.gatewayModel)}`,
@@ -63,11 +67,23 @@ export function renderLiteLlmConfig() {
       `      api_base: ${yamlString(`os.environ/${apiBaseEnv}`)}`,
       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
       ...(responsesSurface ? [] : ["      use_chat_completions_api: true"]),
+      // A Grok OAuth turn can be silent for minutes while it reasons, so its
+      // stream timeout outlasts the router's stall guard. Compaction reaches
+      // the same deployment without streaming, where `timeout` applies
+      // instead, so it gets the same bound. Every other deployment keeps the
+      // global request_timeout below.
+      ...(model.provider === "grok-oauth"
+        ? [
+            `      stream_timeout: ${grokGatewayStreamTimeoutSeconds()}`,
+            `      timeout: ${grokGatewayStreamTimeoutSeconds()}`,
+          ]
+        : []),
       "",
     );
   }
   lines.push(
     "litellm_settings:",
+    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
     "  drop_params: true",
     "  request_timeout: 600",
     "",
@@ -79,6 +95,16 @@ export function renderLiteLlmConfig() {
     // fix a rejected credential. Relay the provider's real status instead.
     "router_settings:",
     "  disable_cooldowns: true",
+    // Z.ai Coding Plan reports a five-hour account quota as HTTP 429. LiteLLM
+    // otherwise retries that same exhausted plan twice before the outer router
+    // can inspect the provider body and classify it as out_of_usage. Scope the
+    // override to Coding Plan model groups only: pay-per-token Z.ai and every
+    // other provider retain LiteLLM's normal transient rate-limit behavior.
+    "  model_group_retry_policy:",
+    ...MODELS.filter(({ provider }) => provider === "zai-coding").flatMap((model) => [
+      `    ${model.gatewayModel}:`,
+      "      RateLimitErrorRetries: 0",
+    ]),
     "",
     "general_settings:",
     "  disable_spend_logs: true",
@@ -94,6 +120,14 @@ export function writeLiteLlmConfig(target = LITELLM_CONFIG_PATH) {
     assertStateOwnership("write the gateway routing config");
   }
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  // LiteLLM resolves configured callbacks beside its YAML. Publish only this
+  // repository-owned module, atomically and privately, before referencing it.
+  const callbackPath = path.join(path.dirname(target), "grok_service_tier_callback.py");
+  const callbackTemp = `${callbackPath}.tmp.${process.pid}`;
+  writeFileSync(callbackTemp, readFileSync(new URL("./grok_service_tier_callback.py", import.meta.url)), { mode: 0o600 });
+  protectPrivateFile(callbackTemp);
+  renameSync(callbackTemp, callbackPath);
+  protectPrivateFile(callbackPath);
   const temporary = `${target}.tmp.${process.pid}`;
   writeFileSync(temporary, renderLiteLlmConfig(), { encoding: "utf8", mode: 0o600 });
   protectPrivateFile(temporary);

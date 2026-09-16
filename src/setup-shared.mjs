@@ -17,8 +17,10 @@ import {
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { credentialStatus } from "./provider-credentials.mjs";
+import { effectiveProviderCredentialStatus } from "./provider-api-key-routing.mjs";
+import { credentialSetupHint } from "./provider-credentials.mjs";
 import { providerOnboardingSnapshot } from "./provider-onboarding.mjs";
 import { defaultProviderIds, validateProviderIds } from "./provider-selection.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
@@ -121,17 +123,21 @@ export function providerConfigured(provider) {
   if (provider.kind === "oauth") {
     if (provider.id === "kimi-oauth") return kimiOAuthStatus().configured;
     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
+    if (provider.id === "antigravity-oauth") return antigravityOAuthStatus().configured;
     return false;
   }
   return providerNeedsNoKey(provider)
     ? true
-    : credentialStatus(provider, { persistent: true }).configured;
+    : effectiveProviderCredentialStatus(provider, { persistent: true }).configured;
 }
 
 // Per-provider hint for a selected-but-unconfigured OAuth provider.
 function oauthSetupHint(provider) {
   if (provider.id === "grok-oauth") {
     return "install the official Grok CLI and run `grok login --oauth`";
+  }
+  if (provider.id === "antigravity-oauth") {
+    return "run the Antigravity sign-in flow";
   }
   return `run \`kimi login\` (install the Kimi Code CLI from ${KIMI_CLI_INSTALL_URL} first if needed)`;
 }
@@ -181,7 +187,7 @@ function guidedSelection(appName) {
   if (selected.size === 0) selected = new Set([1]);
   process.stdout.write(`\nChoose the providers to show in ${appName}:\n`);
   process.stdout.write(
-    "OAuth entries reuse official Kimi or Grok CLI sessions; API entries use a provider credential.\n",
+    "OAuth entries reuse Kimi, Grok, or Antigravity sign-in; API entries use a provider credential.\n",
   );
   for (;;) {
     process.stdout.write(`${renderProviderChoices(snapshots, selected, colorEnabled)}\n`);
@@ -274,26 +280,28 @@ function onboardGrokOauth() {
   throw new Error("Grok OAuth login did not produce a usable credential after several attempts.");
 }
 
-// Ensure a selected provider has a usable credential, onboarding it when guided.
-// providerKeyCommand(id) yields the target-specific hint for the non-guided path.
 export function configureProvider(provider, { guided, providerKeyCommand }) {
   if (providerConfigured(provider)) return;
   if (!guided) {
-    const setup =
-      provider.kind === "oauth"
-        ? oauthSetupHint(provider)
+    const setup = provider.kind === "oauth"
+      ? oauthSetupHint(provider)
+      : provider.credential?.resolver
+        ? credentialSetupHint(provider)
         : `run \`${providerKeyCommand(provider.id)}\``;
     throw new Error(`${provider.displayName} is selected but not configured; ${setup} first.`);
+  }
+  if (provider.credential?.resolver) {
+    throw new Error(
+      `${provider.displayName} is selected but not configured; ${credentialSetupHint(provider)} first.`,
+    );
   }
   if (provider.kind === "oauth") {
     if (provider.id === "grok-oauth") onboardGrokOauth();
     else onboardKimiOauth();
-  } else {
-    if (["anonymous", "per-model"].includes(provider.authMode)) return;
-    const prompt = provider.credential?.prompt || `${provider.displayName} API key`;
-    if (!confirm(`Enter ${prompt} securely now?`)) {
-      throw new Error(`${provider.displayName} setup was cancelled.`);
-    }
-    run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
+    return;
   }
+  if (!confirm(`Enter a ${provider.displayName} key securely now?`)) {
+    throw new Error(`${provider.displayName} setup was cancelled.`);
+  }
+  run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
 }

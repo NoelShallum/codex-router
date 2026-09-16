@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-migration-"));
 const codexHome = path.join(testRoot, "codex");
@@ -20,6 +20,12 @@ process.env.CODEX_ROUTER_STATE_DIR = stateDir;
 process.env.CODEX_ROUTER_PORT = "46192";
 process.env.CODEX_ROUTER_LAUNCH_AGENTS_DIR = launchAgents;
 process.env.CODEX_ROUTER_SKIP_LAUNCHCTL = "1";
+
+// Individual tests tear down what they created; this sweep guarantees the
+// shared fixture root itself never outlives the file.
+after(() => {
+  rmSync(testRoot, { recursive: true, force: true });
+});
 
 const {
   applyKnownMigrations,

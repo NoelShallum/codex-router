@@ -33,11 +33,13 @@ not start a second Ollama pull or removal.
 The native macOS tray's **View more** panel and the Windows/Linux panel's
 **Discover Ollama** section include the complete tag inventories captured from
 the official Ollama pages for Gemma 4, Qwen 3.5/3.6/3.8, Nemotron 3 Super,
-Ornith, Nemotron 3, and Muse Glimmer. That includes quantized, MLX, BF16, and other
-published variants—not only the family aliases. Cloud aliases are shown for
-completeness but are labelled **cloud only** and cannot be downloaded as local
-weights. The manifest is a dated snapshot, so arbitrary Ollama tags and model
-URLs remain supported even when a newly published tag has not been added yet.
+Ornith, Nemotron 3, and Muse Glimmer. They also include the Ollama-compatible
+Unsloth GGUF variants of GLM-5.3 and GLM-5.3-Flash. That includes quantized,
+MLX, BF16, and other published variants—not only the family aliases. Cloud
+aliases are shown for completeness but are labelled **cloud only** and cannot
+be downloaded as local weights. The manifest is a dated snapshot, so arbitrary
+Ollama tags and ollama.com model URLs remain supported even when a newly
+published tag has not been added yet.
 An installed model's generation speed is measured on demand with the **Speed**
 button and reported as tokens/second; unmeasured models never receive a guessed
 number.
@@ -45,10 +47,10 @@ number.
 Every model in the catalog is listed and installable, including ones this
 machine is rated too small for. The two shortlists above the catalog—the coding
 quick picks and the image readers—are recommendations and only show what fits,
-but nothing is ever removed from the catalog itself: a model that will not fit
-is labelled **won't fit**, and its button reads **Anyway** and asks for
-confirmation before spending the gigabytes. Hiding those entries previously left
-them with no install path at all on a small machine.
+but nothing is ever removed from the catalog itself. A model that will not fit
+is labelled **won't fit**; acknowledge **Allow a model larger than the router
+recommends for this machine** before selecting it. The install still asks for
+confirmation before spending the gigabytes.
 
 Useful commands:
 

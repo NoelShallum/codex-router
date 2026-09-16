@@ -9,15 +9,16 @@ import {
   recordProbeResult,
   recordProbeStarted,
 } from "./subagent-proofs.mjs";
+import { detachedOperationEnvironment } from "./process-tree.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Enabling a model as a subagent is the assignment; this module answers
 // whether the assignment can hold. Verification is capability research, not
 // trust: the probe spends two live requests proving the model streams and
-// answers a forced tool call through the installed router, and only that
-// evidence — never the toggle itself — advertises the model to Codex as a
-// v2 subagent (as "experimental", until a real spawn settles it).
+// answers a forced tool call through the installed router. That low-cost
+// result becomes certification evidence, not a v2 claim: only a reviewed
+// v2_agent application plus registry entry may advertise the native role.
 
 // A probe is two 180-second-capped requests, so any "checking" older than
 // this ceiling was left behind by a worker that died — machine sleep, OOM, a
@@ -32,7 +33,9 @@ function checkingIsStale(proof, now = Date.now()) {
 }
 
 // Which of these slugs need a probe at all. Registry-v2 models shipped with
-// the full native proof; slugs already carrying local evidence keep it.
+// the full native proof. Explicit registry-v1 models were already reviewed
+// and rejected for the native role, so a local probe must never reopen that
+// decision; only unknown models are certification candidates.
 export function subagentVerificationCandidates(slugs, { force = false, now = Date.now() } = {}) {
   const proofs = readSubagentProofs().proofs;
   const seen = new Set();
@@ -43,10 +46,10 @@ export function subagentVerificationCandidates(slugs, { force = false, now = Dat
     seen.add(slug);
     const model = MODEL_BY_SLUG.get(slug);
     if (!model) continue;
-    if (model.multiAgentVersion === "v2") continue;
+    if (model.multiAgentVersion === "v2" || model.multiAgentVersion === "v1") continue;
     const status = proofs[slug]?.status;
     if (!force) {
-      if (status === "experimental" || status === "proven") continue;
+      if (status === "candidate" || status === "experimental" || status === "proven") continue;
       if (status === "checking" && !checkingIsStale(proofs[slug], now)) continue;
     }
     candidates.push(slug);
@@ -113,16 +116,27 @@ export async function verifySubagentCandidates(slugs, { probe, force = false } =
 // candidate list to a detached worker (the same shape as the vision-model
 // download worker): state moves to "checking" immediately, the worker records
 // the verdict and republishes the catalog when it lands.
-export function spawnDetachedVerification(slugs, { execPath = process.execPath } = {}) {
-  const candidates = subagentVerificationCandidates(slugs);
+export function spawnDetachedVerification(
+  slugs,
+  { execPath = process.execPath, deferCandidateResolution = false } = {},
+) {
+  // A curation transaction has just written a new model overlay, but this
+  // process still holds the old registry module. Let the fresh worker resolve
+  // those slugs after the overlay publication instead of silently dropping
+  // them as "unknown" here.
+  const candidates = deferCandidateResolution
+    ? [...new Set((slugs || []).map((slug) => String(slug || "").trim()).filter(Boolean))]
+    : subagentVerificationCandidates(slugs);
   if (candidates.length === 0) return { spawned: false, candidates: [] };
-  for (const slug of candidates) recordProbeStarted(slug);
+  if (!deferCandidateResolution) {
+    for (const slug of candidates) recordProbeStarted(slug);
+  }
   const child = spawn(
     execPath,
     [path.join(REPO_ROOT, "src", "subagent-verify.mjs"), "--worker", ...candidates],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
+      env: detachedOperationEnvironment(process.env, { MODEL_ROUTER_TARGET: "codex" }),
       detached: true,
       stdio: "ignore",
       windowsHide: true,

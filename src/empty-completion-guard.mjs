@@ -5,6 +5,30 @@ import { HeaderlessSseDetector } from "./sse-prefix.mjs";
 
 const MAX_PRECONTENT_BYTES = 1024 * 1024;
 const MAX_PRECONTENT_MS = 30_000;
+// An individual event can echo tool schemas or carry a large reasoning delta.
+// Bound its unfinished frame separately from the accumulated prelude hold.
+const MAX_INCOMPLETE_EVENT_BYTES = 10 * 1024 * 1024;
+
+export class EmptyCompletionPreludeLimitError extends Error {
+  constructor(kind) {
+    super(
+      kind === "time"
+        ? "The upstream produced no client-visible output before the pre-content deadline."
+        : "The upstream exceeded the pre-content byte limit without producing client-visible output.",
+    );
+    this.name = "EmptyCompletionPreludeLimitError";
+    this.code = "EMPTY_COMPLETION_PRELUDE_LIMIT";
+    this.kind = kind;
+  }
+}
+
+export function isEmptyCompletionPreludeLimitError(error) {
+  return (
+    error instanceof EmptyCompletionPreludeLimitError ||
+    (error?.code === "EMPTY_COMPLETION_PRELUDE_LIMIT" &&
+      (error?.kind === "time" || error?.kind === "bytes"))
+  );
+}
 
 // A terminal SSE event for a Responses turn. `response.completed` is the
 // protocol's end-of-response marker; `response.done` is the stream terminator
@@ -17,6 +41,187 @@ function isTerminalEvent(eventType, dataText) {
     eventType === "response.completed" ||
     eventType === "response.done"
   );
+}
+
+const FAILURE_TERMINAL_EVENT_TYPES = new Set(["error", "response.failed", "response.incomplete"]);
+
+// An upstream that states the turn failed: a typed failure event, or an
+// untyped `data:` payload whose JSON names one.
+function isFailureTerminalEvent(eventType, dataText) {
+  if (FAILURE_TERMINAL_EVENT_TYPES.has(eventType)) return true;
+  if (eventType !== undefined || !dataText || dataText === "[DONE]") return false;
+  try {
+    return FAILURE_TERMINAL_EVENT_TYPES.has(JSON.parse(dataText)?.type);
+  } catch {
+    return false;
+  }
+}
+
+function sseFields(block) {
+  let eventType = undefined;
+  const dataLines = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    else if (line.startsWith("data:")) {
+      const value = line.slice(5);
+      dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  }
+  return {
+    eventType,
+    // The SSE algorithm joins repeated data fields with a line feed before
+    // dispatch. Overwriting them truncates valid multiline JSON.
+    dataText: dataLines.length ? dataLines.join("\n") : undefined,
+  };
+}
+
+function nextSseBlock(buffer) {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf < 0 && crlf < 0) return undefined;
+  if (crlf >= 0 && (lf < 0 || crlf < lf)) {
+    return { end: crlf + 4, bodyEnd: crlf };
+  }
+  return { end: lf + 2, bodyEnd: lf };
+}
+
+// The empty-completion guard may release a stream after reasoning or a time
+// bound so the caller can see progress and cancel it. The terminal event must
+// still stay behind the verdict: Codex is allowed to stop reading as soon as
+// `response.completed` arrives, so an error appended after that event is not a
+// stated failure at all. This small downstream transform holds terminal blocks
+// until the paired guard has observed content. If the turn is empty, the router
+// writes its error after this transform finishes and before any terminal marker
+// can reach the client.
+export class EmptyCompletionTerminalGuard extends Transform {
+  #guard;
+  #eventStream;
+  #headerlessDetector;
+  #pending = Buffer.alloc(0);
+  #heldTerminal = [];
+  #heldTerminalBytes = 0;
+  #maxHeldTerminalBytes;
+
+  constructor(
+    guard,
+    contentType = "",
+    { maxHeldTerminalBytes = MAX_PRECONTENT_BYTES } = {},
+  ) {
+    super();
+    this.#guard = guard;
+    this.#maxHeldTerminalBytes =
+      Number.isFinite(maxHeldTerminalBytes) && maxHeldTerminalBytes >= 0
+        ? Math.floor(maxHeldTerminalBytes)
+        : MAX_PRECONTENT_BYTES;
+    const declared = String(contentType).toLowerCase();
+    this.#eventStream = declared.includes("text/event-stream");
+    this.#headerlessDetector =
+      !this.#eventStream && !declared.includes("json")
+        ? new HeaderlessSseDetector()
+        : undefined;
+  }
+
+  _transform(chunk, _encoding, callback) {
+    try {
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.write(chunk);
+        if (detected.decision === "pending") {
+          callback();
+          return;
+        }
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        for (const buffered of detected.chunks) this.#consume(buffered);
+        callback();
+        return;
+      }
+      this.#consume(chunk);
+      callback();
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  _flush(callback) {
+    try {
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.end();
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        for (const buffered of detected.chunks) this.#consume(buffered);
+      }
+      if (!this.#eventStream) {
+        if (this.#pending.length) this.push(this.#pending);
+      } else {
+        if (this.#guard.hasContent()) this.#releaseTerminal();
+        // A non-terminal final block may omit its trailing blank line. A held
+        // terminal is deliberately dropped when the paired guard found no
+        // content, leaving the router's subsequent `event: error` observable.
+        if (this.#pending.length) {
+          const { eventType, dataText } = sseFields(this.#pending.toString("utf8"));
+          if (!isTerminalEvent(eventType, dataText)) this.push(this.#pending);
+          else if (this.#guard.hasContent()) this.push(this.#pending);
+        }
+      }
+      this.#pending = Buffer.alloc(0);
+      this.#heldTerminal = [];
+      this.#heldTerminalBytes = 0;
+      callback();
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  #consume(chunk) {
+    const bytes = Buffer.from(chunk);
+    if (!this.#eventStream) {
+      this.push(bytes);
+      return;
+    }
+    if (this.#guard.hasContent() && this.#pending.length === 0) {
+      this.#releaseTerminal();
+      this.push(bytes);
+      return;
+    }
+    this.#pending =
+      this.#pending.length === 0
+        ? bytes
+        : Buffer.concat([this.#pending, bytes], this.#pending.length + bytes.length);
+    while (true) {
+      const boundary = nextSseBlock(this.#pending);
+      if (!boundary) break;
+      const raw = this.#pending.subarray(0, boundary.end);
+      const block = this.#pending.subarray(0, boundary.bodyEnd).toString("utf8");
+      this.#pending = this.#pending.subarray(boundary.end);
+      const { eventType, dataText } = sseFields(block);
+      if (isTerminalEvent(eventType, dataText)) {
+        if (this.#guard.hasContent()) this.push(raw);
+        else {
+          this.#heldTerminal.push(Buffer.from(raw));
+          this.#heldTerminalBytes += raw.length;
+          if (this.#heldTerminalBytes > this.#maxHeldTerminalBytes) {
+            throw new EmptyCompletionPreludeLimitError("bytes");
+          }
+        }
+      } else {
+        if (this.#guard.hasContent()) this.#releaseTerminal();
+        this.push(raw);
+      }
+    }
+    if (this.#guard.hasContent()) {
+      this.#releaseTerminal();
+      if (this.#pending.length) {
+        this.push(this.#pending);
+        this.#pending = Buffer.alloc(0);
+      }
+    }
+  }
+
+  #releaseTerminal() {
+    for (const block of this.#heldTerminal) this.push(block);
+    this.#heldTerminal = [];
+    this.#heldTerminalBytes = 0;
+  }
 }
 
 function partHasContent(part) {
@@ -178,19 +383,27 @@ export class EmptyCompletionGuard extends Transform {
   #bufferedBytes = 0;
   #sawContent = false;
   #sawTerminal = false;
+  #sawParseableEvent = false;
   #empty = false;
   #released = false;
-  #releasedForBudget = false;
+  #keepParsingAfterRelease = false;
   #releasedForLiveness = false;
+  #preludeLimitKind;
   #suppressedPrologue = false;
   #headerlessDetector;
   #maxPreludeBytes;
   #maxPreludeMs;
+  #maxStreamStallMs;
   #timer;
+  #receivedBytes = 0;
 
   constructor(
     contentType = "",
-    { maxPreludeBytes = MAX_PRECONTENT_BYTES, maxPreludeMs = MAX_PRECONTENT_MS } = {},
+    {
+      maxPreludeBytes = MAX_PRECONTENT_BYTES,
+      maxPreludeMs = MAX_PRECONTENT_MS,
+      maxStreamStallMs = maxPreludeMs,
+    } = {},
   ) {
     super();
     const declared = String(contentType).toLowerCase();
@@ -207,7 +420,11 @@ export class EmptyCompletionGuard extends Transform {
       Number.isFinite(maxPreludeMs) && maxPreludeMs >= 0
         ? maxPreludeMs
         : MAX_PRECONTENT_MS;
-    if (this.#eventStream) this.#startTimer();
+    this.#maxStreamStallMs =
+      Number.isFinite(maxStreamStallMs) && maxStreamStallMs >= 0
+        ? maxStreamStallMs
+        : this.#maxPreludeMs;
+    if (this.#eventStream || this.#headerlessDetector) this.#startTimer();
   }
 
   isEmpty() {
@@ -218,22 +435,15 @@ export class EmptyCompletionGuard extends Transform {
     return this.#sawContent;
   }
 
-  // True when the stream was released by the hold budget (byte cap or timer)
-  // rather than by a content or terminal verdict. The turn is then relayed
-  // unchanged and never classified empty — the conservative choice — but the
-  // caller can tell "released because we could not afford to hold it" apart
-  // from "released because it produced something", which is the difference
-  // between "may have been an empty completion we chose not to retry" and a
-  // healthy turn in the meter.
-  releasedForBudget() {
-    return this.#releasedForBudget;
-  }
-
   // True when the hold ended because the upstream proved it was generating
   // rather than because it produced content. The stream was relayed in full and
   // on time; the verdict, if any, arrives later.
   releasedForLiveness() {
     return this.#releasedForLiveness;
+  }
+
+  preludeLimitKind() {
+    return this.#preludeLimitKind;
   }
 
   // True when the guard still held every byte at the moment it declared the
@@ -246,21 +456,26 @@ export class EmptyCompletionGuard extends Transform {
   }
 
   _transform(chunk, _encoding, callback) {
-    if (this.#headerlessDetector) {
-      const detected = this.#headerlessDetector.write(chunk);
-      if (detected.decision === "pending") {
+    try {
+      this.#receivedBytes += Buffer.byteLength(chunk);
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.write(chunk);
+        if (detected.decision === "pending") {
+          callback();
+          return;
+        }
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        if (this.#eventStream) this.#startTimer();
+        for (const buffered of detected.chunks) this.#transformChunk(buffered);
         callback();
         return;
       }
-      this.#headerlessDetector = undefined;
-      this.#eventStream = detected.decision === "event-stream";
-      if (this.#eventStream) this.#startTimer();
-      for (const buffered of detected.chunks) this.#transformChunk(buffered);
+      this.#transformChunk(chunk);
       callback();
-      return;
+    } catch (error) {
+      callback(error);
     }
-    this.#transformChunk(chunk);
-    callback();
   }
 
   #transformChunk(chunk) {
@@ -273,12 +488,22 @@ export class EmptyCompletionGuard extends Transform {
     const bytes = Buffer.from(chunk);
     if (this.#released) {
       this.push(bytes);
-      // A liveness release ends the hold, not the question. Keep parsing from
-      // behind the relay so a turn that streamed reasoning and then produced
-      // nothing is still recognized — it just gets reported instead of retried.
+      // A liveness or time-limit release ends the hold, not the question. Keep
+      // parsing from behind the relay so a turn that later produces nothing is
+      // still recognized — it just gets reported instead of retried.
+      // After release, use a much higher limit for incomplete SSE blocks to allow
+      // legitimate large reasoning deltas (issue #684) while still protecting
+      // against unbounded/malformed streams.
       if (!this.#settled()) {
         this.#parseBuffer += this.#decoder.write(bytes);
         this.#consumeBlocks();
+        if (
+          !this.#settled() &&
+          Buffer.byteLength(this.#parseBuffer) > MAX_INCOMPLETE_EVENT_BYTES
+        ) {
+          this.#failPrelude("bytes");
+        }
+        if (!this.#settled()) this.#startTimer({ reset: true });
       }
       return;
     }
@@ -287,66 +512,95 @@ export class EmptyCompletionGuard extends Transform {
     this.#parseBuffer += this.#decoder.write(bytes);
     this.#consumeBlocks();
     if (!this.#released && this.#bufferedBytes > this.#maxPreludeBytes) {
-      this.#release({ budget: true });
+      const pendingBytes = Buffer.byteLength(this.#parseBuffer);
+      // Let a fragmented first event finish before classifying it. Retain at
+      // most one bounded unfinished frame beyond the prelude budget; completed
+      // malformed blocks cannot accumulate behind a small unfinished tail.
+      if (
+        !this.#sawTerminal &&
+        pendingBytes > 0 &&
+        pendingBytes <= MAX_INCOMPLETE_EVENT_BYTES &&
+        this.#bufferedBytes - pendingBytes <= this.#maxPreludeBytes
+      ) {
+        return;
+      }
+      // A large but well-framed prologue is not a broken stream. Providers can
+      // echo substantial response metadata before the first delta; relaying a
+      // completed JSON event bounds our staging memory while parsing behind
+      // the relay preserves the eventual empty/content verdict. Oversized
+      // unfinished frames and unparseable completed bodies still fail closed.
+      if (
+        this.#sawParseableEvent &&
+        !this.#sawTerminal &&
+        pendingBytes <= MAX_INCOMPLETE_EVENT_BYTES
+      ) {
+        this.#release({ preludeLimit: "bytes" });
+      } else {
+        this.#failPrelude("bytes");
+      }
     }
   }
 
   // No further parsing can change the outcome: either the turn produced content
   // or the hold ended for a reason that also ended the verdict (a content
-  // release, an unparseable terminal, or the byte/time budget).
+  // release or an unparseable terminal).
   #settled() {
-    return this.#sawContent || (this.#released && !this.#releasedForLiveness);
+    return this.#sawContent || (this.#released && !this.#keepParsingAfterRelease);
   }
 
   _flush(callback) {
-    if (this.#headerlessDetector) {
-      const detected = this.#headerlessDetector.end();
-      this.#headerlessDetector = undefined;
-      this.#eventStream = detected.decision === "event-stream";
-      if (this.#eventStream) this.#startTimer();
-      for (const buffered of detected.chunks) this.#transformChunk(buffered);
-    }
-    this.#clearTimer();
-    if (!this.#eventStream) {
-      this.push(this.#decoder.end());
-      callback();
-      return;
-    }
-    if (this.#released) {
-      // A stream released for liveness was relayed in full, so there is nothing
-      // left to push — but its verdict is still owed. Finish parsing and record
-      // it; the caller reads `suppressedPrologue()` to learn that this one
-      // cannot be retried behind the client's back.
-      if (!this.#settled()) {
-        this.#parseBuffer += this.#decoder.end();
-        if (this.#parseBuffer) {
-          this.#classifyBlock(this.#parseBuffer);
-          this.#parseBuffer = "";
+    try {
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.end();
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        if (this.#eventStream) this.#startTimer();
+        for (const buffered of detected.chunks) this.#transformChunk(buffered);
+      }
+      this.#clearTimer();
+      if (!this.#eventStream) {
+        this.push(this.#decoder.end());
+        callback();
+        return;
+      }
+      if (this.#released) {
+        // A stream released for liveness or the time limit was relayed in full,
+        // so there is nothing left to push — but its verdict is still owed.
+        // Finish parsing and record it; the caller reads `suppressedPrologue()`
+        // to learn that this one cannot be retried behind the client's back.
+        if (!this.#settled()) {
+          this.#parseBuffer += this.#decoder.end();
+          if (this.#parseBuffer) {
+            this.#classifyBlock(this.#parseBuffer);
+            this.#parseBuffer = "";
+          }
+          if (!this.#sawContent && this.#sawTerminal) this.#empty = true;
         }
-        if (!this.#sawContent && this.#sawTerminal) this.#empty = true;
+        callback();
+        return;
+      }
+      this.#parseBuffer += this.#decoder.end();
+      if (this.#parseBuffer) {
+        // The final block may lack its trailing blank line; it is still a
+        // complete SSE block for our purposes.
+        this.#classifyBlock(this.#parseBuffer);
+        this.#parseBuffer = "";
+      }
+      if (!this.#sawContent && this.#sawTerminal) {
+        this.#empty = true;
+        // Every byte is still held, so the retry can replace this attempt whole.
+        this.#suppressedPrologue = true;
+        this.#chunks = [];
+        this.#bufferedBytes = 0;
+      } else {
+        // A clean EOF without a protocol terminal is not proof of an empty
+        // completion. Preserve it and let ordinary stream handling decide.
+        this.#release();
       }
       callback();
-      return;
+    } catch (error) {
+      callback(error);
     }
-    this.#parseBuffer += this.#decoder.end();
-    if (this.#parseBuffer) {
-      // The final block may lack its trailing blank line; it is still a
-      // complete SSE block for our purposes.
-      this.#classifyBlock(this.#parseBuffer);
-      this.#parseBuffer = "";
-    }
-    if (!this.#sawContent && this.#sawTerminal) {
-      this.#empty = true;
-      // Every byte is still held, so the retry can replace this attempt whole.
-      this.#suppressedPrologue = true;
-      this.#chunks = [];
-      this.#bufferedBytes = 0;
-    } else {
-      // A clean EOF without a protocol terminal is not proof of an empty
-      // completion. Preserve it and let ordinary stream handling decide.
-      this.#release();
-    }
-    callback();
   }
 
   _destroy(error, callback) {
@@ -365,13 +619,38 @@ export class EmptyCompletionGuard extends Transform {
 
   #classifyBlock(block) {
     const { eventType, dataText } = this.#fields(block);
+    if (dataText === "[DONE]") {
+      this.#sawParseableEvent = true;
+    } else if (dataText) {
+      try {
+        JSON.parse(dataText);
+        this.#sawParseableEvent = true;
+      } catch {
+        // `#contentOf` below keeps malformed terminal data indeterminate. The
+        // byte-budget decision remains fail-closed unless another complete
+        // JSON event already established framing.
+      }
+    }
     // Content is decided before the terminal check: a gateway that puts the
     // whole turn in `response.completed` emits a terminal event that is also
     // the only content event in the stream.
     const content = this.#contentOf(eventType, dataText);
     if (content === true) {
       this.#sawContent = true;
+      this.#clearTimer();
       this.#release();
+      return;
+    }
+    // A failure terminal is the upstream's own verdict, not an empty
+    // completion. Holding it would only delay the error the client needs
+    // (until the prelude or stall timer, which then reports a second failure),
+    // and retrying it would replay a request the provider already refused.
+    if (isFailureTerminalEvent(eventType, dataText)) {
+      this.#clearTimer();
+      this.#release();
+      // A stream already released for liveness or a time limit stops parsing
+      // and stops its stall timer too: the failure is the verdict.
+      this.#keepParsingAfterRelease = false;
       return;
     }
     if (isTerminalEvent(eventType, dataText)) {
@@ -394,19 +673,23 @@ export class EmptyCompletionGuard extends Transform {
     }
   }
 
-  #release({ budget = false, liveness = false } = {}) {
+  #release({ liveness = false, preludeLimit } = {}) {
     if (this.#released) return;
     this.#released = true;
-    if (budget) this.#releasedForBudget = true;
     if (liveness) this.#releasedForLiveness = true;
+    if (preludeLimit === "time" || preludeLimit === "bytes") {
+      this.#preludeLimitKind = preludeLimit;
+    }
+    this.#keepParsingAfterRelease = liveness || Boolean(preludeLimit);
     this.#clearTimer();
     for (const chunk of this.#chunks) this.push(chunk);
     this.#chunks = [];
     this.#bufferedBytes = 0;
-    // A liveness release keeps parsing, and the buffer holds the partial block
-    // straddling the release. Dropping it would corrupt the very block the
-    // verdict may depend on. Every other release is done reading.
-    if (!liveness) this.#parseBuffer = "";
+    // A liveness or time-limit release keeps parsing, and the buffer holds the
+    // partial block straddling the release. Dropping it would corrupt the very
+    // block the verdict may depend on. Every other release is done reading.
+    if (!this.#keepParsingAfterRelease) this.#parseBuffer = "";
+    else if (!this.#settled()) this.#startTimer();
   }
 
   #clearTimer() {
@@ -416,29 +699,46 @@ export class EmptyCompletionGuard extends Transform {
     }
   }
 
-  #startTimer() {
-    if (this.#timer || this.#released) return;
-    this.#timer = setTimeout(() => this.#release({ budget: true }), this.#maxPreludeMs);
+  #startTimer({ reset = false } = {}) {
+    if (reset) this.#clearTimer();
+    if (this.#timer || this.#settled()) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      if (this.#settled()) return;
+      if (this.#released) {
+        // Once the prologue is visible, this is a stall bound. End a stream
+        // that stopped producing complete events instead of letting a routed
+        // request sit open for minutes with no answer.
+        this.#failPrelude("time");
+      } else if (this.#receivedBytes === 0 || this.#headerlessDetector) {
+        // Headers-only responses and undecidable headerless bodies have
+        // nothing safe to release. Fail while the first attempt is still fully
+        // replaceable so the router can retry it once.
+        this.#failPrelude("time");
+      } else {
+        // A time limit is otherwise a latency bound, not evidence the stream is
+        // broken. Relay the staged prologue so a healthy slow model remains
+        // cancellable, then keep parsing behind the relay.
+        this.#release({ preludeLimit: "time" });
+      }
+    }, this.#released ? this.#maxStreamStallMs : this.#maxPreludeMs);
     this.#timer.unref?.();
   }
 
+  #failPrelude(kind) {
+    this.#clearTimer();
+    this.#preludeLimitKind = kind;
+    this.#suppressedPrologue = !this.#released;
+    this.#chunks = [];
+    this.#bufferedBytes = 0;
+    this.#parseBuffer = "";
+    const error = new EmptyCompletionPreludeLimitError(kind);
+    if (kind === "time") this.destroy(error);
+    else throw error;
+  }
+
   #fields(block) {
-    let eventType = undefined;
-    const dataLines = [];
-    for (const line of block.split(/\r?\n/)) {
-      if (line.startsWith("event:")) eventType = line.slice(6).trim();
-      else if (line.startsWith("data:")) {
-        const value = line.slice(5);
-        dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
-      }
-    }
-    return {
-      eventType,
-      // The SSE algorithm joins repeated data fields with a line feed before
-      // dispatch. Overwriting them truncates valid multiline JSON and can turn
-      // a content event into a false empty completion.
-      dataText: dataLines.length ? dataLines.join("\n") : undefined,
-    };
+    return sseFields(block);
   }
 
   // Liveness never decides the verdict, only the hold, so an unparseable block

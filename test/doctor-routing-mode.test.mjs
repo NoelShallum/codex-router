@@ -48,10 +48,25 @@ esac
 }
 
 function child(script, args, env) {
+  const childEnv = {
+    ...env,
+    // This test redirects Codex/router state, but service status is read from
+    // the machine, not from that state: launchd on macOS, systemd on Linux and
+    // Task Scheduler on Windows all answer for the developer's real install.
+    // A maintainer with the router running therefore made the fixture report a
+    // loaded service, and doctor waits 30s rather than 2s for a router that
+    // will never appear on the fixture's port -- past this child's own bound,
+    // leaving empty stdout for the JSON parse below. CI has no service
+    // installed, so it only ever reproduced locally.
+    ...(script === "doctor.mjs" ? { CODEX_ROUTER_SERVICE_PLATFORM: "test-fixture" } : {}),
+  };
   return spawnSync(process.execPath, [path.join(root, "src", script), ...args], {
     cwd: root,
-    env,
+    env: childEnv,
     encoding: "utf8",
+    // node:test cannot interrupt a synchronous child while the event loop is
+    // blocked, so bound the subprocess itself as the final isolation guard.
+    timeout: 20_000,
   });
 }
 
@@ -136,20 +151,62 @@ wire_api = "responses"
         0,
       );
 
+      const nativeCapturePath = path.join(stateDir, "native-models.json");
+      const nativeCapture = JSON.parse(readFileSync(nativeCapturePath, "utf8"));
+      nativeCapture.captured_with = "codex-cli 98.0.0";
+      writeFileSync(nativeCapturePath, `${JSON.stringify(nativeCapture)}\n`, { mode: 0o600 });
+
       const doctor = child("doctor.mjs", ["--json"], env);
+      assert.ifError(doctor.error);
       const report = JSON.parse(doctor.stdout);
       const byName = new Map(report.checks.map((check) => [check.name, check]));
       assert.deepEqual(byName.get("Merged catalog"), {
-        status: "ok",
+        status: "warn",
         name: "Merged catalog",
-        detail: "native-only; routed transport is inactive",
-        fix: "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
+        detail: "native catalog captured by codex-cli 98.0.0; installed codex-cli 99.0.0",
+        fix: "Run ./bin/refresh-catalog, then fully quit and reopen Codex.",
       });
       assert.equal(byName.get("Catalog matches gateway routes").status, "ok");
       assert.equal(byName.get("Catalog matches gateway routes").detail, "0 routed models");
       assert.equal(byName.get("Routed model agents").status, "ok");
       assert.match(byName.get("Routed model agents").detail, /^0 current definitions/);
       assert.equal(byName.get("Signed router coexistence").status, "ok");
+
+      if (process.platform === "win32") {
+        // Codex Desktop writes config.toml atomically. Recreate the resulting
+        // inherited-ACL shape without changing the temporary directory ACL.
+        const configured = readFileSync(configPath, "utf8");
+        unlinkSync(configPath);
+        writeFileSync(configPath, configured, { mode: 0o600 });
+
+        const privacyDoctor = child("doctor.mjs", ["--json"], env);
+        const privacyReport = JSON.parse(privacyDoctor.stdout);
+        const privacy = privacyReport.checks.find((check) => check.name === "Codex config privacy");
+        assert.deepEqual(privacy, {
+          status: "ok",
+          name: "Codex config privacy",
+          detail: "router credentials stay outside config.toml",
+        });
+
+        const legacy = configured.replace(
+          /^openai_base_url\s*=.*$/m,
+          `openai_base_url = "http://127.0.0.1:46192/_codex-router/${callerSecret}/v1"`,
+        );
+        assert.notEqual(legacy, configured, "legacy fixture must replace the managed root URL");
+        assert.match(legacy, /\/_codex-router\/[A-Za-z0-9_-]+\/v1/);
+        unlinkSync(configPath);
+        writeFileSync(configPath, legacy, { mode: 0o600 });
+        assert.equal(readFileSync(configPath, "utf8"), legacy);
+        const legacyDoctor = child("doctor.mjs", ["--json"], env);
+        const legacyReport = JSON.parse(legacyDoctor.stdout);
+        const legacyPrivacy = legacyReport.checks.find((check) => check.name === "Codex config privacy");
+        assert.deepEqual(legacyPrivacy, {
+          status: "fail",
+          name: "Codex config privacy",
+          detail: "Windows ACL is broader than the current user",
+          fix: "Run ./bin/doctor --fix; the managed router URL contains a local caller capability.",
+        });
+      }
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }
@@ -167,22 +224,17 @@ test(
     writeFileSync(configPath, 'model = "gpt-5.6-sol"\n', { mode: 0o600 });
     writeFileSync(
       path.join(stateDir, "enabled-providers.json"),
-      `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
+      `${JSON.stringify({ version: 1, providers: ["kimi-api"] })}\n`,
       { mode: 0o600 },
     );
-    writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-key\n", {
+    writeFileSync(path.join(stateDir, "kimi-api-key.secret"), "test-key\n", {
       mode: 0o600,
     });
-    writeFileSync(
-      path.join(stateDir, "multi-agent-proofs.json"),
-      `${JSON.stringify({
-        version: 1,
-        proofs: {
-          "deepseek/deepseek-v4-pro": { status: "proven" },
-        },
-      })}\n`,
-      { mode: 0o600 },
-    );
+    // A registry model carrying `multiAgentVersion: "v2"`, not a local proof.
+    // Local proof records are diagnostic and application material only --
+    // promoting from them let a stream/tool probe masquerade as native
+    // collaboration proof -- so a seeded `proven` entry no longer produces a
+    // managed agent definition and there would be nothing here to remove.
     // The catalog now publishes routed models only after an explicit picker
     // selection. Keep this test focused on the doctor detecting a missing
     // managed agent definition, rather than relying on the old implicit-show
@@ -192,8 +244,8 @@ test(
       `${JSON.stringify({
         version: 1,
         hidden: [],
-        visible: ["deepseek/deepseek-v4-pro"],
-        seeded: ["deepseek/deepseek-v4-pro"],
+        visible: ["kimi-api/kimi-k3"],
+        seeded: ["kimi-api/kimi-k3"],
       })}\n`,
       { mode: 0o600 },
     );
@@ -219,9 +271,7 @@ test(
       const catalog = child("catalog.mjs", ["--refresh-native", "--bundled-native"], env);
       assert.equal(catalog.status, 0, catalog.stderr);
       assert.equal(JSON.parse(catalog.stdout).routed_catalog_active, true);
-      unlinkSync(
-        path.join(codexHome, "agents", "router-model-deepseek-deepseek-v4-pro.toml"),
-      );
+      unlinkSync(path.join(codexHome, "agents", "router-model-kimi-api-kimi-k3.toml"));
 
       const routes = child("litellm-config.mjs", [], env);
       assert.equal(routes.status, 0, routes.stderr);
@@ -229,6 +279,7 @@ test(
       assert.equal(enabled.status, 0, enabled.stderr);
 
       const doctor = child("doctor.mjs", ["--json"], env);
+      assert.ifError(doctor.error);
       const report = JSON.parse(doctor.stdout);
       const byName = new Map(report.checks.map((check) => [check.name, check]));
       assert.deepEqual(byName.get("Codex model catalog"), {
