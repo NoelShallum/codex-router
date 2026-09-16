@@ -39,6 +39,7 @@ import {
   loopback,
 } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
+import { routedModelAlias } from "./model-aliases.mjs";
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
@@ -1828,8 +1829,8 @@ async function handleModels(response) {
   const data = catalogModels().map((model) => ({
     id: model.slug,
     object: "model",
-    owned_by: MODEL_BY_SLUG.has(model.slug)
-      ? providerForModel(MODEL_BY_SLUG.get(model.slug)).ownedBy
+    owned_by: MODEL_BY_SLUG.has(routedModelAlias(model.slug))
+      ? providerForModel(MODEL_BY_SLUG.get(routedModelAlias(model.slug))).ownedBy
       : "openai",
   }));
   writeJson(response, 200, { object: "list", data });
@@ -2315,8 +2316,10 @@ async function handleResponses(request, response, requestUrl) {
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    const routedModel = routedModelAlias(requestedModel);
     let registeredRoute =
-      MODEL_BY_SLUG.get(requestedModel) ??
+      MODEL_BY_SLUG.get(routedModel) ??
+      MODEL_BY_SLUG.get(readNativeAliases()[routedModel]) ??
       MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
     // An unregistered model on this endpoint is native GPT traffic -- Codex's
     // background agent sessions arrive here hardwired to a native slug no

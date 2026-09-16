@@ -121,6 +121,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.8-max",
       "opencode-go-responses/gpt-5.6-luna",
       "opencode-go-responses/muse-spark-1.2-contributor",
+      "opencode-go-responses/muse-spark-1.3-contributor",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -589,6 +590,8 @@ test("deprecated DeepSeek aliases remain routable but stay out of the picker", (
   for (const slug of [
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
+    "opencode-go/muse-spark-1.2-contributor",
+    "opencode-go/muse-spark-1.3-contributor",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.ok(model);

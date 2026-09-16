@@ -1,4 +1,5 @@
 import http from "node:http";
+import { createHash } from "node:crypto";
 
 import {
   applyKeepAliveTimeouts,
@@ -43,6 +44,7 @@ import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
+import { threadIdFromHeaders } from "./codex-session-names.mjs";
 
 installStableFetchTransport();
 
@@ -572,26 +574,26 @@ function normalizeBody(buffer, contentType, route) {
   // Fireworks rejects this OpenAI search parameter instead of ignoring it.
   // Other provider payloads keep it unchanged.
   if (provider.id === "fireworks") delete payload.web_search_options;
-  // Meta refuses `search_content_types` on anything but a `web_search_preview`
-  // tool, and Codex only ever sends the current spelling: its hosted search
-  // tool is `type: "web_search"`, carrying search_content_types beside
+  // Meta and OpenCode Console Go's Responses surface refuse
+  // `search_content_types` on anything but a `web_search_preview` tool, and
+  // Codex only ever sends the current spelling: its hosted search tool is
+  // `type: "web_search"`, carrying search_content_types beside
   // external_web_access, indexed_web_access, filters, user_location, and
   // search_context_size (read out of the shipped 0.147 binary, which contains
   // no occurrence of `web_search_preview` at all). The tool is declared on the
   // turn whenever web search is enabled, not only when the model searches, so
-  // the reporter's "running anything" is literal: every turn 400s and the
-  // provider is unusable rather than degraded (#286).
+  // one rejected field can make every turn 400 rather than degrading search.
   //
-  // Deliberately scoped to Meta and not applied everywhere. OpenAI documents
-  // `search_content_types` on `web_search` and *not* on `web_search_preview`,
-  // which is the reverse of what this endpoint enforces, so Meta is running an
-  // older fork of the schema rather than being the strict reader of it.
-  // Stripping the field for every provider would take a documented parameter
-  // away from the responses-native providers that do follow the current spec
-  // (github-copilot, opencode-go-responses), and neither has been observed to
-  // refuse it. A caller that does send Meta a real `web_search_preview` tool
-  // keeps the field, because that is the one tool this endpoint accepts it on.
-  if (provider.id === "meta" && Array.isArray(payload.tools)) {
+  // Deliberately scoped to these two providers and not applied everywhere.
+  // OpenAI documents `search_content_types` on `web_search` and *not* on
+  // `web_search_preview`, which is the reverse of what these endpoints
+  // enforce. A caller that does send either provider a real
+  // `web_search_preview` tool keeps the field, because that is the one tool
+  // the endpoint accepts it on.
+  if (
+    ["meta", "opencode-go-responses"].includes(provider.id) &&
+    Array.isArray(payload.tools)
+  ) {
     payload.tools = stripSearchContentTypes(payload.tools);
   }
   if (Array.isArray(payload.messages)) {
@@ -800,6 +802,12 @@ function normalizeBody(buffer, contentType, route) {
   return { body: Buffer.from(JSON.stringify(payload), "utf8"), model, provider, endpoint, payload };
 }
 
+// Stable per-credential stand-in for x-opencode-session (see upstreamHeaders).
+function stableCredentialSessionId(apiKey) {
+  const digest = createHash("sha256").update(String(apiKey || "anonymous")).digest("hex");
+  return `codex-router-${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
 function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = {}, endpoint = provider) {
   const headers = {};
   const providerIdentityHeaders = new Set([
@@ -823,6 +831,24 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
       continue;
     }
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  // OpenCode routes (and prompt-caches) per conversation and require a
+  // stable session id (https://opencode.ai/docs/go/#where-can-i-use-it).
+  // Codex clients send their native thread/session id instead, which the
+  // strip rules above deliberately do not forward upstream -- so translate
+  // it here. An explicit caller-supplied x-opencode-session always wins.
+  if (provider?.ownedBy?.toLowerCase?.() === "opencode") {
+    const hasSessionHeader = Object.keys(headers).some(
+      (name) => name.toLowerCase() === "x-opencode-session",
+    );
+    if (!hasSessionHeader) {
+      // Native thread ids rarely survive the LiteLLM hop (it strips unknown
+      // inbound headers), so fall back to a stable per-credential id. It
+      // routes correctly and stays distinct per user; conversations share
+      // prompt cache rather than each getting its own.
+      const threadId = threadIdFromHeaders(requestHeaders);
+      headers["x-opencode-session"] = threadId || stableCredentialSessionId(apiKey);
+    }
   }
   if (endpoint.authMode === "anonymous") {
     // The upstream explicitly permits anonymous access -- for a reseller's
