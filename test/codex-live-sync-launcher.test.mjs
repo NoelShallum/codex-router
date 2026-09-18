@@ -392,10 +392,23 @@ test("strict shim output still resolves the real binary rather than itself", { s
 });
 
 test("the CLI dispatcher exposes live-sync help without importing the catalog worker", () => {
-  const output = execFileSync("./bin/model-router", ["codex", "live-sync", "--help"], {
-    cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
-    encoding: "utf8",
-  });
+  // Windows has no shebang execution: spawning "./bin/model-router" directly
+  // cannot resolve the dispatcher there, and cmd.exe shim generation is
+  // deliberately out of scope for this feature (see installShim's win32
+  // refusal). Run the dispatcher through its interpreter on Windows so the
+  // same help text is exercised on every platform in CI.
+  const isWindows = process.platform === "win32";
+  const output = execFileSync(
+    isWindows ? "sh" : "./bin/model-router",
+    isWindows
+      ? ["bin/model-router", "codex", "live-sync", "--help"]
+      : ["codex", "live-sync", "--help"],
+    {
+      cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."),
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
   assert.match(output, /enable.*strict live-sync/);
   assert.match(output, /MODEL_ROUTER_LIVE_SYNC_BYPASS=1/);
 });

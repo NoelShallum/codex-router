@@ -12,6 +12,13 @@ process.env.MODEL_ROUTER_USER_MODELS = path.join(
   mkdtempSync(path.join(os.tmpdir(), "registry-test-")),
   "user-models.json",
 );
+// Registry assertions below describe the checked-in catalog, not whichever
+// live OpenCode snapshot happens to be present on the developer's machine.
+// Live overlay behavior is covered by opencode-live-sync.test.mjs.
+process.env.MODEL_ROUTER_OPENCODE_LIVE_CATALOG = path.join(
+  mkdtempSync(path.join(os.tmpdir(), "registry-live-test-")),
+  "missing-live-catalog.json",
+);
 
 const { renderLiteLlmConfig } = await import("../src/litellm-config.mjs");
 const {
@@ -987,11 +994,11 @@ test("deprecated DeepSeek aliases remain routable but stay out of the picker", (
   for (const slug of [
     "deepseek/deepseek-chat",
     "deepseek/deepseek-reasoner",
-    "opencode-go/muse-spark-1.2-contributor",
-    "opencode-go/muse-spark-1.3-contributor",
+    "opencode-go-responses/muse-spark-1.2-contributor-legacy",
+    "opencode-go-responses/muse-spark-1.3-contributor-legacy",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
-    assert.ok(model);
+    assert.ok(model, slug);
     assert.equal(model.listed, false);
     assert.ok(API_MODELS.includes(model));
   }

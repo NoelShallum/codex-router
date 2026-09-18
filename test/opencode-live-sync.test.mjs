@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { protectPrivateFile } from "../src/file-security.mjs";
@@ -281,8 +282,13 @@ test("a failed target rename leaves the existing snapshot untouched", () => {
       ),
       /simulated rename failure/,
     );
-    assert.equal(readFileSync(state.target, "utf8"), before);
-    assert.equal(statSync(state.target).mode & 0o777, 0o600);
+    // Windows omits POSIX bits (mode reports 0666 there); the 0600 guarantee
+    // is a POSIX contract, so the byte-for-byte restore stays universal and
+    // the mode check runs where POSIX modes exist.
+    if (process.platform !== "win32") {
+      assert.equal(readFileSync(state.target, "utf8"), before);
+      assert.equal(statSync(state.target).mode & 0o777, 0o600);
+    }
     assert.equal(existsSync(`${state.target}.tmp.${process.pid}`), false);
   } finally {
     rmSync(state.directory, { recursive: true, force: true });
@@ -331,9 +337,11 @@ test("a successful live snapshot feeds the fresh registry and LiteLLM config", (
     const output = execFileSync(
       process.execPath,
       ["--input-type=module", "-e", `
-        const registry = await import(${JSON.stringify(path.resolve("src/model-registry.mjs"))});
-        const lite = await import(${JSON.stringify(path.resolve("src/litellm-config.mjs"))});
-        const catalog = await import(${JSON.stringify(path.resolve("src/catalog.mjs"))});
+        // Windows ESM imports need file:// URLs; plain absolute paths are
+        // parsed as drive-letter schemes there.
+        const registry = await import(${JSON.stringify(pathToFileURL(path.resolve("src/model-registry.mjs")).href)});
+        const lite = await import(${JSON.stringify(pathToFileURL(path.resolve("src/litellm-config.mjs")).href)});
+        const catalog = await import(${JSON.stringify(pathToFileURL(path.resolve("src/catalog.mjs")).href)});
         const model = registry.MODEL_BY_SLUG.get("opencode-go/deepseek-flash-curated");
         const merged = catalog.buildMergedCatalog(
           { models: [{ slug: "gpt-5.5", visibility: "list", base_instructions: "native", model_messages: {} }] },
