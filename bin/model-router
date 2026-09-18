@@ -35,7 +35,7 @@ command writes, not which router it talks to.
 Commands:
   setup, install, doctor, status, provider-key, caller-key, key-pool, providers, search-sidecar, enable, disable,
   chatgpt-session, skills, multi-agent, picker-order, agents, media, panel, local-mlx, uninstall, smoke-test,
-  start, stop, update, rollback, shim, subagent-preset (dsh only)
+  start, stop, update, rollback, shim, live-sync, subagent-preset (dsh only)
 
 Examples:
   ./bin/model-router codex doctor
@@ -47,6 +47,9 @@ Examples:
   ./bin/model-router codex agents status
   ./bin/model-router codex skills approve-external codex-router
   ./bin/model-router codex shim install
+  ./bin/model-router codex live-sync enable
+  ./bin/model-router codex live-sync status
+  ./bin/model-router codex live-sync refresh
   ./bin/model-router dsh enable
   ./bin/model-router dsh status
   ./bin/model-router gemini enable
@@ -89,7 +92,7 @@ case "$target" in
 esac
 
 case "$command" in
-  setup|install|doctor|status|provider-key|caller-key|key-pool|providers|search-sidecar|enable|disable|chatgpt-session|skills|multi-agent|picker-order|agents|media|panel|local-mlx|uninstall|smoke-test|start|stop|update|rollback|subagent-preset|shim) ;;
+  setup|install|doctor|status|provider-key|caller-key|key-pool|providers|search-sidecar|enable|disable|chatgpt-session|skills|multi-agent|picker-order|agents|media|panel|local-mlx|uninstall|smoke-test|start|stop|update|rollback|subagent-preset|shim|live-sync) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -98,5 +101,16 @@ export MODEL_ROUTER_TARGET
 if [ "$command" = "search-sidecar" ] && [ "$target" != "codex" ]; then
   echo "search-sidecar is supported only for the Codex target." >&2
   exit 2
+fi
+# `live-sync` is a Codex-only command family and lives in the same Node
+# launcher that the strict shim invokes. Keep it out of the generic bin/
+# command dispatch so a catalog preflight can be called directly without
+# spawning an interactive Codex process.
+if [ "$command" = "live-sync" ]; then
+  if [ "$target" != "codex" ]; then
+    echo "live-sync is available for the codex target only." >&2
+    exit 2
+  fi
+  exec node "$repo_dir/src/codex-live-sync-launcher.mjs" "$@"
 fi
 exec "$repo_dir/bin/$command" "$@"

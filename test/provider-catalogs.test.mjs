@@ -12,7 +12,7 @@ import {
 test("every selectable provider remains a canonical UI family", () => {
   const canonical = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
   assert.equal(canonical.length, 42);
-  assert.equal(PROVIDERS.size, 47);
+  assert.equal(PROVIDERS.size, 49);
 });
 
 test("catalog capability comes from backend provider definitions", () => {
@@ -45,7 +45,13 @@ test("shared credentials expose distinct catalogs without duplicate protocol row
     "opencode-go-messages",
     "opencode-go-responses",
   ]);
-  assert.deepEqual(providerCatalogRouteIds("opencode-zen"), ["opencode-zen"]);
+  // Zen publishes the same protocol variants as Go: the live sync generates
+  // Responses and Messages routes from the free Zen ids it discovers.
+  assert.deepEqual(providerCatalogRouteIds("opencode-zen"), [
+    "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
+  ]);
   assert.deepEqual(providerCatalogRouteIds("commandcode"), [
     "commandcode",
     "commandcode-messages",
@@ -55,5 +61,7 @@ test("shared credentials expose distinct catalogs without duplicate protocol row
     "opencode-go-messages",
     "opencode-go-responses",
     "opencode-zen",
+    "opencode-zen-messages",
+    "opencode-zen-responses",
   ]));
 });

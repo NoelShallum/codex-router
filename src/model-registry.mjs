@@ -15,6 +15,7 @@ import {
   curatedModelIsFree,
   curatedModelToolSchemaRecursion,
 } from "./opencode-curation.mjs";
+import { readOpenCodeLiveCatalog } from "./opencode-live-metadata.mjs";
 import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
 import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
@@ -1027,12 +1028,116 @@ function mergeUserModels(base, staticAliases) {
   };
 }
 
+// The live OpenCode snapshot is a generated overlay, not a replacement for
+// checked-in or user-curated routes. Merge it after user models so an operator
+// who curated the same provider/model identity keeps their presentation and
+// metadata when the provider later starts publishing that id itself.
+function mergeLiveModels(base, snapshot, inheritedAliases, providers) {
+  if (
+    !snapshot ||
+    snapshot.providers?.go?.status !== "ok" ||
+    snapshot.providers?.zen?.status !== "ok" ||
+    !Array.isArray(snapshot.models)
+  ) {
+    return {
+      models: base.models,
+      warnings: Object.freeze([]),
+      aliases: new Map(),
+    };
+  }
+
+  const models = [...base.models];
+  const slugs = new Set(models.map((model) => model.slug));
+  const gatewayModels = new Set(models.map((model) => model.gatewayModel));
+  const routes = new Map(
+    models.map((model) => [`${model.provider}\0${model.upstreamModel}`, model]),
+  );
+  const warnings = [];
+
+  for (const candidate of snapshot.models) {
+    if (candidate?.autoSynced !== true) {
+      warnings.push(`Skipped live model ${candidate?.slug || "<unknown>"}: missing autoSynced marker`);
+      continue;
+    }
+    const routeKey = `${candidate?.provider || ""}\0${candidate?.upstreamModel || ""}`;
+    if (routes.has(routeKey)) {
+      // A checked-in or user-curated definition owns presentation metadata
+      // for an existing route, but the live endpoint still proves that the
+      // route is currently advertised. Carry only the live provenance across
+      // the collision so catalog policy can make that model visible by
+      // default without replacing its reviewed metadata.
+      const existing = routes.get(routeKey);
+      if (existing?.autoSynced !== true) {
+        const promoted = {
+          ...existing,
+          autoSynced: true,
+          liveSource: candidate.liveSource,
+          liveProtocol: candidate.liveProtocol,
+          liveUpstream: candidate.liveUpstream,
+        };
+        const index = models.indexOf(existing);
+        if (index >= 0) models[index] = promoted;
+        routes.set(routeKey, promoted);
+      }
+      continue;
+    }
+    if (typeof candidate?.slug === "string" && slugs.has(candidate.slug)) {
+      warnings.push(`Skipped live model ${candidate.slug}: model slug already exists`);
+      continue;
+    }
+    if (typeof candidate?.gatewayModel === "string" && gatewayModels.has(candidate.gatewayModel)) {
+      warnings.push(`Skipped live model ${candidate.slug || "<unknown>"}: gateway model already exists`);
+      continue;
+    }
+    const problem = modelProblem(candidate, providers, slugs, gatewayModels);
+    if (problem) {
+      warnings.push(`Skipped live model: ${problem}`);
+      continue;
+    }
+    const normalized = normalizedModel(candidate, providers.get(candidate.provider));
+    models.push(normalized);
+    slugs.add(normalized.slug);
+    gatewayModels.add(normalized.gatewayModel);
+    routes.set(routeKey, normalized);
+  }
+
+  // A protocol migration changes the generated provider namespace while the
+  // upstream id stays the same. Carry the prior public slug forward so the
+  // catalog's existing visibility decision remains attached to the route.
+  const aliases = new Map(inheritedAliases || []);
+  for (const [from, to] of Object.entries(snapshot.aliases || {})) {
+    if (
+      typeof from !== "string" ||
+      typeof to !== "string" ||
+      !from ||
+      !to ||
+      from === to ||
+      slugs.has(from) ||
+      aliases.has(from) ||
+      !slugs.has(to)
+    ) continue;
+    aliases.set(from, to);
+  }
+
+  return {
+    models: Object.freeze(models),
+    warnings: Object.freeze(warnings),
+    aliases,
+  };
+}
+
 const registry = loadRegistry();
 const staticAliases = validatedStaticModelSlugAliases(registry);
 const runtime = loadRuntimeProviders(registry.providers);
-const merged = mergeUserModels(
+const userMerged = mergeUserModels(
   { ...registry, providers: runtime.providers },
   staticAliases,
+);
+const liveMerged = mergeLiveModels(
+  userMerged,
+  readOpenCodeLiveCatalog(),
+  new Map([...staticAliases, ...userMerged.aliases]),
+  runtime.providers,
 );
 
 export const PROVIDERS = registry.providers;
@@ -1046,17 +1151,23 @@ export const RUNTIME_PROVIDER_WARNINGS = runtime.warnings;
 // bind to this set: a local overlay is useful routing configuration, but it
 // cannot certify itself for every installer.
 export const CHECKED_IN_MODELS = registry.models;
-export const MODELS = merged.models;
-export const USER_MODEL_WARNINGS = merged.warnings;
+export const MODELS = liveMerged.models;
+export const USER_MODEL_WARNINGS = userMerged.warnings;
+// Generated live OpenCode routes that were skipped while merging the live
+// snapshot. Empty on a machine with no snapshot or a partial fetch.
+export const LIVE_MODEL_WARNINGS = liveMerged.warnings;
 // Slug -> the reason that user model was left out of MODELS. A slug here may
 // still route through a curation alias; callers check MODEL_BY_SLUG first.
-export const USER_MODELS_SKIPPED = merged.skipped;
+export const USER_MODELS_SKIPPED = userMerged.skipped;
 // Old curated public slugs that now resolve to a checked-in route. Catalog
 // publication migrates picker decisions through these aliases before applying
 // defaults, so an update removes the duplicate without hiding the model.
+// Live protocol migrations add generated aliases on top; the catalog's
+// visibility migration carries an operator's decision across a slug change.
 export const MODEL_SLUG_ALIASES = new Map([
   ...staticAliases,
-  ...merged.aliases,
+  ...userMerged.aliases,
+  ...liveMerged.aliases,
 ]);
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
 export const API_MODELS = Object.freeze(

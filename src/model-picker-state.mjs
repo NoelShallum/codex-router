@@ -45,6 +45,9 @@ function readPickerState() {
     hidden: new Set(),
     visible: new Set(),
     seeded: new Set(),
+    autoHidden: new Set(),
+    hasAutoHiddenProvenance: false,
+    liveDefaultsMigrated: false,
     order: DEFAULT_PICKER_ORDER,
     hasExplicitVisibility: false,
     // "Nothing has ever been recorded here" and "the file says nothing is
@@ -60,6 +63,15 @@ function readPickerState() {
       new Set((Array.isArray(value) ? value : []).map((slug) => String(slug)).filter(Boolean));
     const hidden = slugs(parsed.hidden);
     const seeded = slugs(parsed.seeded);
+    // `autoHidden` records the narrower provenance of a default hide, so a
+    // later catalog policy can remove only its own default without guessing
+    // that a user hide was automatic. Entries that are no longer hidden carry
+    // no provenance worth keeping.
+    const autoHidden = new Set(
+      [...slugs(parsed.autoHidden)].filter((slug) => hidden.has(slug)),
+    );
+    const hasAutoHiddenProvenance = Array.isArray(parsed.autoHidden);
+    const liveDefaultsMigrated = parsed.liveDefaultsMigrated === true;
     // `visible` was added after version 1 shipped. For an older file, every
     // seeded model not in `hidden` is an explicit show decision and can be
     // reconstructed without changing the effective picker behavior.
@@ -71,7 +83,17 @@ function readPickerState() {
     // `order` was added after version 1 shipped; an older file keeps the
     // historical native-first placement, as does any unrecognized value.
     const order = normalizePickerOrder(parsed.order);
-    return { hidden, visible, seeded, order, hasExplicitVisibility, recognized: true };
+    return {
+      hidden,
+      visible,
+      seeded,
+      autoHidden,
+      hasAutoHiddenProvenance,
+      liveDefaultsMigrated,
+      order,
+      hasExplicitVisibility,
+      recognized: true,
+    };
   } catch {
     return empty;
   }
@@ -93,16 +115,28 @@ export function readVisibleModels() {
 // same rule every publisher applies, so a surface that offers the operator a
 // pre-filled list starts from what they are actually looking at rather than
 // from one of the two representations. A machine with no picker state has
-// decided nothing, and new router models are opt-in, so the answer there is
+// decided nothing; new router models are opt-in there, so the answer is
 // "none" -- not "all of them", which is what `hidden` being empty would say.
-export function effectiveVisibleModels(slugs) {
+// Auto-synced live models are the exception to the routed allowlist: they are
+// visible by default, but an explicit hide still wins. Static and curated
+// routed models retain the existing opt-in behavior.
+export function effectiveVisibleModels(slugs, { autoSyncedSlugs = [] } = {}) {
   const values = [...new Set(
     (Array.isArray(slugs) ? slugs : []).map((slug) => String(slug || "").trim()).filter(Boolean),
   )];
+  const autoSynced = new Set(
+    (Array.isArray(autoSyncedSlugs) ? autoSyncedSlugs : [...autoSyncedSlugs])
+      .map((slug) => String(slug || "").trim())
+      .filter(Boolean),
+  );
   const { hidden, visible, hasExplicitVisibility, recognized } = readPickerState();
-  if (!recognized) return new Set();
+  if (!recognized) return new Set(values.filter((value) => autoSynced.has(value)));
   return new Set(
-    values.filter((value) => (hasExplicitVisibility ? visible.has(value) : !hidden.has(value))),
+    values.filter((value) => {
+      if (hidden.has(value)) return false;
+      if (autoSynced.has(value)) return true;
+      return hasExplicitVisibility ? visible.has(value) : true;
+    }),
   );
 }
 
@@ -110,6 +144,8 @@ function writePickerState({
   hidden,
   visible,
   seeded,
+  autoHidden = new Set(),
+  liveDefaultsMigrated = false,
   order,
   hasExplicitVisibility = true,
 }) {
@@ -130,6 +166,8 @@ function writePickerState({
           ? { visible: [...visible].filter((slug) => !hidden.has(slug)).sort() }
           : {}),
         seeded: [...seeded].sort(),
+        autoHidden: [...autoHidden].filter((slug) => hidden.has(slug)).sort(),
+        liveDefaultsMigrated: liveDefaultsMigrated === true,
         // The default is omitted so a file nobody has reordered stays
         // byte-identical to what earlier builds wrote.
         ...(effectiveOrder !== DEFAULT_PICKER_ORDER ? { order: effectiveOrder } : {}),
@@ -150,6 +188,8 @@ export function modelPickerSnapshot() {
   return {
     hidden: [...state.hidden].sort(),
     visible: [...state.visible].sort(),
+    autoHidden: [...state.autoHidden].sort(),
+    liveDefaultsMigrated: state.liveDefaultsMigrated,
     order: state.order,
     hasExplicitVisibility: state.hasExplicitVisibility,
     path: MODEL_PICKER_STATE_PATH,
@@ -180,8 +220,11 @@ export function setModelVisible(slug, visible) {
 export function setModelsVisible(slugs, visible) {
   const values = [...new Set(slugs.map((slug) => String(slug || "").trim()).filter(Boolean))];
   if (values.length === 0) throw new Error("At least one model slug is required.");
-  const { hidden, visible: visibleSet, seeded } = readPickerState();
+  const { hidden, visible: visibleSet, seeded, autoHidden, liveDefaultsMigrated } = readPickerState();
   for (const value of values) {
+    // The operator just decided this one, so any shipped-default provenance
+    // recorded earlier stops applying to it.
+    autoHidden.delete(value);
     if (visible) {
       hidden.delete(value);
       visibleSet.add(value);
@@ -193,7 +236,7 @@ export function setModelsVisible(slugs, visible) {
     // shipped default from quietly undoing the decision later.
     seeded.add(value);
   }
-  return writePickerState({ hidden, visible: visibleSet, seeded });
+  return writePickerState({ hidden, visible: visibleSet, seeded, autoHidden, liveDefaultsMigrated });
 }
 
 // Move an operator's picker decision when a curated model's routing identity
@@ -210,12 +253,20 @@ export function migrateModelVisibility(replacements) {
     .filter(({ from, to }) => from && to && from !== to);
   if (pairs.length === 0) return modelPickerSnapshot();
 
-  const { hidden, visible, seeded, hasExplicitVisibility } = readPickerState();
+  const {
+    hidden,
+    visible,
+    seeded,
+    autoHidden,
+    liveDefaultsMigrated,
+    hasExplicitVisibility,
+  } = readPickerState();
   let changed = false;
   for (const { from, to } of pairs) {
     const sourceHidden = hidden.has(from);
     const sourceVisible = visible.has(from);
     const sourceSeeded = seeded.has(from);
+    const sourceAutoHidden = autoHidden.has(from);
     if (!sourceHidden && !sourceVisible && !sourceSeeded) continue;
 
     // `seeded` records decisions this code made; a hand-edited state file can
@@ -226,12 +277,14 @@ export function migrateModelVisibility(replacements) {
     hidden.delete(from);
     visible.delete(from);
     seeded.delete(from);
+    autoHidden.delete(from);
     changed = true;
 
     if (!destinationDecided) {
       if (sourceHidden) {
         hidden.add(to);
         visible.delete(to);
+        if (sourceAutoHidden) autoHidden.add(to);
       } else if (sourceVisible) {
         hidden.delete(to);
         visible.add(to);
@@ -240,7 +293,7 @@ export function migrateModelVisibility(replacements) {
     if (sourceSeeded) seeded.add(to);
   }
   return changed
-    ? writePickerState({ hidden, visible, seeded, hasExplicitVisibility })
+    ? writePickerState({ hidden, visible, seeded, autoHidden, liveDefaultsMigrated, hasExplicitVisibility })
     : modelPickerSnapshot();
 }
 
@@ -269,17 +322,30 @@ export function forgetModelVisibility(slugs) {
 
 export function setAllModelsVisible(slugs, visible) {
   const known = [...new Set(slugs.map((slug) => String(slug).trim()).filter(Boolean))];
-  const { hidden: currentHidden, visible: currentVisible, seeded } = readPickerState();
+  const {
+    hidden: currentHidden,
+    visible: currentVisible,
+    seeded,
+    autoHidden,
+    liveDefaultsMigrated,
+  } = readPickerState();
   const hiddenModels = visible
     ? new Set([...currentHidden].filter((slug) => !known.includes(slug)))
     : new Set([...currentHidden, ...known]);
   const visibleModels = visible
     ? new Set([...currentVisible, ...known])
     : new Set([...currentVisible].filter((slug) => !known.includes(slug)));
+  // An operator-level bulk action is a decision for exactly these slugs, so
+  // their automatic provenance is dropped along with the hide itself.
+  const automaticHidden = new Set(
+    [...autoHidden].filter((slug) => !known.includes(slug)),
+  );
   return writePickerState({
     hidden: hiddenModels,
     visible: visibleModels,
     seeded: new Set([...seeded, ...known]),
+    autoHidden: automaticHidden,
+    liveDefaultsMigrated,
   });
 }
 
@@ -303,8 +369,9 @@ export function setModelSelection(slugs, selectedSlugs) {
       .map((slug) => String(slug || "").trim())
       .filter(Boolean),
   );
-  const { hidden, visible, seeded, hasExplicitVisibility } = readPickerState();
+  const { hidden, visible, seeded, autoHidden, liveDefaultsMigrated, hasExplicitVisibility } = readPickerState();
   for (const value of values) {
+    autoHidden.delete(value);
     if (selected.has(value)) {
       hidden.delete(value);
       visible.add(value);
@@ -314,7 +381,7 @@ export function setModelSelection(slugs, selectedSlugs) {
     }
     seeded.add(value);
   }
-  return writePickerState({ hidden, visible, seeded, hasExplicitVisibility });
+  return writePickerState({ hidden, visible, seeded, autoHidden, liveDefaultsMigrated, hasExplicitVisibility });
 }
 
 // Bridges one install from the pre-allowlist file format, exactly once.
@@ -339,7 +406,15 @@ export function setModelSelection(slugs, selectedSlugs) {
 // guessing on its behalf would switch models back on that someone switched
 // off.
 export function migrateLegacyVisibleModels(slugs) {
-  const { hidden, visible, seeded, hasExplicitVisibility, recognized } = readPickerState();
+  const {
+    hidden,
+    visible,
+    seeded,
+    autoHidden,
+    liveDefaultsMigrated,
+    hasExplicitVisibility,
+    recognized,
+  } = readPickerState();
   if (!recognized || hasExplicitVisibility) return modelPickerSnapshot();
   const values = [...new Set(
     (Array.isArray(slugs) ? slugs : []).map((slug) => String(slug || "").trim()).filter(Boolean),
@@ -352,7 +427,7 @@ export function migrateLegacyVisibleModels(slugs) {
     // immediately below would still read these slugs as never-decided.
     seeded.add(value);
   }
-  return writePickerState({ hidden, visible, seeded });
+  return writePickerState({ hidden, visible, seeded, autoHidden, liveDefaultsMigrated });
 }
 
 // Applies a shipped default to models the operator has never decided, and only
@@ -367,13 +442,60 @@ export function seedModelsHidden(slugs) {
   const values = [...new Set(
     (Array.isArray(slugs) ? slugs : []).map((slug) => String(slug || "").trim()).filter(Boolean),
   )];
-  const { hidden, visible, seeded, hasExplicitVisibility } = readPickerState();
+  const { hidden, visible, seeded, autoHidden, liveDefaultsMigrated, hasExplicitVisibility } = readPickerState();
   const fresh = values.filter((value) => !seeded.has(value));
   if (fresh.length === 0) return modelPickerSnapshot();
   for (const value of fresh) {
     hidden.add(value);
     visible.delete(value);
     seeded.add(value);
+    autoHidden.add(value);
   }
-  return writePickerState({ hidden, visible, seeded, hasExplicitVisibility });
+  return writePickerState({ hidden, visible, seeded, autoHidden, liveDefaultsMigrated, hasExplicitVisibility });
+}
+
+// Promote automatic hides when a model becomes live-synced. The first live
+// rollout needs a one-time compatibility migration: the previous catalog
+// build could only persist `hidden`/`seeded`, and had just default-hidden live
+// routes without recording why. Once this function writes the rollout marker,
+// later explicit hides have durable provenance and are never undone. Generic
+// static hidden+seeded entries are not included in `slugs`, so they remain
+// untouched.
+export function migrateAutoSyncedModels(slugs) {
+  const values = [...new Set(
+    (Array.isArray(slugs) ? slugs : []).map((slug) => String(slug || "").trim()).filter(Boolean),
+  )];
+  const {
+    hidden,
+    visible,
+    seeded,
+    autoHidden,
+    hasAutoHiddenProvenance,
+    liveDefaultsMigrated,
+    hasExplicitVisibility,
+    recognized,
+  } =
+    readPickerState();
+  if (!recognized) return modelPickerSnapshot();
+  const migrated = liveDefaultsMigrated
+    ? values.filter((value) => autoHidden.has(value))
+    : values.filter((value) => hidden.has(value) && seeded.has(value));
+  // Persist the provenance field even when this particular catalog has no
+  // legacy live entries. This makes the rollout migration one-shot and
+  // prevents an old hidden+seeded decision from being reinterpreted later.
+  if (migrated.length === 0 && liveDefaultsMigrated) return modelPickerSnapshot();
+  for (const value of migrated) {
+    if (liveDefaultsMigrated || hasAutoHiddenProvenance) autoHidden.delete(value);
+    hidden.delete(value);
+    visible.add(value);
+    seeded.add(value);
+  }
+  return writePickerState({
+    hidden,
+    visible,
+    seeded,
+    autoHidden,
+    liveDefaultsMigrated: true,
+    hasExplicitVisibility,
+  });
 }

@@ -41,7 +41,9 @@ import {
   subagentEligibleModels,
 } from "./multi-agent-state.mjs";
 import {
+  effectiveVisibleModels,
   migrateLegacyVisibleModels,
+  migrateAutoSyncedModels,
   migrateModelVisibility,
   modelPickerSnapshot,
   readHiddenModels,
@@ -854,10 +856,11 @@ function pickerProviderGroup(provider) {
   if (value === "antigravity-oauth") return { rank: 0, key: "antigravity" };
   if (value === "deepseek") return { rank: 1, key: "deepseek" };
   // The opencode family shares one stored key: `opencode-go` and its variants
-  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen`). Group
-  // them together so Zen models stay next to the Go models they relate to
-  // instead of falling into the rank-3 catch-all under their own key.
-  if (value.startsWith("opencode-go") || value === "opencode-zen") {
+  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen`, and its
+  // protocol variants). Group them together so Zen models stay next to the Go
+  // models they relate to instead of falling into the rank-3 catch-all under
+  // their own key.
+  if (value.startsWith("opencode-go") || value.startsWith("opencode-zen")) {
     return { rank: 2, key: "opencode" };
   }
   return { rank: 3, key: value };
@@ -1113,7 +1116,27 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
   // native-looking slots are router aliases and retain the existing behavior.
   // Only slugs with no recorded decision are touched, so no later rebuild can
   // undo an operator's choice.
-  const routedSeedSlugs = loginFree ? [] : selectedModels.map((model) => String(model.slug));
+  //
+  // Keep the two sets separate. If a live slug is passed to seedModelsHidden,
+  // it becomes hidden+seeded and an explicit picker allowlist will hide it on
+  // every later rebuild. If a static route is treated as live, it would become
+  // visible without the operator's opt-in. Both mistakes are easy to make when
+  // the registry is refreshed, so derive the policy directly from autoSynced.
+  const autoSyncedRoutedSlugs = loginFree
+    ? []
+    : selectedModels
+      .filter((model) => model.autoSynced === true)
+      .map((model) => String(model.slug));
+  const routedSeedSlugs = loginFree
+    ? []
+    : selectedModels
+      .filter((model) => model.autoSynced !== true)
+      .map((model) => String(model.slug));
+  // Run before any older picker migration can rewrite a legacy state file and
+  // add the new provenance field. This is a one-time compatibility bridge for
+  // live routes that the previous build default-hidden without distinguishing
+  // that default from a user hide.
+  migrateAutoSyncedModels(autoSyncedRoutedSlugs);
   // First, though: an install that predates the allowlist recorded only what
   // was switched off, so its routed models are absent from `seeded` and the
   // opt-in default below would read "visible, never written down" as "never
@@ -1130,6 +1153,10 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
   const hiddenModels = readHiddenModels();
   const pickerState = modelPickerSnapshot();
   const visibleModels = new Set(pickerState.visible);
+  const autoSyncedVisibleModels = effectiveVisibleModels(
+    autoSyncedRoutedSlugs,
+    { autoSyncedSlugs: autoSyncedRoutedSlugs },
+  );
   const multiAgentSettings = readMultiAgentSettings();
   // Settings can disable a certified route. A v2 claim itself comes from one
   // of exactly two places: the checked-in registry route, or a completed local
@@ -1243,9 +1270,12 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
         // A state file written by the new picker carries positive selections.
         // Older installs had only `hidden`; preserve their behavior until an
         // operator makes a picker change, at which point the write records the
-        // explicit allowlist permanently.
+        // explicit allowlist permanently. Auto-synced live routes are visible
+        // by default there, but an operator's explicit hide still wins.
         const selected = pickerState.hasExplicitVisibility
-          ? visibleModels.has(policySlug)
+          ? (autoSyncedVisibleModels.has(policySlug)
+              ? !hidden
+              : visibleModels.has(policySlug))
           : !hidden;
         return routerManaged && (hidden || !selected)
           ? { ...model, visibility: "hide" }
