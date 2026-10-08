@@ -158,3 +158,14 @@ test("openCodeSessionHeaders returns the wire header shape", () => {
     [OPENCODE_SESSION_HEADER]: "codex-router-discovery",
   });
 });
+
+test("an array-valued explicit session header uses its trimmed first entry", () => {
+  assert.equal(
+    resolveOpenCodeSessionId({ headers: { [OPENCODE_SESSION_HEADER.toUpperCase()]: ["  ses_abc  ", "ses_other"] } }),
+    "ses_abc",
+  );
+  assert.notEqual(
+    resolveOpenCodeSessionId({ headers: { [OPENCODE_SESSION_HEADER]: [""] }, body: { messages: [{ role: "user", content: "hi" }] } }),
+    "",
+  );
+});

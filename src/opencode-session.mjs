@@ -25,13 +25,12 @@ export function isOpenCodeProvider(provider) {
 }
 
 export function resolveOpenCodeSessionId({ headers = {}, body, fallback } = {}) {
-  const explicit = Object.entries(headers || {}).find(
-    ([name, value]) =>
-      name.toLowerCase() === OPENCODE_SESSION_HEADER &&
-      typeof value === "string" &&
-      value.trim().length > 0,
-  )?.[1];
-  if (explicit) return explicit.trim();
+  const explicit = Object.entries(headers || {}).find(([name, value]) => {
+    if (name.toLowerCase() !== OPENCODE_SESSION_HEADER) return false;
+    const candidate = Array.isArray(value) ? value[0] : value;
+    return typeof candidate === "string" && candidate.trim().length > 0;
+  })?.[1];
+  if (explicit) return (Array.isArray(explicit) ? explicit[0] : explicit).trim();
 
   const fromThread = threadIdFromHeaders(headers);
   if (fromThread) return fromThread;

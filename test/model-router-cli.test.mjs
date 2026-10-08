@@ -126,3 +126,11 @@ test("both dispatchers expose caller capability rotation", () => {
     /"caller-key"\s*\{\s*Invoke-RouterNode "src\\caller-key\.mjs" \$Arguments/,
   );
 });
+
+test("top-level --help and -h print usage and exit 0", () => {
+  for (const flag of ["--help", "-h"]) {
+    const result = spawnSync("sh", [path.join(root, "bin", "model-router"), flag], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout + result.stderr, /Usage|usage/);
+  }
+});

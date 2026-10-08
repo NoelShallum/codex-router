@@ -18,6 +18,7 @@ import test from "node:test";
 import {
   SHIM_MARKER,
   chooseShimDirectory,
+  floatingStandaloneCodex,
   installShim,
   isShimFile,
   renderShim,
@@ -347,6 +348,54 @@ test("resolveRealCodex reports nothing when the only codex on PATH is a shim", (
     // Honest "none" rather than handing back the shim: a caller that spawned it
     // would restart the router, which is the loop this filter exists to break.
     assert.equal(resolveRealCodex({ PATH: only }), null);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("floatingStandaloneCodex prefers an executable standalone current/bin/codex", () => {
+  const home = scratch();
+  try {
+    const base = path.join(home, ".codex", "packages", "standalone");
+    const release = path.join(base, "releases", "1.0.0-x86_64", "bin");
+    const current = path.join(base, "current", "bin");
+    mkdirSync(release, { recursive: true });
+    mkdirSync(current, { recursive: true });
+    writeFileSync(path.join(release, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(current, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+    assert.equal(
+      floatingStandaloneCodex(path.join(release, "codex")),
+      path.join(current, "codex"),
+    );
+    assert.equal(floatingStandaloneCodex(path.join(home, "npm-global", "bin", "codex")), null);
+    rmSync(path.join(current, "codex"));
+    assert.equal(floatingStandaloneCodex(path.join(release, "codex")), null);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a shim pinned to an old standalone release follows the advanced current binary", () => {
+  const home = scratch();
+  try {
+    const base = path.join(home, "packages", "standalone");
+    for (const [dir, version] of [["releases/1.0.0/bin", "old"], ["current/bin", "new"]]) {
+      mkdirSync(path.join(base, dir), { recursive: true });
+      writeFileSync(path.join(base, dir, "codex"), `#!/bin/sh\necho ${version} "$@"\n`, { mode: 0o755 });
+    }
+    const shim = renderShim({
+      realCodex: path.join(base, "releases", "1.0.0", "bin", "codex"),
+      checkout: path.join(home, "checkout"),
+      strict: false,
+      nodeBin: process.execPath,
+    });
+    const shimPath = path.join(home, "codex");
+    writeFileSync(shimPath, shim, { mode: 0o755 });
+    const out = execFileSync("sh", [shimPath, "--version"], {
+      encoding: "utf8",
+      env: { ...process.env, MODEL_ROUTER_SHIM_WAIT: "0", MODEL_ROUTER_SHIM: "0" },
+    });
+    assert.match(out, /new --version/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

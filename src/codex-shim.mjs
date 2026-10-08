@@ -82,6 +82,37 @@ export function isStrictShimFile(candidate) {
 }
 
 /**
+ * Prefer the floating standalone `current` symlink over a pinned release.
+ *
+ * Standalone Codex keeps versioned releases behind:
+ *   ~/.codex/packages/standalone/current -> releases/<version>-<target>
+ *   ~/.local/bin/codex -> .../standalone/current/bin/codex
+ *
+ * `installShim` resolves symlinks with realpath, which turns the floating
+ * path into `releases/<version>/bin/codex` at install time. `codex update`
+ * then advances `current`, but the shim keeps execing the old release, so
+ * `--version` looks stuck. Return the floating `current/bin/codex` path when
+ * the resolved binary lives under `packages/standalone/releases` and the
+ * floating counterpart exists and is executable. Returns null otherwise (npm,
+ * Homebrew, custom installs), preserving the existing realpath behavior.
+ */
+export function floatingStandaloneCodex(resolved) {
+  const marker = `${path.sep}packages${path.sep}standalone${path.sep}releases${path.sep}`;
+  const text = String(resolved);
+  const idx = text.indexOf(marker);
+  if (idx === -1) return null;
+  const prefix = text.slice(0, idx);
+  const floating = path.join(prefix, "packages", "standalone", "current", "bin", "codex");
+  try {
+    if (!statSync(floating).isFile()) return null;
+    accessSync(floating, constants.X_OK);
+    return floating;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Find the real `codex` on PATH, ignoring any shim we installed.
  *
  * Returns `{ file, directory, index }` where `index` is the position of its
@@ -170,6 +201,17 @@ CODEX_BIN=${shellQuote(realCodex)}
 ROUTER_NODE=${shellQuote(nodeBin)}
 # Seconds to wait for a cold router before giving up and starting Codex anyway.
 ROUTER_WAIT=\${MODEL_ROUTER_SHIM_WAIT:-45}
+
+# Standalone installs keep versioned releases behind a floating 'current'
+# symlink. Prefer it when present so 'codex update' takes effect without
+# reinstalling the shim. Harmless for npm/Homebrew installs (no match, no-op).
+if case "$CODEX_BIN" in */packages/standalone/releases/*/bin/codex) true;; *) false;; esac; then
+  _floating="\${CODEX_BIN%%/packages/standalone/releases/*}/packages/standalone/current/bin/codex"
+  if [ -x "$_floating" ]; then
+    CODEX_BIN="$_floating"
+  fi
+  unset _floating
+fi
 
 # Recorded at install time, but npm reinstalls and version managers move things.
 # Fall back to a PATH search that skips this shim rather than failing outright.
@@ -335,6 +377,17 @@ export function installShim({
     recorded = realpathSync(real.file);
   } catch {
     // A dangling link is the caller's problem to fix; record what we were told.
+  }
+
+  // Standalone Codex floats `current -> releases/<version>` on every update.
+  // Recording the resolved version would pin the shim forever, so prefer the
+  // floating path when this looks like a standalone install. npm/Homebrew
+  // paths fall through unchanged.
+  try {
+    const floating = floatingStandaloneCodex(recorded);
+    if (floating) recorded = floating;
+  } catch {
+    // Keep the resolved path; the shim's PATH fallback still finds a real Codex.
   }
 
   writeFileSync(target, renderShim({ realCodex: recorded, checkout, strict, nodeBin }), { mode: 0o755 });

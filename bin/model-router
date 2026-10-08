@@ -63,6 +63,11 @@ Examples:
 EOF
 }
 
+if [ "$#" -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+  usage
+  exit 0
+fi
+
 version() {
   node -p 'require(process.argv[1]).version' "$repo_dir/package.json"
 }
