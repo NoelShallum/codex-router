@@ -27,6 +27,8 @@ Neither command prints credential values. Repair refuses unknown router owners.
 
 **Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
 
+**Fresh boots refresh first.** `service start` (the call the tray makes when Codex or ChatGPT desktop appears) runs a best-effort live pass — OpenCode Go/Zen snapshot, then a drift-aware merged-catalog publish — before the gateway boots. A failed or offline step only logs and never blocks the service; `MODEL_ROUTER_SERVICE_REFRESH=0` skips the pass. A running client still needs the full quit/reopen above to pick up the new rows.
+
 Expected flow:
 1. OpenAI releases new native (e.g., GPT-7)
 2. Router observes a changed account catalog, or Codex replaces its bundled/runtime executable

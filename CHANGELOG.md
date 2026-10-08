@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Service boots refresh live models first.** `service start` (the call the tray makes when Codex or ChatGPT desktop appears) runs a best-effort pass before the gateway boots: the OpenCode Go/Zen snapshot, then a drift-aware merged-catalog publish that also picks up new Codex natives. Any failed step only logs and never blocks the service; `MODEL_ROUTER_SERVICE_REFRESH=0` skips the pass. Fully quit and reopen the desktop client afterwards — Codex reads its catalog once at startup.
 - **Google Cloud Vertex AI is a catalog-only provider.** It authenticates with
   Application Default Credentials from `gcloud auth application-default login`
   (never a stored API key or a silent `gcloud auth login` user token), honors

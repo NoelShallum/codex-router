@@ -22,6 +22,90 @@ if (!script) {
 const mutatingCommands = new Set(["install", "uninstall", "start", "stop", "restart"]);
 const readinessCommands = new Set(["install", "start", "restart"]);
 const shutdownCommands = new Set(["stop", "uninstall"]);
+// MODEL_ROUTER_SERVICE_REFRESH=0 skips the pass (e.g. air-gapped boots).
+// `install` is excluded: setup owns its publication flow.
+const SERVICE_OPENCODE_TIMEOUT_MS = 90_000;
+const SERVICE_CATALOG_TIMEOUT_MS = 120_000;
+
+export function serviceCatalogRefreshSkipped(env = process.env) {
+  return env.MODEL_ROUTER_SERVICE_REFRESH === "0";
+}
+
+function refreshStepError(detail) {
+  const stderr = String(detail?.stderr || "").trim().split("\n").filter(Boolean);
+  const tail = stderr.slice(-2).join(" | ").slice(0, 300);
+  if (detail?.error) return detail.error.message || String(detail.error);
+  if (detail?.signal) return `terminated with ${detail.signal}${tail ? `: ${tail}` : ""}`;
+  if (typeof detail?.status === "number" && detail.status !== 0) {
+    return `exited with status ${detail.status}${tail ? `: ${tail}` : ""}`;
+  }
+  return tail || "failed";
+}
+
+// Best-effort live refresh before a service boot: OpenCode Go/Zen snapshot,
+// then a drift-aware merged-catalog publish (which also picks up a refreshed
+// Codex account cache). Each step is isolated; none throws.
+export function refreshServiceCatalogs({
+  spawn = spawnSync,
+  env = process.env,
+  sourceRoot = SOURCE_ROOT,
+  nodeBinary = process.execPath,
+  opencodeTimeoutMs = SERVICE_OPENCODE_TIMEOUT_MS,
+  catalogTimeoutMs = SERVICE_CATALOG_TIMEOUT_MS,
+} = {}) {
+  if (serviceCatalogRefreshSkipped(env)) return { skipped: true, steps: [] };
+  const childEnvironment = { ...env, MODEL_ROUTER_TARGET: "codex" };
+  const steps = [];
+  for (const step of [
+    { name: "opencode-live", script: "opencode-live-sync.mjs", timeoutMs: opencodeTimeoutMs },
+    { name: "catalog", script: "catalog.mjs", timeoutMs: catalogTimeoutMs },
+  ]) {
+    let ok = false;
+    let detail = "";
+    try {
+      const result = spawn(
+        nodeBinary,
+        [path.join(sourceRoot, "src", step.script)],
+        { encoding: "utf8", env: childEnvironment, timeout: step.timeoutMs },
+      );
+      ok = result?.status === 0;
+      if (!ok) detail = refreshStepError(result);
+    } catch (error) {
+      detail = error instanceof Error ? error.message : String(error);
+    }
+    steps.push({ step: step.name, ok, ...(detail ? { detail } : {}) });
+    if (!ok) {
+      console.error(
+        `[codex-router] service-start ${step.name} refresh skipped (${detail}); starting with the cached catalog.`,
+      );
+    }
+  }
+  return { skipped: false, steps };
+}
+
+function serviceReportsRunning({ status, loaded, state } = {}) {
+  if (loaded === true) return true;
+  return state === "active" || state === "Running" || state === "running";
+}
+export function serviceIsRunning({
+  spawn = spawnSync,
+  nodeBinary = process.execPath,
+  sourceRoot = SOURCE_ROOT,
+  env = process.env,
+  scriptName = script,
+} = {}) {
+  try {
+    const status = spawn(
+      nodeBinary,
+      [path.join(sourceRoot, "src", scriptName), "status"],
+      { encoding: "utf8", env },
+    );
+    if (status?.status !== 0) return false;
+    return serviceReportsRunning(JSON.parse(status?.stdout || "{}"));
+  } catch {
+    return false;
+  }
+}
 // start.mjs allows the LiteLLM gateway 300s to cold start, so the readiness
 // wait has to cover at least that. A shorter wait reports failure while the
 // service is still booting, and the installer's rollback then uninstalls the
@@ -78,6 +162,20 @@ export async function runServiceCommandUnlocked(
     throw new Error(
       "The service operation deadline cannot preserve its platform and 300-second readiness allowances.",
     );
+  }
+  // Refresh live model catalogs before a fresh boot so a desktop open behind
+  // a stopped router sees new models, not the last published snapshot. The
+  // refresh is best-effort and fail-open: it never blocks the service itself.
+  // `install` is excluded: setup owns its publication flow. `restart` skips
+  // the pass when the service is already live: the running gateway depends on
+  // the snapshot it booted with, and a failed refresh would pair the old
+  // process (old snapshot) with a rewritten merged catalog on disk.
+  if (command === "start") refreshServiceCatalogs({ env: childEnvironment });
+  if (
+    command === "restart" &&
+    !serviceIsRunning({ env: childEnvironment })
+  ) {
+    refreshServiceCatalogs({ env: childEnvironment });
   }
   const result = spawnSync(
     process.execPath,
