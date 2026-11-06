@@ -731,6 +731,7 @@ class ResponsesWebSocketPeer {
     this.abortController = new AbortController();
     this.continuations = new Map();
     this.turnState = undefined;
+    this.activeTurn = undefined;
   }
 
   start(head) {
@@ -914,13 +915,27 @@ class ResponsesWebSocketPeer {
   }
 
   enqueue(text) {
+    let request;
+    let parsed = true;
+    try {
+      request = JSON.parse(text);
+    } catch {
+      parsed = false;
+    }
+    // An interrupt belongs to the response the socket is currently streaming.
+    // Serializing it behind that request would make it arrive only after the
+    // turn it was meant to stop, so it is handled at the frame boundary.
+    if (parsed && request && !Array.isArray(request) && request.type === "response.interrupt") {
+      this.interrupt(request);
+      return;
+    }
     this.pendingRequests += 1;
     if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
       this.fail(1008, "Too many queued Responses requests.");
       return;
     }
     this.queue = this.queue
-      .then(() => this.process(text))
+      .then(() => this.process(request, parsed))
       .catch(() => {
         if (!this.closed) {
           this.sendError(500, {
@@ -934,12 +949,143 @@ class ResponsesWebSocketPeer {
       });
   }
 
-  async process(text) {
+  sendInterruptAccepted(turn) {
+    if (this.closed || !turn.responseId) return;
+    turn.lastSequenceNumber += 1;
+    this.sendJson({
+      type: "response.interrupt.accepted",
+      response_id: turn.responseId,
+      sequence_number: turn.lastSequenceNumber,
+    });
+  }
+
+  interrupt(request) {
+    const responseId = typeof request.response_id === "string" ? request.response_id : "";
+    if (!responseId) {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        message: "response.interrupt requires a response_id.",
+      });
+      return;
+    }
+    const turn = this.activeTurn;
+    if (!turn || turn.responseId !== responseId) {
+      // The official server acknowledges only a response that is still active.
+      // Codex correlates the failure by response_id and ends the interrupted
+      // turn instead of leaving it waiting for an acknowledgement.
+      this.sendJson({
+        type: "response.interrupt.failed",
+        response_id: responseId,
+        error: {
+          type: "invalid_request_error",
+          code: "response_not_found",
+          message: "The response is no longer active.",
+        },
+      });
+      return;
+    }
+    if (!turn.terminalSeen && !turn.finalized && !turn.interrupt) {
+      turn.interrupt = {
+        mode: typeof request.mode === "string" ? request.mode : undefined,
+      };
+      turn.controller.abort(new Error("Responses response interrupted."));
+    }
+    this.sendInterruptAccepted(turn);
+  }
+
+  trackEvent(turn, event) {
+    if (Number.isSafeInteger(event.sequence_number)) {
+      turn.lastSequenceNumber = Math.max(turn.lastSequenceNumber, event.sequence_number);
+    }
+    if (event.response && typeof event.response === "object" && !Array.isArray(event.response)) {
+      turn.response = event.response;
+      if (typeof event.response.id === "string" && event.response.id) {
+        turn.responseId = event.response.id;
+      }
+    }
+    if (event.type === "response.output_item.added" && event.item) {
+      const outputIndex = Number.isInteger(event.output_index)
+        ? event.output_index
+        : turn.openItems.size;
+      const itemId = typeof event.item.id === "string"
+        ? event.item.id
+        : typeof event.item_id === "string"
+          ? event.item_id
+          : undefined;
+      turn.openItems.set(outputIndex, { id: itemId, output_index: outputIndex });
+      return;
+    }
+    if (event.type !== "response.output_item.done" || !event.item) return;
+    if (Number.isInteger(event.output_index)) {
+      turn.openItems.delete(event.output_index);
+    } else {
+      for (const [outputIndex, item] of turn.openItems) {
+        if (event.item.id && item.id === event.item.id) turn.openItems.delete(outputIndex);
+      }
+    }
+    const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
+    if (turn.outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
+      turn.outputItems.push(event.item);
+      turn.outputItemsBytes += itemBytes;
+    } else {
+      turn.continuationOverflow = true;
+    }
+  }
+
+  async finishInterrupted(turn, fullRequest) {
+    if (turn.finalized || turn.terminalSeen || !turn.responseId) return;
+    turn.finalized = true;
+    if (turn.interrupt?.mode === "discard_partial_items") {
+      const items = [...turn.openItems.values()].sort(
+        (left, right) => left.output_index - right.output_index,
+      );
+      for (const item of items) {
+        if (!item.id) continue;
+        turn.lastSequenceNumber += 1;
+        if (!(await this.sendJsonWithBackpressure({
+          type: "response.output_item.interrupted",
+          response_id: turn.responseId,
+          item_id: item.id,
+          output_index: item.output_index,
+          sequence_number: turn.lastSequenceNumber,
+        }))) return;
+      }
+    }
+    turn.openItems.clear();
+    // Codex continues an interrupted turn with previous_response_id as soon
+    // as it sees the terminal event, so the resumable history must be in place
+    // before that frame can leave the socket.
+    this.continuations.clear();
+    const continuation = !turn.continuationOverflow
+      ? continuationState(
+        fullRequest.input,
+        turn.outputItems,
+        this.options.maxContinuationBytes,
+      )
+      : undefined;
+    if (continuation) this.continuations.set(turn.responseId, continuation);
+    const response = {
+      ...(turn.response && typeof turn.response === "object" && !Array.isArray(turn.response)
+        ? turn.response
+        : {}),
+      id: turn.responseId,
+      object: "response",
+      status: "incomplete",
+      incomplete_details: { reason: "interrupted" },
+      output: turn.outputItems,
+    };
+    turn.lastSequenceNumber += 1;
+    turn.terminalSeen = true;
+    await this.sendJsonWithBackpressure({
+      type: "response.incomplete",
+      response,
+      sequence_number: turn.lastSequenceNumber,
+    });
+  }
+
+  async process(request, parsed) {
     if (this.closed) return;
-    let request;
-    try {
-      request = JSON.parse(text);
-    } catch {
+    if (!parsed) {
       this.sendError(400, {
         type: "invalid_request_error",
         message: "Responses WebSocket messages must contain valid JSON.",
@@ -1026,6 +1172,22 @@ class ResponsesWebSocketPeer {
     }
 
     const controller = new AbortController();
+    const turn = {
+      responseId: undefined,
+      response: undefined,
+      controller,
+      openItems: new Map(),
+      outputItems: [],
+      outputItemsBytes: 0,
+      continuationOverflow: false,
+      lastSequenceNumber: -1,
+      interrupt: undefined,
+      terminalSeen: false,
+      terminalFailure: false,
+      completedResponse: undefined,
+      finalized: false,
+    };
+    this.activeTurn = turn;
     const onClose = () => controller.abort(this.abortController.signal.reason);
     this.abortController.signal.addEventListener("abort", onClose, { once: true });
     let upstream;
@@ -1109,17 +1271,30 @@ class ResponsesWebSocketPeer {
           return;
         }
         if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
+        turn.responseId = completedResponse.id;
+        turn.response = completedResponse;
         if (!(await this.sendJsonWithBackpressure({
           type: "response.created",
           response: { ...completedResponse, status: "in_progress", output: [] },
         }))) return;
         for (const [outputIndex, item] of completedResponse.output.entries()) {
+          if (turn.interrupt) break;
+          this.trackEvent(turn, {
+            type: "response.output_item.done",
+            output_index: outputIndex,
+            item,
+          });
           if (!(await this.sendJsonWithBackpressure({
             type: "response.output_item.done",
             output_index: outputIndex,
             item,
           }))) return;
         }
+        if (turn.interrupt) {
+          await this.finishInterrupted(turn, fullRequest);
+          return;
+        }
+        turn.terminalSeen = true;
         if (!(await this.sendJsonWithBackpressure({
           type: "response.completed",
           response: completedResponse,
@@ -1134,12 +1309,6 @@ class ResponsesWebSocketPeer {
         return;
       }
       if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
-      const outputItems = [];
-      let outputItemsBytes = 0;
-      let continuationOverflow = false;
-      let completed;
-      let terminalFailure = false;
-      let terminalSeen = false;
       await relaySse(
         upstream.body,
         async (data) => {
@@ -1156,7 +1325,10 @@ class ResponsesWebSocketPeer {
           // logical response. Drain the HTTP body for clean accounting and
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
-          if (terminalSeen) return true;
+          if (turn.terminalSeen) return true;
+          // Once interrupted, the router owns the terminal sequence: stop
+          // forwarding upstream frames and synthesize the interrupted tail.
+          if (turn.interrupt) return false;
           // Native Codex maps WebSocket `error` events only when they carry
           // an HTTP failure status. SSE can instead signal failure by ending
           // its body; the persistent socket has no such turn boundary.
@@ -1164,24 +1336,17 @@ class ResponsesWebSocketPeer {
               !(Number.isInteger(event.status) && event.status >= 400 && event.status <= 599)) {
             event = { ...event, status: 502 };
           }
+          const terminal = event.type === "response.completed" ||
+            ["error", "response.failed", "response.incomplete"].includes(event.type);
+          if (terminal) turn.terminalSeen = true;
+          this.trackEvent(turn, event);
           if (!(await this.sendJsonWithBackpressure(event))) return false;
-          if (event.type === "response.output_item.done" && event.item) {
-            const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
-            if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
-              outputItems.push(event.item);
-              outputItemsBytes += itemBytes;
-            } else {
-              continuationOverflow = true;
-            }
-          }
           if (event.type === "response.completed") {
-            completed = event.response;
-            terminalSeen = true;
+            turn.completedResponse = event.response;
             return true;
           }
-          if (["error", "response.failed", "response.incomplete"].includes(event.type)) {
-            terminalFailure = true;
-            terminalSeen = true;
+          if (terminal) {
+            turn.terminalFailure = true;
             // Codex ends the turn on this event and may send its retry on the
             // same socket, where it queues behind this drain. A gateway that
             // holds the stream open after a failure must not stall that retry.
@@ -1195,25 +1360,32 @@ class ResponsesWebSocketPeer {
           maxEventBytes: this.options.maxEventBytes,
         },
       );
-      if (completed?.id && !terminalFailure) {
-        const output = reconciledContinuationOutput(completed.output, outputItems);
+      if (turn.interrupt && !turn.terminalSeen) {
+        await this.finishInterrupted(turn, fullRequest);
+      } else if (turn.completedResponse?.id && !turn.terminalFailure) {
+        const output = reconciledContinuationOutput(
+          turn.completedResponse.output,
+          turn.outputItems,
+        );
         this.continuations.clear();
-        const continuation = !continuationOverflow
+        const continuation = !turn.continuationOverflow
           ? continuationState(
             fullRequest.input,
             output,
             this.options.maxContinuationBytes,
           )
           : undefined;
-        if (continuation) this.continuations.set(completed.id, continuation);
-      } else if (!terminalFailure && !this.closed) {
+        if (continuation) this.continuations.set(turn.completedResponse.id, continuation);
+      } else if (!turn.terminalFailure && !this.closed) {
         this.sendError(502, {
           type: "local_router_stream_failed",
           message: "The internal Responses stream ended before response.completed.",
         });
       }
     } catch (error) {
-      if (!this.closed && !controller.signal.aborted) {
+      if (turn.interrupt && !turn.terminalSeen) {
+        await this.finishInterrupted(turn, fullRequest);
+      } else if (!this.closed && !controller.signal.aborted) {
         this.sendError(502, {
           type: error?.code || "local_router_stream_failed",
           message: "The local router lost the internal Responses stream.",
@@ -1222,6 +1394,7 @@ class ResponsesWebSocketPeer {
     } finally {
       this.abortController.signal.removeEventListener("abort", onClose);
       controller.abort();
+      if (this.activeTurn === turn) this.activeTurn = undefined;
     }
   }
 }
