@@ -302,7 +302,9 @@ citations, endpoints, or credentials.
 
 Current Codex builds use the Responses WebSocket v2 transport. The router
 authenticates the caller capability before upgrading, accepts
-`response.create` messages, reconstructs full history when Codex sends a
+`response.create` messages, handles an active turn's `response.interrupt`
+out of band by aborting the internal stream and returning the canonical
+interrupted tail, reconstructs full history when Codex sends a
 `previous_response_id` delta, and re-enters its own caller-authenticated HTTP
 Responses route. SSE response events are translated back to WebSocket JSON
 frames. The WebSocket edge never selects or contacts a provider itself, and

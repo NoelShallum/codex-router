@@ -736,6 +736,126 @@ test("prewarms locally and reconstructs incremental turns without losing history
   peer.close();
 });
 
+test("interrupts an active response out of band and resumes from the drained turn", async (t) => {
+  const bodies = [];
+  let markAborted;
+  const upstreamAborted = new Promise((resolve) => {
+    markAborted = resolve;
+  });
+  const { server, port } = await startServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    if (bodies.length === 1) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`event: response.created\ndata: ${JSON.stringify({
+        type: "response.created",
+        response: { id: "resp-interrupted" },
+      })}\n\n`);
+      response.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_partial", summary: [] },
+      })}\n\n`);
+      response.on("close", markAborted);
+      return;
+    }
+    sse(response, [
+      { type: "response.created", response: { id: "resp-follow-up" } },
+      { type: "response.completed", response: { id: "resp-follow-up", usage: {} } },
+    ]);
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.output_item.added");
+  peer.sendJson({
+    type: "response.interrupt",
+    response_id: "resp-interrupted",
+    mode: "discard_partial_items",
+  });
+
+  const accepted = await peer.nextJson();
+  assert.equal(accepted.type, "response.interrupt.accepted");
+  assert.equal(accepted.response_id, "resp-interrupted");
+  const discarded = await peer.nextJson();
+  assert.deepEqual(
+    {
+      type: discarded.type,
+      response_id: discarded.response_id,
+      item_id: discarded.item_id,
+      output_index: discarded.output_index,
+    },
+    {
+      type: "response.output_item.interrupted",
+      response_id: "resp-interrupted",
+      item_id: "rs_partial",
+      output_index: 0,
+    },
+  );
+  const interrupted = await peer.nextJson();
+  assert.equal(interrupted.type, "response.incomplete");
+  assert.equal(interrupted.response.id, "resp-interrupted");
+  assert.equal(interrupted.response.status, "incomplete");
+  assert.deepEqual(interrupted.response.incomplete_details, { reason: "interrupted" });
+  assert.deepEqual(interrupted.response.output, []);
+
+  let abortTimer;
+  try {
+    await Promise.race([
+      upstreamAborted,
+      new Promise((_resolve, reject) => {
+        abortTimer = setTimeout(() => reject(new Error("upstream was not aborted")), 2_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(abortTimer);
+  }
+
+  peer.sendJson(createRequest({
+    previous_response_id: "resp-interrupted",
+    input: [{ type: "message", role: "user", content: "next" }],
+  }));
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  assert.deepEqual(bodies[1].input, [
+    { type: "message", role: "user", content: "hello" },
+    { type: "message", role: "user", content: "next" },
+  ]);
+  peer.close();
+});
+
+test("rejects an interrupt naming a response that is not active", async (t) => {
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the body before answering, like the real HTTP route.
+    }
+    sse(response, [
+      { type: "response.created", response: { id: "resp-finished" } },
+      { type: "response.completed", response: { id: "resp-finished", usage: {} } },
+    ]);
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+
+  peer.sendJson(createRequest());
+  assert.equal((await peer.nextJson()).type, "response.created");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.sendJson({
+    type: "response.interrupt",
+    response_id: "resp-missing",
+    mode: "discard_partial_items",
+  });
+  const failed = await peer.nextJson();
+  assert.equal(failed.type, "response.interrupt.failed");
+  assert.equal(failed.response_id, "resp-missing");
+  peer.close();
+});
+
 test("continuation replay prefers the complete custom tool item over a conflicting completion snapshot", async (t) => {
   const bodies = [];
   const customCall = {
