@@ -10,7 +10,15 @@ import { commandOnPath, preferSpawnablePath, spawnableCommand } from "./spawnabl
 
 export { preferSpawnablePath, spawnableCommand };
 
-const LINUX_DESKTOP_APP_ROOTS = ["/opt/codex-desktop"];
+export const LINUX_DESKTOP_APP_ROOTS = [
+  "/opt/codex-desktop",
+  // The official ChatGPT/Codex .deb installs under /usr/lib/chatgpt, not
+  // /opt: without this entry a stale npm `codex` on PATH shadows the desktop
+  // app's newer bundled CLI, and the account catalog fetch asks for models
+  // with an old client_version that the backend answers poorly (new natives
+  // missing from the picker until the CLI is updated).
+  "/usr/lib/chatgpt",
+];
 
 export function linuxDesktopAppBundledCodex({
   platform = process.platform,

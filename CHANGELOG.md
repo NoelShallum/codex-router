@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Service boots refresh the Codex runtime before the model catalogs.** A
+  stale standalone CLI could shadow the desktop app's newer bundled copy, and
+  the account catalog fetch asks with the resolved CLI's client_version — so
+  new natives silently missed the picker until the CLI was updated by hand
+  (the Linux scan also missed the official .deb path `/usr/lib/chatgpt`, which
+  made the shadowing certain). On a fresh `service start` (and a `restart`
+  when the service is down) the router now compares the resolved CLI against
+  the desktop app's bundled copy first: an older npm-managed copy is upgraded
+  with `npm i -g @openai/codex@latest`, anything else is reported with the fix
+  instead of touched, and every step announces itself on stderr. Fail-open
+  throughout; `MODEL_ROUTER_CODEX_AUTOUPDATE=0` skips the pass. `doctor` also
+  warns while the resolved CLI trails the bundled copy.
 - **Service boots refresh live models first.** `service start` (the call the tray makes when Codex or ChatGPT desktop appears) runs a best-effort pass before the gateway boots: the OpenCode Go/Zen snapshot, then a drift-aware merged-catalog publish that also picks up new Codex natives. Any failed step only logs and never blocks the service; `MODEL_ROUTER_SERVICE_REFRESH=0` skips the pass. Fully quit and reopen the desktop client afterwards — Codex reads its catalog once at startup.
 - **Google Cloud Vertex AI is a catalog-only provider.** It authenticates with
   Application Default Credentials from `gcloud auth application-default login`

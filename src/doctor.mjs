@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { redactCallerUrl, validCallerSecret } from "./caller-auth.mjs";
 import { codexAuthStatus, codexVersion, findCodexBinary, runCodex } from "./codex-binary.mjs";
+import { codexRuntimeFreshness } from "./codex-runtime-freshness.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 import { routedCodexAgentStatus } from "./codex-agent-catalog.mjs";
 import { privateFileIsProtected } from "./file-security.mjs";
@@ -349,6 +350,21 @@ if (codexTarget) {
     codex || "not found",
     "Install Codex or set CODEX_BIN to the Codex CLI binary.",
   );
+}
+// A resolved CLI older than the desktop app's bundled copy asks the account
+// endpoint with an old client_version, which the backend answers poorly: new
+// natives silently miss the picker. The service start pass auto-updates
+// npm-managed copies; anything else needs the operator.
+if (codexTarget && codex) {
+  const freshness = codexRuntimeFreshness();
+  if (freshness.stale) {
+    add(
+      "warn",
+      "Codex CLI is older than the desktop app copy",
+      `${freshness.resolved.version || "unknown version"} at ${freshness.resolved.path} vs ${freshness.bundled.version || "unknown version"} at ${freshness.bundled.path}`,
+      "Update the standalone CLI (`npm i -g @openai/codex@latest`) or the desktop app; new native models may be missing from the picker until then.",
+    );
+  }
 }
 // A Codex binary that cannot be spawned reads as "signed out" everywhere it is
 // probed, which silently removes every native model from the picker. Surface it

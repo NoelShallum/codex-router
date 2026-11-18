@@ -8,6 +8,7 @@ import {
   codexBinaryFingerprint,
   codexCandidatePaths,
   findCodexBinary,
+  LINUX_DESKTOP_APP_ROOTS,
   linuxDesktopAppBundledCodex,
   preferSpawnablePath,
   spawnableCommand,
@@ -59,6 +60,14 @@ test("ignores blank lines in finder output", () => {
 test("returns undefined for empty finder output", () => {
   assert.equal(preferSpawnablePath([], "win32"), undefined);
   assert.equal(preferSpawnablePath(["", "   "], "darwin"), undefined);
+});
+
+test("the Linux desktop scan covers the official .deb install path", () => {
+  // The ChatGPT/Codex .deb installs under /usr/lib/chatgpt, not /opt. When
+  // the scan missed it, a stale npm `codex` on PATH shadowed the desktop
+  // app's newer bundled CLI and new natives went missing from the picker.
+  assert.ok(LINUX_DESKTOP_APP_ROOTS.includes("/opt/codex-desktop"));
+  assert.ok(LINUX_DESKTOP_APP_ROOTS.includes("/usr/lib/chatgpt"));
 });
 
 test("prefers the Linux desktop app's bundled CLI over a standalone CLI", () => {

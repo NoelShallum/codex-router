@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SOURCE_ROOT } from "./paths.mjs";
+import { ensureFreshCodexRuntime } from "./codex-runtime-freshness.mjs";
 import { stopManagedOllama } from "./ollama-runtime.mjs";
 import { waitForServiceReadiness } from "./service-readiness.mjs";
 import { withServiceOperationLock } from "./service-operation-lock.mjs";
@@ -170,13 +171,15 @@ export async function runServiceCommandUnlocked(
   // the pass when the service is already live: the running gateway depends on
   // the snapshot it booted with, and a failed refresh would pair the old
   // process (old snapshot) with a rewritten merged catalog on disk.
-  if (command === "start") refreshServiceCatalogs({ env: childEnvironment });
-  if (
-    command === "restart" &&
-    !serviceIsRunning({ env: childEnvironment })
-  ) {
-    refreshServiceCatalogs({ env: childEnvironment });
-  }
+  //
+  // The account catalog fetch asks with the resolved CLI's client_version, so
+  // the runtime refresh runs first: an updated CLI is what makes new natives
+  // appear in the publish that follows. Same fail-open rules, same skip
+  // conditions, and like the catalog pass it announces itself on stderr.
+  const freshBoot = command === "start" ||
+    (command === "restart" && !serviceIsRunning({ env: childEnvironment }));
+  if (freshBoot) ensureFreshCodexRuntime({ env: childEnvironment });
+  if (freshBoot) refreshServiceCatalogs({ env: childEnvironment });
   const result = spawnSync(
     process.execPath,
     [path.join(SOURCE_ROOT, "src", script), ...args],
