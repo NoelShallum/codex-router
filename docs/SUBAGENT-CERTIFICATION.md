@@ -1,30 +1,32 @@
 # Making a route usable as a subagent
 
-A model can only be spawned as a Codex subagent if its exact `provider/model`
-route is `multiAgentVersion: "v2"`. Everything else in this file is about how a
-route gets there, and how to avoid paying to measure the same route twice.
+A routed model is eligible for Codex collaboration when its exact
+`provider/model` entry has `multi_agent_version: "v2"` in the merged catalog.
+This guide covers local setup and the evidence required to ship that route as
+v2 by default.
 
 Read this before changing anything under `src/subagent-*.mjs`, `v2_agent/`, or
 the Subagents column in the Control Center.
 
-## What "v2" is, and what "v1" is not
+## Catalog eligibility and route validation
 
-`v2` means the route provably carries Codex's native collaboration: the parent
-delegates through the encrypted payload relay, the child answers, and it answers
-again on a follow-up in the same thread.
+`v2` makes a route eligible for Codex's native collaboration. A completed
+certification demonstrates that the parent delegates through the encrypted
+payload relay and the child answers both the initial turn and a same-thread
+follow-up.
 
-`v1` is **not** a lesser working mode. Nothing spawns a v1 route as a subagent:
+`v1` leaves a visible route available for ordinary routed model turns. The
+filter in `src/multi-agent-state.mjs` controls subagent eligibility.
 
 ```js
 // src/multi-agent-state.mjs
 subagentEligibleModels → model.multiAgentVersion === "v2"
 ```
 
-and only eligible models get an agent definition written into
-`~/.codex/agents/`. A route without a definition cannot be spawned by name at
-all. In the registry almost every route has **no** `multiAgentVersion` field;
-`"v1"` is the publication default (`multiAgentVersion || "v1"`), so a route
-showing v1 means "not certified yet", never "reviewed and rejected".
+Only eligible models get an agent definition written into `~/.codex/agents/`.
+The catalog defaults to `"v1"` when the registry omits `multiAgentVersion`.
+The `subagents set <slug> on` command also checks for an explicit v1
+classification in the registry before it lets an operator opt in.
 
 ## The five checks
 
@@ -136,15 +138,15 @@ CLI:
 
 ```bash
 bin/model-router codex subagents set <provider>/<model> on
-node src/catalog.mjs                 # publish; the Control Center does this for you
 ```
 
-Then **fully quit and reopen Codex**. It reads the catalog at startup and caches
-it; skipping this is the most common reason a change looks like it did nothing.
+The command refreshes the installed catalogs. **Fully quit and reopen Codex**
+to load the refreshed list.
 
-Neither costs quota. Selection is a statement of intent, not a capability claim
-— `mode all` is documented as advertising every route "regardless of whether it
-works" — so verify a route before relying on it:
+Enabling a new route may schedule a two-request compatibility probe that uses
+provider quota. Its `candidate` result reports streaming and tool calling.
+Exercise the actual Codex child turn and follow-up before relying on a route.
+The ordinary agent capability check can also help diagnose tool calling:
 
 ```bash
 node --input-type=module -e '
@@ -152,6 +154,37 @@ import { checkAgentCapability } from "./src/agent-check.mjs";
 console.log(JSON.stringify(checkAgentCapability(process.argv[1]), null, 2));
 ' "opencode-go/glm-5.2"
 ```
+
+## Enable an OpenCode Go route locally
+
+With OpenCode Go configured and the model visible in the picker, opt in the
+exact route. The effort setting below uses a level advertised by DeepSeek V4.1
+Flash.
+
+```bash
+opencode_subagent_slug=opencode-go/deepseek-v4.1-flash
+./bin/control subagents mode selected
+./bin/control subagents set "$opencode_subagent_slug" on
+./bin/control subagents effort "$opencode_subagent_slug" max
+node .claude/skills/codex-subagents/subagent-report.mjs
+```
+
+The controls refresh the merged catalog and managed agent definitions. The
+report shows published v2 routes by priority and the configured effort
+overrides. If Codex's short override list crowds out the desired route, run
+`./bin/model-router codex picker-order routed-first` and rerun the report.
+That switch changes model picker ordering for the installation.
+
+Fully quit and reopen Codex before checking the refreshed overrides. Ask Codex
+to spawn a child on `opencode-go/deepseek-v4.1-flash`, then send a follow-up to
+the same child. Use `./bin/control activity` to check the effective routed
+model. The catalog, the provider probe, and the completed child turns each
+answer a different part of the check.
+
+For another OpenCode route, use its full published slug and a reasoning level
+it advertises. `subagents effort <slug> default` clears the local override.
+`subagents set <slug> off` removes the opt-in. Use the five-check workflow
+below when proposing a registry certification for other installations.
 
 ## Gathering evidence for the registry
 

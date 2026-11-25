@@ -17,17 +17,16 @@ Run every command from the codex-router checkout.
 node .claude/skills/codex-subagents/subagent-report.mjs
 ```
 
-This answers the only question that matters — *if I ask Codex to spawn a subagent
-right now, what can it pick?* — and it is the one question `control subagents status`
-does not answer. That command reports your **intent**. The merged catalog is what
-Codex actually **reads**. They drift apart silently, and the report catches the drift.
-
-If the report says a model is spawnable, it is offered to Codex. If it doesn't
-appear there, nothing else you do in Codex will surface it.
+The report reads the merged catalog and lists published v2 routes by priority,
+along with configured reasoning effort overrides. `control subagents status`
+describes the operator's settings. The current Codex process may still hold an
+older catalog, and its override list shows a limited number of routes.
+[OpenCode setup example](../../../docs/SUBAGENT-CERTIFICATION.md#enable-an-opencode-go-route-locally).
 
 ## How a model becomes spawnable
 
-A model carries `multiAgentVersion: "v2"` in the catalog. Three modes decide who gets it:
+Codex uses `multi_agent_version: "v2"` in the merged catalog. Three modes control
+publication.
 
 | Mode | Effect |
 |---|---|
@@ -51,23 +50,24 @@ still resolves to `v1`.
 `unselect-all` is the fastest way out of a crowded list when the models you want
 have been pushed past what Codex advertises.
 
-**After any change:**
+The control commands refresh the installed catalogs. Rebuild if the report
+shows `STALE`.
 
 ```bash
 node src/catalog.mjs
 ```
 
-then **fully quit and reopen Codex**. Not a new window — the whole app. Codex reads
-the catalog at startup and caches it. Skipping this is the single most common reason
-a change appears to do nothing, and the report flags it as `STALE`.
+**Fully quit and reopen Codex** after publication. Codex reads the catalog at
+startup and caches it.
 
 ## Two traps that waste the most time
 
 **Codex advertises only a small priority-ordered subset.** Turning on twelve models
 does not give you twelve choices — it buries the ones you wanted behind ones you
-didn't. The report prints models in Codex's ranking order and marks where the cut
-probably falls. If a model you want sits far down that list, turn off the ones above
-it rather than adding more.
+didn't. The report prints models in catalog priority order and marks where the
+cut probably falls. To prioritize routed models, use
+`./bin/model-router codex picker-order routed-first`. You can also turn off
+individual routes you no longer want in the override list.
 
 **`mode all` is not "make everything work".** It advertises every model as capable,
 including models that cannot drive Codex at all. A model that emits tool calls as

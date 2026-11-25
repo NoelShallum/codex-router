@@ -851,31 +851,29 @@ installation. It is repository development and requires the process below.
 
 ### Subagent capability is researched, not asserted
 
-Switching a model on as a subagent (tray toggle, `control subagents set`) is
-the operator's whole job; deciding whether that model **under that provider**
-can hold the v2 child role is the router's. The same model answers differently
-per provider — tool support, request profiles, and payload handling all vary —
-so the unit of evidence is always the slug, never the model name.
+Switching a model on as a subagent (tray toggle, `control subagents set`) opts
+that exact route into local v2 publication. Validate the child role on the
+same slug. The same model can behave differently across providers because
+tool support, request profiles, and payload handling vary.
 
 1. Enabling an unknown model hands it to a detached compatibility probe
    (`src/subagent-verify.mjs`): two live requests through the installed router
-   proving streaming and a forced tool call. The proofs snapshot shows
-   `checking` until the verdict lands. A passing probe records `candidate`; it
-   does **not** advertise v2. A worker that dies without a verdict records a
-   failure, and a stale `checking` record is retryable. Explicit registry-v1
+   checking streaming and tool calling. The proofs snapshot shows
+   `checking` until the verdict lands. A passing probe records `candidate`.
+   Local selection controls v2 publication independently of that result.
+   A worker that dies without a verdict records a failure, and a stale
+   `checking` record is retryable. Explicit registry-v1
    routes are settled decisions and are never re-opened by this local probe;
    registry-v2 routes need no compatibility probe.
-2. `multi-agent-proofs.json` is diagnostic application evidence only. Local
-   `candidate`, and legacy `experimental` / `proven`, records cannot change the
-   catalog's `multi_agent_version`, managed agent definitions, or any client
-   route. `applySubagentProofs` deliberately returns the registry capabilities
-   unchanged. An unreadable proofs file therefore authorizes and promotes
-   nothing.
+2. `applySubagentProofs` promotes a route from machine-local evidence only
+   when all five checks pass for that exact slug. The `candidate` and legacy
+   `experimental` or `proven` statuses serve as diagnostics. An unreadable
+   proofs file supplies no evidence for publication.
 3. The compatibility probe is not the native collaboration proof. It does not
    exercise Codex's encrypted child payload relay, a marker-return spawn, or a
    same-thread follow-up. A successful ordinary chat/tool request must never be
    presented as evidence that the model can hold the native v2 child role.
-4. Only the exact checked-in registry route may assert v2. The route's slug,
+4. Shipping a route as v2 by default requires certification. The route's slug,
    provider, and upstream model must match an accepted artifact under
    `v2_agent/`, and the accepted artifact and `multiAgentVersion: "v2"` change
    land in the same pull request. CI enforces the implication in both

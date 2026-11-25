@@ -685,12 +685,14 @@ the legacy single key. A pre-response `429` can rebind the request to another
 healthy entry; failover stops once response headers or body bytes have been
 committed.
 
-The desktop panel and macOS tray Settings tab provide both per-model controls
-and provider-level Select all / Unselect all actions for which registry-proven
-v2 models can run as subagents and which models appear in installed client
-pickers. Local settings cannot promote an unverified model. Fully quit and
-reopen Codex after changing either list; DeepSeek Harness hot-reloads its route,
-and the next Gemini CLI invocation reads the new environment.
+The desktop panel and macOS tray Settings tab let operators choose which routes
+appear in installed client pickers and which eligible routes are published as
+local Codex subagents. Local selection can publish a route as v2 for that
+installation. Registry certification is the separate review for shipping a
+route as v2 by default. Fully quit and reopen Codex after changing either
+list. DeepSeek Harness hot-reloads its route, and the next Gemini CLI
+invocation reads the new environment.
+[Set up an OpenCode route as a subagent](docs/SUBAGENT-CERTIFICATION.md#enable-an-opencode-go-route-locally).
 The Control Center keeps Go and pay-per-use Zen under this one credential card,
 but exposes each live catalog as a separate source. Loading a catalog only
 caches and previews its candidates; models are added to the picker only after
