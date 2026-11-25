@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 // Readiness report for Codex subagent spawning.
 //
-// Answers the question the CLI cannot: "if I ask Codex to spawn a subagent
-// right now, which models can it actually pick?" That is not what
-// `control subagents status` reports. Settings name an intent; the merged
-// catalog is what Codex reads. The two drift apart whenever the catalog is not
-// rebuilt after a settings change, and the drift is silent.
+// Inspect the published v2 routes and their configured effort overrides.
+// `control subagents status` describes the operator's settings. Codex reads
+// the merged catalog at startup, so an old catalog or cached session can
+// still advertise a different list.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -51,37 +50,38 @@ const settings = existsSync(SETTINGS_PATH)
 
 const out = [];
 out.push(`Mode:     ${settings.mode}`);
-out.push(`Catalog:  ${models.length} models, ${capable.length} spawnable as subagents`);
+out.push(`Catalog:  ${models.length} models, ${capable.length} published as v2`);
 if (settings.disabled?.length) {
   out.push(`Disabled: ${settings.disabled.length} model(s) held back by an explicit off`);
 }
 out.push("");
 
 if (capable.length === 0) {
-  out.push("No model can be spawned as a subagent right now.");
+  out.push("No v2 routes in the merged catalog.");
   out.push("");
   out.push("  Most likely: the catalog predates your settings. Rebuild it:");
   out.push("    node src/catalog.mjs");
   out.push("  Then fully quit and reopen Codex.");
 } else {
-  out.push("Spawnable, in the order Codex ranks them:");
+  out.push("Published v2 routes in catalog priority order:");
   out.push("");
   capable.forEach((model, index) => {
     const rank = String(index + 1).padStart(2);
     const priority = String(model.priority ?? "-").padStart(4);
     const hidden = model.visibility === "hide" ? "  [hidden in picker]" : "";
+    const effort = settings.efforts?.[model.slug];
+    const effortLabel = typeof effort === "string" && effort ? `  [configured effort ${effort}]` : "";
     const marker = index === LIKELY_VISIBLE ? "  <- Codex likely stops advertising here" : "";
-    out.push(`  ${rank}. prio ${priority}  ${model.slug}${hidden}${marker}`);
+    out.push(`  ${rank}. prio ${priority}  ${model.slug}${effortLabel}${hidden}${marker}`);
   });
   if (capable.length > LIKELY_VISIBLE) {
     out.push("");
     out.push(
       `  ${capable.length} models carry v2, but Codex advertises only a small priority-ordered`,
     );
-    out.push(
-      "  subset. Models far down this list may never appear. Turn off the ones you do not",
-    );
-    out.push("  want so the ones you do want are not crowded out:");
+    out.push("  subset. To bring routed models forward, change the picker order:");
+    out.push("    ./bin/model-router codex picker-order routed-first");
+    out.push("  To remove an individual route from the list:");
     out.push("    ./bin/control subagents set <slug> off");
   }
 }
